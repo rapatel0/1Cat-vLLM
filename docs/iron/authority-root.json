@@ -1,0 +1,1 @@
+{"authority":"state","current":{"evidence":"refs/heads/iron/evidence","state":"refs/heads/iron/state"},"main":{"commit":"94f64714263e3af4399bbc0dd78069e5ce3a84b9","ref":"refs/heads/main"},"origin":{"name":"origin","url":"git@github.com:rapatel0/1Cat-vLLM.git"},"schema":"iron-authority-root-v1","transition_id":"03fbf798b8becfa7f906d469359602ba98eb0a5365b893b94793df52887c5dd3"}
