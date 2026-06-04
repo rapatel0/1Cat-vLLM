@@ -131,11 +131,32 @@ monotonically with position; uniform = draft and target are in lockstep on garba
   corrupt the target's own attention at the shared layers (garbage from layer 58 onward), or the
   multi-KV-group (hd256 sliding + hd512 global → 2 groups) target verify is mis-metadata'd on V100.
   This is a deeper, kernel-adjacent fix than the loop.
-- Next steps: (a) test whether disabling the cross-model KV sharing — give the draft its own KV
-  cache instead of sharing (correctness over the small KV saving) — fixes the target output; (b) if
-  so, the bug is in `add_kv_sharing_layers_to_kv_cache_groups` / the shared-block path on the fork's
-  V100 cache; (c) compare against a single-KV-group target (the gemma4 sliding-only case) to isolate
-  the multi-group factor; (d) enable `VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE` on the verify path.
+### ROOT CAUSE FOUND (2026-06-04): the hd512 multi-token verify kernel
+
+Ruled out and fixed along the way (both correct, committed): the backbone-dim feedback buffer
+(model-arch convertor → `get_hidden_size`=5376) and the stale `get_supported_head_sizes`
+(`[64,128,256]` → add `512`). Neither fixed correctness, but the head-size fix changed acceptance
+86%→30% (the draft's hd512 global layer was being mis-routed).
+
+**The bug is `_flash_v100_small_query_prefill_as_decode` at head_dim 512.** This is the V100 path
+for MTP *verification* (a tiny multi-token query span over the KV prefix). It was only ever
+validated for single-query decode; the multi-row verify at hd512 produces wrong results. Proof:
+setting `VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q=0` (route verify to the direct paged-prefill kernel
+instead) makes short output **correct** — "capital of France" → **Paris**, clean — and the
+acceptance metric finally **decays monotonically** (per-pos 13/11/11/11 instead of the broken
+uniform all-or-nothing). So the spec-decode *mechanism* (proposer, KV sharing, constant-position
+drafting, rejection sampling) is **correct**; only the hd512 verify kernel is wrong.
+
+Residual: with small-q disabled, *longer* output still degrades ("1, 2, 1000000…") because the
+direct paged-prefill kernel hits the SM70 96 KB smem limit at hd512 long contexts — which is the
+very reason the small-q path exists. So **both** V100 verify paths are flawed at 512:
+small-q-as-decode = incorrect, paged-prefill = smem-limited.
+
+**Remaining work (bounded CUDA-kernel fix):** make one hd512 verify path correct on SM70 — either
+debug `flash_decode_paged.cu`'s partition path for the multi-row/long-seq verify shape at D=512
+(the kernel was validated only single-row), or give the paged-prefill kernel an even-smaller-tile
+D=512 config so it fits 96 KB at long context. Then drop the `VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q`
+workaround. The non-kernel port (Phases A/B + the runner/config wiring) is complete and correct.
 
 The no-spec deploy (`24-deployment`, 18.4/147 tok/s) is restored as the active service; the mtp
 deploy is scaled to 0 (manifest + overlay preserved for resuming).

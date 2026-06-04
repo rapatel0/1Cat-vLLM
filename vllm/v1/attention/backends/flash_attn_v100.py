@@ -973,4 +973,8 @@ class FlashAttnV100Backend(TritonAttentionBackend):
     @staticmethod
     def get_supported_head_sizes() -> list[int]:
         # Keep this aligned with the dense prefill kernel dispatch table.
-        return [64, 128, 256]
+        # head_dim 512 is the Gemma-4 global (full-attn) layer size; the
+        # prefill/decode kernels were extended to dispatch it (case 512), so
+        # the backend must advertise it too — otherwise spec-decode draft-model
+        # backend selection routes the hd512 layer away from Flash-V100.
+        return [64, 128, 256, 512]
