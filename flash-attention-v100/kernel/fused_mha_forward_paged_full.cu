@@ -576,7 +576,7 @@ std::vector<at::Tensor> flash_attention_forward(
     const auto sizes = q.sizes();
     const int B = sizes[0], H = sizes[1], M = sizes[2], D = sizes[3];
     const int N = k.size(2);
-    TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0, "D must be even, <=256, multiple of 8");
+    TORCH_CHECK(D <= 512 && D % 8 == 0 && D % 2 == 0, "D must be even, <=256, multiple of 8");
 
     at::Tensor out_fp16 = out_.has_value() ? out_.value() : torch::zeros_like(q);
     TORCH_CHECK(out_fp16.dtype() == torch::kFloat16, "out must be fp16");

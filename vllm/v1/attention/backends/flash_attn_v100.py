@@ -366,13 +366,17 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             not self.kv_cache_dtype.startswith("fp8")
             or self.kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
         )
+        # Gemma-4 global (full-attn) layers pass None (not 0 / (-1,-1)) for these; treat
+        # None as "no softcap / no sliding window" so they engage flash-v100 (head_dim 512,
+        # which Triton cannot run on V100 due to >96KB smem). Sliding layers keep a real
+        # window and still fall back to Triton (fine at head_dim 256).
         return (
             self.use_flash_v100
             and self.attn_type == AttentionType.DECODER
             and self.alibi_slopes is None
-            and self.logits_soft_cap == 0
+            and not self.logits_soft_cap
             and self.sinks is None
-            and self.sliding_window == (-1, -1)
+            and self.sliding_window in ((-1, -1), None)
             and supported_kv_dtype
         )
 

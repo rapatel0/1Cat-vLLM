@@ -24,6 +24,7 @@ import torch
 from torch import nn
 
 from vllm.config.utils import getattr_iter
+from vllm.model_executor.models.utils import maybe_prefix
 from vllm.logger import init_logger
 from vllm.model_executor.layers.conv import Conv2dLayer, Conv3dLayer
 from vllm.model_executor.layers.layernorm import GemmaRMSNorm, RMSNorm
@@ -251,3 +252,31 @@ def can_enable_torch_compile(vllm_config: "VllmConfig") -> bool:
             rope_parameters = {"": rope_parameters}
         return all(rp["rope_type"] != "dynamic" for rp in rope_parameters.values())
     return True
+
+
+def recursive_replace_linear(
+    model: nn.Module,
+    quant_config: "QuantizationConfig | None",
+    prefix: str = "",
+):
+    """Recursively replace linear modules in the model as needed."""
+
+    def _recursive_replace(module: nn.Module, prefix: str):
+        for child_name, child_module in module.named_children():
+            new_module = child_module
+            qual_name = maybe_prefix(prefix, child_name)
+            # Replace modules as needed
+            if isinstance(child_module, nn.Linear):
+                style = "replicate"
+                new_module = replace_linear_class(
+                    child_module,
+                    style,
+                    quant_config,
+                    prefix=qual_name,
+                )
+            else:
+                _recursive_replace(child_module, prefix=qual_name)
+            if new_module is not child_module:
+                setattr(module, child_name, new_module)
+
+    _recursive_replace(model, prefix=prefix)

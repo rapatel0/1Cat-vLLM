@@ -322,6 +322,11 @@ def get_rope(
             )
         else:
             raise ValueError("Pangu mrope lacks necessary parameters.")
+    elif scaling_type == "proportional":
+        # Proportional RoPE — Gemma4 global (full) attention layers.
+        from .gemma4_rope import Gemma4RotaryEmbedding
+        rotary_emb = Gemma4RotaryEmbedding(
+            head_size, rotary_dim, max_position, base, is_neox_style, dtype)
     else:
         raise ValueError(f"Unknown RoPE scaling type {scaling_type}")
     _ROPE_DICT[key] = rotary_emb

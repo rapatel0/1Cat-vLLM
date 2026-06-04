@@ -49,11 +49,15 @@ using namespace nvcuda::wmma;
 #define BLOCK_N_256 64
 #define WARPS_256   16
 
+#define BLOCK_M_512 16
+#define BLOCK_N_512 32
+#define WARPS_512   16
+
 template<int D>
 struct KernelConfig {
-    static constexpr int BLOCK_M = (D == 16) ? BLOCK_M_16 : (D == 32) ? BLOCK_M_32 : (D == 64) ? BLOCK_M_64 : (D == 128) ? BLOCK_M_128 : BLOCK_M_256;
-    static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64) ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : BLOCK_N_256;
-    static constexpr int WARPS_PER_BLOCK = (D == 16) ? WARPS_16 : (D == 32) ? WARPS_32 : (D == 64) ? WARPS_64 : (D == 128) ? WARPS_128 : WARPS_256;
+    static constexpr int BLOCK_M = (D == 16) ? BLOCK_M_16 : (D == 32) ? BLOCK_M_32 : (D == 64) ? BLOCK_M_64 : (D == 128) ? BLOCK_M_128 : (D == 256) ? BLOCK_M_256 : BLOCK_M_512;
+    static constexpr int BLOCK_N = (D == 16) ? BLOCK_N_16 : (D == 32) ? BLOCK_N_32 : (D == 64) ? BLOCK_N_64 : (D == 128) ? BLOCK_N_128 : (D == 256) ? BLOCK_N_256 : BLOCK_N_512;
+    static constexpr int WARPS_PER_BLOCK = (D == 16) ? WARPS_16 : (D == 32) ? WARPS_32 : (D == 64) ? WARPS_64 : (D == 128) ? WARPS_128 : (D == 256) ? WARPS_256 : WARPS_512;
 
     static constexpr int THREADS_PER_BLOCK = WARPS_PER_BLOCK * MAX_THREADS_PER_WARP;
     static constexpr int THREADS_PER_ROW   = THREADS_PER_BLOCK / BLOCK_M;
@@ -586,7 +590,7 @@ std::vector<at::Tensor> flash_attention_forward(
     const int B = sizes[0], H = sizes[1], M = sizes[2], D = sizes[3];
     const int H_KV = k.size(1);
     const int N = k.size(2);
-    TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0, "D must be even, <=256, multiple of 8");
+    TORCH_CHECK(D <= 512 && D % 8 == 0 && D % 2 == 0, "D must be even, <=256, multiple of 8");
     TORCH_CHECK(H_KV > 0, "num_kv_heads must be positive");
     TORCH_CHECK(H % H_KV == 0, "num_attention_heads must be divisible by num_kv_heads");
     TORCH_CHECK(k.size(0) == B && v.size(0) == B, "K/V batch size must match Q");
@@ -610,6 +614,7 @@ std::vector<at::Tensor> flash_attention_forward(
         case 64:  launcher_flash_attention_forward<64>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
         case 128: launcher_flash_attention_forward<128>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
         case 256: launcher_flash_attention_forward<256>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
+        case 512: launcher_flash_attention_forward<512>(q, k, v, out_fp16, softmax_lse, softmax_scale, is_causal, stream); break;
         default: TORCH_CHECK(false, "Unsupported D: ", D);
     }
 

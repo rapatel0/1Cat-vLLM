@@ -1250,7 +1250,7 @@ std::vector<at::Tensor> flash_attention_backward(
     const auto sizes = q.sizes();
     const int B = sizes[0], H = sizes[1], M = sizes[2], D = sizes[3];
     const int N = k.size(2);
-    TORCH_CHECK(D <= 256 && D % 8 == 0 && D % 2 == 0, "D must be even, <=256, multiple of 8");
+    TORCH_CHECK(D <= 512 && D % 8 == 0 && D % 2 == 0, "D must be even, <=256, multiple of 8");
 
     at::Tensor dq_fp16 = dq_.has_value() ? dq_.value() : torch::zeros_like(q);
     at::Tensor dk_fp16 = dk_.has_value() ? dk_.value() : torch::zeros_like(k);
