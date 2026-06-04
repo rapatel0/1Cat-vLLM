@@ -52,9 +52,14 @@ The drafter `google/gemma-4-31B-it-assistant` (arch `Gemma4AssistantForCausalLM`
    layer wiring. This is the crux: ~2–3 days + 1–2 days V100 validation.
 
 ## Phased plan (de-risk the runner port last)
-- **Phase A (clean wins, ~½ day):** add the config class + registry + MTPModelTypes; port
-  `gemma4_mtp.py`. Goal: vLLM *loads* the assistant as a draft model (even if propose() is stubbed)
-  — proves config/model/registry without touching the runner.
+- **Phase A — DONE ✅ (2026-06-04, commit a63d357e5).** config class
+  (`vllm/transformers_utils/configs/gemma4_assistant.py` + registered in configs/__init__ +
+  config.py), ported `gemma4_mtp.py`, registry + MTPModelTypes entries. **Validated** on a no-GPU
+  pod: config loads as Gemma4AssistantConfig (backbone 5376; text hidden 1024 / 4 layers / vocab
+  262144 / head_dim 256+512 / layer_types 3×sliding+1×full), registry resolves
+  Gemma4AssistantForCausalLM, drafter module imports (Gemma4MTP / MultiTokenPredictor /
+  MTPAttention), method auto-detects mtp. Note: the drafter `from .gemma4 import ...` means the
+  spec-decode deploy must overlay the main-port gemma4 files too (already in the deploy ConfigMap).
 - **Phase B (the crux, ~2–3 days):** port the `gpu_model_runner.py` gemma4 proposer + KV-sharing
   setup + backbone-dim feedback buffer, reconciling against the fork's divergence. Unit-validate the
   KV-shared Q-only attention on V100 (hd512 + hd256) in isolation first.
