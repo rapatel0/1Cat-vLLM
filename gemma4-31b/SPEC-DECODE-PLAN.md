@@ -158,6 +158,35 @@ debug `flash_decode_paged.cu`'s partition path for the multi-row/long-seq verify
 D=512 config so it fits 96 KB at long context. Then drop the `VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q`
 workaround. The non-kernel port (Phases A/B + the runner/config wiring) is complete and correct.
 
+### CORRECTION (2026-06-04, later): it is NOT the verify kernel — it's the cross-model KV read
+
+Broader testing overturned the "verify kernel" diagnosis. All THREE V100 verify paths were forced
+and tested (env-only, no rebuild): small-q-as-decode (`SMALLQ_DECODE_MAX_Q` default), the dedicated
+paged-prefill kernel (`SMALLQ=0`), and the dense paged-KV-gather + FA2 path (`SMALLQ=0` +
+`DISABLE_PAGED_PREFILL=1`). **All three produce the same broken signature:** all-or-nothing
+acceptance (per-pos uniform, e.g. 140/140/140/140 — a draft is either fully accepted or rejected at
+pos 0) and garbage output. The earlier "13/11/11/11 looks like decay" was a misread — it was 11
+full-accepts + 2 pos-0-only, i.e. still dominantly all-or-nothing. So "mechanism proven correct" was
+**overstated**; only the first (prefill) token is reliably correct.
+
+Decisive new clue: **output varies across identical temperature-0 runs** ("Paris" / "ParisB" /
+"ParisBC" / "ParisB orLP"). Determinism at temp 0 is mandatory, so the spec path is reading
+**uninitialized / wrong memory**. The drafter passes `kv_dummy = torch.empty(...)` (uninitialized)
+as K/V (gemma4_mtp.py:251) and relies entirely on cross-model KV sharing to read the *target's* KV
+blocks. All-or-nothing-on-garbage = draft and target agreeing on corrupted state; random variation =
+uninitialized read. Conclusion: **the cross-model KV-share block-table / cache read for the draft's
+layers is wrong on the fork's V100 multi-group cache** (the draft reads its own unallocated/garbage
+blocks instead of the target's), which is the one factor common to all verify paths and is the
+gemma4-specific thing Qwen MTP (own-KV) never exercises.
+
+Next debug step (needs instrumentation, not config): in `_setup_gemma4_kv_sharing` / the runner,
+dump the draft attention layers' resolved block_table + `kv_sharing_target_layer_name` vs the
+target's, and confirm the draft's attn actually reads the target's physical blocks at run time
+(add a one-shot tensor dump in `_flash_v100_decode` for a kv-shared layer). Likely fix is in
+`add_kv_sharing_layers_to_kv_cache_groups` / per-group block-table wiring for the multi-group case,
+or making the drafter pass real (cache-resident) K/V rather than `kv_dummy` on the V100 path.
+
+---
 Kernel read (2026-06-04): `flash_attention_decode_partition_kernel<D,PART,KV>` processes each query
 row as an independent `(batch_idx, head, partition)` block — `q_shared[D]` is 1 KB at D=512, smem is
 fine, and the per-row block_table/seq_len indexing is independent — so a multi-row verify should
