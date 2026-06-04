@@ -60,9 +60,38 @@ The drafter `google/gemma-4-31B-it-assistant` (arch `Gemma4AssistantForCausalLM`
   Gemma4AssistantForCausalLM, drafter module imports (Gemma4MTP / MultiTokenPredictor /
   MTPAttention), method auto-detects mtp. Note: the drafter `from .gemma4 import ...` means the
   spec-decode deploy must overlay the main-port gemma4 files too (already in the deploy ConfigMap).
-- **Phase B (the crux, ~2–3 days):** port the `gpu_model_runner.py` gemma4 proposer + KV-sharing
-  setup + backbone-dim feedback buffer, reconciling against the fork's divergence. Unit-validate the
-  KV-shared Q-only attention on V100 (hd512 + hd256) in isolation first.
+- **Phase B (the crux) — MAPPED & RE-SCOPED SMALLER (2026-06-04).** The fork turns out to already
+  have most of the machinery, so this is "port one file + 4 small wirings," not a runner rewrite:
+  - **Already in the fork (no work):** KV-sharing kv-cache-group infra
+    (`add_kv_sharing_layers_to_kv_cache_groups`, `maybe_add_kv_sharing_layers_to_kv_cache_groups`,
+    fast-prefill), the base `build_per_group_and_layer_attn_metadata` (calls `build_for_drafting`,
+    the same V100 path Qwen MTP already uses), `_maybe_share_lm_head`, `validate_same_kv_cache_group`,
+    `_draft_attn_layer_names`/`draft_attn_groups`, `pass_hidden_states_to_model`, and every import the
+    proposer needs (`replace`, `AttentionLayerBase`, `CommonAttentionMetadata`, `KVCacheSpec`,
+    `UniformTypeKVCacheSpecs`, `AttentionGroup`). The base `model_returns_tuple()` already unpacks the
+    2-tuple return (Qwen MTP path).
+  - **To port (saved in `upstream-ref/`):**
+    1. `vllm/v1/spec_decode/gemma4.py` — `Gemma4Proposer` (340 lines). Only reconciliation: upstream
+       imports `SpecDecodeBaseProposer` from `llm_base_proposer`; the fork keeps it in `eagle.py` →
+       change that import. It overrides `model_returns_tuple`, `build_per_group_and_layer_attn_metadata`
+       (per-group block-table swap), `initialize_attn_backend` (per-head-dim groups),
+       `_setup_gemma4_kv_sharing` (maps each draft layer to the last non-shared target layer of the
+       same sliding/full type), `_create_draft_vllm_config` (carry the TRITON/V100 backend through),
+       `_maybe_share_lm_head` (keep draft-dim lm_head), `validate_same_kv_cache_group` (skip — multi
+       group). Centroids paths are dead code for 31B (`use_ordered_embeddings=False`).
+    2. **`constant_draft_positions` — the one genuine base gap.** Upstream's base proposer defines it
+       (default False) and consumes it at 3 points in `propose()` (ref:
+       `upstream-ref/llm_base_proposer.py` lines 107, 523, 576, 588): seed `self.positions[:bs]`,
+       skip `_update_positions_dependent_metadata`, and build attn metadata once (reuse). Port these
+       3 conditionals into the fork's base `SpecDecodeBaseProposer.propose()` (eagle.py). Default
+       False = no behavior change for existing proposers. **This is the delicate surgery.**
+    3. `use_gemma4_mtp()` on `SpeculativeConfig` (mirror `use_eagle()`), gated on
+       `method=="mtp" and draft model_type=="gemma4_assistant"`.
+    4. `gpu_model_runner.py`: add the `elif self.speculative_config.use_gemma4_mtp(): self.drafter =
+       Gemma4Proposer(...)` branch (+ import + the `isinstance(drafter, Gemma4Proposer)` handling for
+       per-group block tables / bidi-sliding, and call `set_per_group_block_table` in `_prepare_inputs`).
+  - **V100 unit check:** KV-shared Q-only attention at hd512 + hd256 via the Triton/flash-v100 backend
+    (the kernels exist; KV-shared decode reading the target's cache is the unproven bit).
 - **Phase C (validate + benchmark, ~1 day):** acceptance length via `/metrics`, lossless-output
   check vs the no-spec deploy, decode speedup vs the current 18.4 tok/s single-stream. enforce-eager
   (cudagraph + spec at hd512 untested).
