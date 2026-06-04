@@ -158,7 +158,36 @@ debug `flash_decode_paged.cu`'s partition path for the multi-row/long-seq verify
 D=512 config so it fits 96 KB at long context. Then drop the `VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q`
 workaround. The non-kernel port (Phases A/B + the runner/config wiring) is complete and correct.
 
-### UPDATE 3 (2026-06-04, latest): short output is CORRECT — remaining bugs are draft quality + long degradation
+### UPDATE 4 (2026-06-04): draft forward is HEALTHY — bug isolated to the draft prediction/alignment
+
+Instrumented the drafter forward (norm dumps, one-shot, filtered to real small-batch steps). On real
+inference steps everything is healthy:
+- Embedding sharing works: log "Detected MTP model. Sharing target model embedding weights with the
+  draft model" (eagle.py:1646); the draft's `embed_tokens.weight` is the target's (262144, 5376) and
+  `inputs_embeds` is (N, 5376) with norm ~74–86/token. normalizer = sqrt(5376) = 73.31 (matches gemma).
+- Target-hidden FEEDBACK is non-zero and chains correctly: prefill `tgt_hidden` norm 1446 (21 tok),
+  decode steps ~290–307, and each step's `backbone(out)` norm (~290–309) matches the next step's
+  `tgt_hidden(in)` — the hidden-state feedback loop is wired right. (The `ntok=4, norm=0` entries are
+  dummy/profile runs, not real inference.)
+- `draft_hidden` (1024) and `backbone` (5376) norms are reasonable, no NaN/zeros. Weights load
+  cleanly (no missing/unexpected). lm_head stays draft-dim 1024 (tied to the loaded draft embed).
+
+Yet **per-position[0] acceptance = 0%** — even the FIRST draft token (computed before any
+constant-position loop) is systematically wrong. So the bug is NOT: KV-share read, KV binding,
+hidden feedback, embedding share, weight load, or the verify kernel — ALL confirmed healthy. It is
+isolated to **the draft's prediction itself being systematically misaligned with the target** (0%
+absolute, not "weak draft" — a weak 0.5B draft would still hit easy tokens). Leading remaining
+candidates: a token-input/position offset specific to how the fork feeds the draft (the input_ids
+shift / first-token handling), or the draft `lm_head`/logits path, OR a genuine format/training
+mismatch in how this fork drives the gemma4 assistant.
+
+**Definitive next step (heavy):** dump the draft's argmax token-IDs per step and compare against a
+plain-transformers `assistant_model=` reference (target 31B + assistant in HF) to find the offset —
+requires standing up the 31B in HF on the V100s (large, slow) or a smaller gemma-4 pair as a proxy.
+This is a deliberate harness, not a redeploy tweak. Everything up to the draft's logits is verified
+correct.
+
+### (earlier) UPDATE 3: short output is CORRECT — remaining bugs are draft quality + long degradation
 
 With ALL fixes applied (backbone-dim convertor + hd512 head-size advertising) and the DEFAULT verify
 config, the picture is much better than the earlier "all garbage" reads:
