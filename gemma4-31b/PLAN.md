@@ -43,6 +43,31 @@ the unusual global-layer proj shapes.
 RoPE. max_position_embeddings 262144. Reasoning model (output → `reasoning_content` first; clients
 need `max_tokens ≥ 256`). vocab/hidden/intermediate: TBD from config (Phase 0).
 
+## Phase 0 RESULTS (2026-06-04) — both gating risks CLEARED ✅
+
+Run in an isolated, no-GPU spike pod (prod/NUMA1 + the 4090 untouched).
+
+- **0a head_dim 512 on V100 — CLEARED, trivial.** Added a `case 512:` to `flash_decode_paged.cu`'s
+  head_dim switch and compiled for sm_70: the D=512 partition kernels use **40–52 registers, 0 spills,
+  ~13 KB smem** (limits 255 reg / 96 KB). The kernel template already handles arbitrary D — global
+  layers just need the switch case added to the decode (and prefill) dispatch. NOT a blocker.
+- **0b transformers 4.57→5.5 — CLEARED, clean.** `transformers==5.5.0` installs, ships `Gemma4Config`
+  + gemma4 modeling, and **`import vllm` still works** on it (no import-time breakage). Small blast
+  radius. (Caveat: import ≠ full runtime validation — confirm model load during Phase 1.)
+- **0c real config** (`QuantTrio/gemma-4-31B-it-AWQ`): `architectures=[Gemma4ForConditionalGeneration]`
+  (**multimodal** checkpoint → runs as `gemma4_mm` text-only like the Qwen-vision deploy), `model_type
+  gemma4`, 60 layers, hidden 5376, inter 21504, 32 heads / 16 KV, head_dim **256 sliding / 512 global**
+  (4 global KV heads). **PLE off** (`hidden_size_per_layer_input: 0`). **p-RoPE on global layers**
+  (`proportional`, θ 1e6, partial_rotary 0.25); sliding default θ 1e4. vocab 262144, ctx 262144.
+  AWQ: `bits 4, group_size 64, version gemm, zero_point true, modules_to_not_convert
+  [vision_tower, model.layers.0.]`.
+- **AWQ group_size 64** — `awq_sm70_gemm.cu` takes `group_size` as a runtime param (autotune key + gemm
+  arg, not hardcoded) → gs64 should work; validate at load.
+
+**Verdict: GREEN — clean port, not a slog.** Both scary risks turned out trivial/clean. Revised
+remaining work: port `gemma4_mm.py` from upstream (transformers 5.5 has the arch), add the head_dim-512
+switch case, wire AWQ sm70 (verify gs64), handle p-RoPE + variable head_dim, validate, deploy.
+
 ## Plan — phased, de-risk first
 
 ### Phase 0 — de-risk spikes (DO FIRST; either failure reshapes/blocks the effort)
