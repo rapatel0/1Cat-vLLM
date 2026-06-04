@@ -133,5 +133,40 @@ All components were isolated-tested correct: flash-v100 prefill kernel @ D=512 (
 template), not a bug — chat-formatted prompts are correct.
 
 Caveat: needs the rebuilt flash_attn_v100 (head_dim 512). For deployment, bake nvcc + transformers 5.5
-+ the rebuilt kernel + the model files into an overlay image (or a startup wrapper). Phase 5 (TP4
-deploy on the free NUMA0 GPUs + benchmark vs the 4090's 25.7 tok/s) remains.
++ the rebuilt kernel + the model files into an overlay image (or a startup wrapper).
+
+## Phase 5 — DEPLOYED + BENCHMARKED ✅ (2026-06-04)
+
+TP4 serving on the 4 free **NUMA0** V100s (prod NUMA1 + the 4090 untouched). No image rebuild:
+overlay the 7 modified python files via the `gemma4-overlay` ConfigMap + install transformers 5.5 +
+copy the rebuilt head_dim-512 flash_attn_v100 `.so` from the PVC (`/models/gemma-kernel`) at startup,
+NUMA-pin, launch. Manifest: `homelab.ds4/manifests/qwen36-27b-vllm-sm70/24-deployment-gemma4-31b.yaml`.
+Served as `gemma4-31b`. Chat coherent (capital of France → **Paris**).
+
+**KV auto-trim gotcha:** the fork auto-trims KV to a single max-context slot (single-user
+long-context default), capping concurrency at 1.05x → flat ~18 tok/s aggregate regardless of load
+(running=1, waiting=N). Fix: `--kv-cache-auto-trim-ratio 0 --max-num-seqs 8` → full 20.35 GiB KV,
+**11.44x** concurrency headroom.
+
+**Throughput (TP4, AWQ gs64, enforce-eager, max_model_len 8192):**
+
+| concurrency | aggregate tok/s | per-stream tok/s |
+|---|---|---|
+| 1  | 18.3  | 18.3 |
+| 2  | 36.9  | 18.5 |
+| 4  | 73.6  | 18.4 |
+| 8  | 147.3 | 18.4 |
+
+Clean **linear scaling** — per-stream holds ~18.4 tok/s with zero degradation through conc 8 (decode
+roofline not yet hit; KV supports ~11x, so more headroom). Story = **aggregate throughput + VRAM**,
+not single-stream latency: single-stream 18.4 tok/s is *below* the 4090's 25.7 (eager + Triton
+sliding-layer fallback + TP4 all-reduce overhead), but batched aggregate (147 @ conc 8) far exceeds
+the single 4090.
+
+**Left on the table (for the regroup):**
+- `--enforce-eager` is on (cudagraph unvalidated at head_dim 512) → single-stream is conservative;
+  cudagraph would lift the per-stream number.
+- The 50/60 sliding layers fall back to **Triton** (only the 10 global head_dim-512 layers use the
+  flash-v100 path) — a flash-v100 sliding path would help both latency and per-stream throughput.
+- max-num-seqs could go to ~11 (KV headroom) for even more aggregate.
+- PPL vs the 4090 GGUF still not quantified.
