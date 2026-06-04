@@ -118,16 +118,24 @@ monotonically with position; uniform = draft and target are in lockstep on garba
 - Ruled out: V100 KV-cache corruption by the draft — none of the flash_attn_v100 paths write the
   paged cache (the common attention layer does the reshape_and_cache, and it honors
   `kv_sharing_target_layer_name`).
-- **Prime suspect: the `constant_draft_positions` port.** Qwen MTP works on this exact V100 spec
-  path but does NOT use constant positions — that code path is new for gemma4 and the least tested.
-  The fork's `propose()` loop uses a fused `eagle_step_update_slot_mapping_and_metadata` kernel where
-  upstream uses `_update_positions_dependent_metadata`; my port gates that block + seeds
-  `self.positions[:batch_size]`, but the slot_mapping / seq_len state the target verify sees may be
-  subtly wrong.
-- Next step (needs instrumentation): enable the fork's spec-debug dump
-  (`_spec_dump_draft_logits_enabled`) or add logging to compare draft vs target logits at one spec
-  position; check whether the target verify forward alone (drafter stubbed to 1 token) is already
-  garbage, which would localize it to the target-side metadata vs the drafter.
+- **LOCALIZED (num_spec=1 diagnostic):** with `num_speculative_tokens=1` the draft loop never runs
+  (`for ... in range(num_spec-1)` is empty), so `constant_draft_positions` is NOT the cause — yet
+  output is still garbage AND acceptance collapses to ~0% (1/141). At ~0% acceptance almost every
+  emitted token is the **target's** bonus token, so **the target's spec-verify forward is itself
+  producing garbage** — the drafter and `constant_draft_positions` are exonerated.
+- **Refined prime suspect: cross-model KV sharing on V100.** The gemma4-specific new ingredient vs
+  the working Qwen MTP is that the draft is *KV-shared* — it reads the target's KV cache
+  (`_setup_gemma4_kv_sharing` + `add_kv_sharing_layers_to_kv_cache_groups` add the draft layers to
+  the target's KV cache groups for layers 58/59). Qwen MTP has its *own* KV (not shared), so this
+  path is exercised for the first time here. The shared KV-cache-group / block handling appears to
+  corrupt the target's own attention at the shared layers (garbage from layer 58 onward), or the
+  multi-KV-group (hd256 sliding + hd512 global → 2 groups) target verify is mis-metadata'd on V100.
+  This is a deeper, kernel-adjacent fix than the loop.
+- Next steps: (a) test whether disabling the cross-model KV sharing — give the draft its own KV
+  cache instead of sharing (correctness over the small KV saving) — fixes the target output; (b) if
+  so, the bug is in `add_kv_sharing_layers_to_kv_cache_groups` / the shared-block path on the fork's
+  V100 cache; (c) compare against a single-KV-group target (the gemma4 sliding-only case) to isolate
+  the multi-group factor; (d) enable `VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE` on the verify path.
 
 The no-spec deploy (`24-deployment`, 18.4/147 tok/s) is restored as the active service; the mtp
 deploy is scaled to 0 (manifest + overlay preserved for resuming).
