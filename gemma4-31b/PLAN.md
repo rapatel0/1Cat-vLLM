@@ -119,3 +119,19 @@ switch case, wire AWQ sm70 (verify gs64), handle p-RoPE + variable head_dim, val
 - vLLM Gemma-4: https://vllm.ai/blog/2026-04-02-gemma4 ; https://docs.vllm.ai/projects/recipes/en/latest/Google/Gemma4.html ; transformers-version issue https://github.com/vllm-project/vllm/issues/38868 ; INT4 run https://github.com/vllm-project/vllm/issues/39133
 - AWQ checkpoints: https://huggingface.co/QuantTrio/gemma-4-31B-it-AWQ ; https://huggingface.co/QuantTrio/gemma-4-31B-it-AWQ-6Bit ; https://huggingface.co/cyankiwi/gemma-4-31B-it-AWQ-4bit
 - Architecture: https://kaitchup.substack.com/p/gemma-4-31b-and-26b-a4b-architecture ; https://huggingface.co/docs/transformers/model_doc/gemma4
+
+## VALIDATION — WORKING ✅ (2026-06-04)
+
+Gemma-4-31B-it Dense AWQ runs **correctly** on a single V100 (TP1) via the fork. Verified with the
+chat template (temperature 0):
+- "capital of France?" → **Paris**; "first 5 primes" → **2, 3, 5, 7, 11**; "17×4" → **68**;
+  "good morning" → French → **Bonjour**; "largest planet" → **Jupiter**; sky-blue → correct Rayleigh.
+
+All components were isolated-tested correct: flash-v100 prefill kernel @ D=512 (cos 1.0), decode kernel
+@ D=512 (cos 1.0), p-RoPE inv_freq vs HF (exact, 0.0 diff), AWQ sm70 gemm @ gs64 (cos 1.0). The early
+"France is France is" degeneration was **raw-completion behavior of an instruct model** (no chat
+template), not a bug — chat-formatted prompts are correct.
+
+Caveat: needs the rebuilt flash_attn_v100 (head_dim 512). For deployment, bake nvcc + transformers 5.5
++ the rebuilt kernel + the model files into an overlay image (or a startup wrapper). Phase 5 (TP4
+deploy on the free NUMA0 GPUs + benchmark vs the 4090's 25.7 tok/s) remains.
