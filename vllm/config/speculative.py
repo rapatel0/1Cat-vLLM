@@ -775,6 +775,16 @@ class SpeculativeConfig:
     def use_eagle(self) -> bool:
         return self.method in ("eagle", "eagle3", "mtp", "dflash")
 
+    def use_gemma4_mtp(self) -> bool:
+        # Gemma4 MTP (gemma4_assistant) uses a dedicated KV-shared proposer,
+        # not the generic eagle/MTP path. method is auto-detected as "mtp".
+        return (
+            self.method == "mtp"
+            and self.draft_model_config is not None
+            and getattr(self.draft_model_config.hf_config, "model_type", None)
+            == "gemma4_assistant"
+        )
+
     def use_dflash(self) -> bool:
         return self.method == "dflash"
 

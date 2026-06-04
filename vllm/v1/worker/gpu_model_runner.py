@@ -157,6 +157,7 @@ from vllm.v1.sample.sampler import Sampler
 from vllm.v1.spec_decode.dflash import DFlashProposer
 from vllm.v1.spec_decode.draft_model import DraftModelProposer
 from vllm.v1.spec_decode.eagle import EagleProposer
+from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
 from vllm.v1.spec_decode.medusa import MedusaProposer
 from vllm.v1.spec_decode.metadata import SpecDecodeMetadata
 from vllm.v1.spec_decode.suffix_decoding import SuffixDecodingProposer
@@ -476,6 +477,10 @@ class GPUModelRunner(
                 )
             elif self.speculative_config.method == "suffix":
                 self.drafter = SuffixDecodingProposer(self.vllm_config)
+            elif self.speculative_config.use_gemma4_mtp():
+                # Gemma4 MTP: KV-shared drafter (method auto-detected as "mtp",
+                # so this must be checked before use_eagle()).
+                self.drafter = Gemma4Proposer(self.vllm_config, self.device, self)
             elif self.speculative_config.use_eagle():
                 self.drafter = EagleProposer(self.vllm_config, self.device, self)
                 if self.speculative_config.method == "eagle3":
@@ -1938,7 +1943,9 @@ class GPUModelRunner(
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
             if self.speculative_config and spec_decode_common_attn_metadata is None:
-                if isinstance(self.drafter, (EagleProposer, DFlashProposer)):
+                if isinstance(
+                    self.drafter, (EagleProposer, DFlashProposer, Gemma4Proposer)
+                ):
                     if self.drafter.attn_layer_names[0] in kv_cache_group.layer_names:
                         spec_decode_common_attn_metadata = cm
                 else:
@@ -1948,6 +1955,12 @@ class GPUModelRunner(
                     if dflash_common_attn_metadata_by_gid is None:
                         dflash_common_attn_metadata_by_gid = {}
                     dflash_common_attn_metadata_by_gid[kv_cache_gid] = cm
+            # Gemma4 MTP spans multiple KV cache groups (sliding + full); capture
+            # each group's block table so the proposer can swap them per draft step.
+            if self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
+                self.drafter.set_per_group_block_table(
+                    kv_cache_gid, cm.block_table_tensor
+                )
 
             for attn_gid in range(len(self.attn_groups[kv_cache_gid])):
                 if ubatch_slices is not None:

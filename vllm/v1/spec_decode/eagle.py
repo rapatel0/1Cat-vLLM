@@ -162,6 +162,11 @@ class SpecDecodeBaseProposer:
 
         self._draft_attn_layer_names: set[str] = set()
         self.draft_attn_groups: list[AttentionGroup] = []
+        # When True (e.g. Gemma4 MTP), all draft steps predict from the same
+        # (last target) position: positions/seq_lens/slot_mapping do not advance
+        # between loop iterations and attn metadata is built once and reused.
+        # Default False preserves the autoregressive behavior of other proposers.
+        self.constant_draft_positions: bool = False
         self.kv_cache_gid: int = -1
         self.draft_layer_to_kv_cache_gid: dict[str, int] = {}
         self.eagle3_use_aux_hidden_state: bool = (
@@ -651,6 +656,12 @@ class SpecDecodeBaseProposer:
             positions = self.positions[token_indices_to_sample]
         hidden_states = hidden_states[token_indices_to_sample]
 
+        if self.constant_draft_positions:
+            # Seed the sampling positions into the front of the positions buffer
+            # so loop iterations (which read via _get_positions) use the correct
+            # constant values without advancing.
+            self.positions[:batch_size] = positions
+
         if any(isinstance(md, TreeAttentionMetadata) for md in per_group_attn_metadata):
             # Draft using tree attention - requires full logits for top-k
             logits = self.model.compute_logits(sample_hidden_states)
@@ -722,59 +733,68 @@ class SpecDecodeBaseProposer:
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
             input_ids = draft_token_ids_list[-1].int()
-            # Use fused kernel for slot mapping and metadata updates.
-            # Write clamped positions directly into the positions buffer to
-            # avoid an extra D2D copy for the common (non-mrope) case.
-            positions_1d = positions[0] if self.uses_mrope else positions
-            if self.uses_mrope:
-                out_pos = self.mrope_positions[0, :batch_size]
-            elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
-                out_pos = self.xdrope_positions[0, :batch_size]
-            else:
-                out_pos = self.positions[:batch_size]
-            eagle_step_update_slot_mapping_and_metadata(
-                positions_1d=positions_1d,
-                block_table_tensor=common_attn_metadata.block_table_tensor,
-                seq_lens=common_attn_metadata.seq_lens,
-                block_size=block_size,
-                max_model_len=self.max_model_len,
-                out_clamped_positions=out_pos,
-                out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
-                input_batch_size=input_batch_size,
-            )
-            common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:batch_size]
-            if self.uses_mrope:
-                self.mrope_positions[1:, :batch_size] = self.mrope_positions[
-                    0, :batch_size
-                ]
-                positions = self.mrope_positions[:, :batch_size]
-            elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
-                self.xdrope_positions[1:, :batch_size] = self.xdrope_positions[
-                    0, :batch_size
-                ]
-                positions = self.xdrope_positions[0, :batch_size]
-            else:
-                positions = self.positions[:batch_size]
-            # Increment the maximum sequence length. We increment max_seq_len
-            # unconditionally even though some seq_lens may have been capped above,
-            # as max_seq_len serves as an upper bound for sequence lengths.
-            common_attn_metadata.max_seq_len = min(
-                common_attn_metadata.max_seq_len + 1, self.max_model_len
-            )
+            if not self.constant_draft_positions:
+                # Use fused kernel for slot mapping and metadata updates.
+                # Write clamped positions directly into the positions buffer to
+                # avoid an extra D2D copy for the common (non-mrope) case.
+                positions_1d = positions[0] if self.uses_mrope else positions
+                if self.uses_mrope:
+                    out_pos = self.mrope_positions[0, :batch_size]
+                elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
+                    out_pos = self.xdrope_positions[0, :batch_size]
+                else:
+                    out_pos = self.positions[:batch_size]
+                eagle_step_update_slot_mapping_and_metadata(
+                    positions_1d=positions_1d,
+                    block_table_tensor=common_attn_metadata.block_table_tensor,
+                    seq_lens=common_attn_metadata.seq_lens,
+                    block_size=block_size,
+                    max_model_len=self.max_model_len,
+                    out_clamped_positions=out_pos,
+                    out_slot_mapping=self._slot_mapping_buffer[:input_batch_size],
+                    input_batch_size=input_batch_size,
+                )
+                common_attn_metadata.slot_mapping = self._slot_mapping_buffer[:batch_size]
+                if self.uses_mrope:
+                    self.mrope_positions[1:, :batch_size] = self.mrope_positions[
+                        0, :batch_size
+                    ]
+                    positions = self.mrope_positions[:, :batch_size]
+                elif self.uses_xdrope_dim > 0 and self.draft_uses_xdrope_dim > 0:
+                    self.xdrope_positions[1:, :batch_size] = self.xdrope_positions[
+                        0, :batch_size
+                    ]
+                    positions = self.xdrope_positions[0, :batch_size]
+                else:
+                    positions = self.positions[:batch_size]
+                # Increment the maximum sequence length. We increment max_seq_len
+                # unconditionally even though some seq_lens may have been capped
+                # above, as max_seq_len serves as an upper bound for seq lengths.
+                common_attn_metadata.max_seq_len = min(
+                    common_attn_metadata.max_seq_len + 1, self.max_model_len
+                )
 
-            # Also update the CPU-side shadow; NOTE: this is hacky and should be
-            # removed in when common_attn_metadata.seq_lens_cpu is deprecated.
-            if common_attn_metadata._seq_lens_cpu is not None:
-                common_attn_metadata._seq_lens_cpu += 1
-            if common_attn_metadata._num_computed_tokens_cpu is not None:
-                common_attn_metadata._num_computed_tokens_cpu += 1
-            if getattr(common_attn_metadata, "seq_lens_cpu_upper_bound", None) is not None:
-                common_attn_metadata.seq_lens_cpu_upper_bound += 1
+                # Also update the CPU-side shadow; NOTE: this is hacky and should
+                # be removed when common_attn_metadata.seq_lens_cpu is deprecated.
+                if common_attn_metadata._seq_lens_cpu is not None:
+                    common_attn_metadata._seq_lens_cpu += 1
+                if common_attn_metadata._num_computed_tokens_cpu is not None:
+                    common_attn_metadata._num_computed_tokens_cpu += 1
+                if (
+                    getattr(common_attn_metadata, "seq_lens_cpu_upper_bound", None)
+                    is not None
+                ):
+                    common_attn_metadata.seq_lens_cpu_upper_bound += 1
 
-            # Rebuild attention metadata
-            _, per_layer_attn_metadata = self.build_per_group_and_layer_attn_metadata(
-                common_attn_metadata, draft_index=token_index + 1
-            )
+            # Rebuild attention metadata. When draft positions are constant
+            # (Gemma4 MTP), common_attn_metadata is invariant across loop
+            # iterations, so build once and reuse.
+            if not self.constant_draft_positions or token_index == 0:
+                _, per_layer_attn_metadata = (
+                    self.build_per_group_and_layer_attn_metadata(
+                        common_attn_metadata, draft_index=token_index + 1
+                    )
+                )
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids
