@@ -429,6 +429,20 @@ class LongCatFlashMTPModelArchConfigConvertor(ModelArchConfigConvertorBase):
         return getattr(self.hf_text_config, "num_nextn_predict_layers", 1)
 
 
+class Gemma4AssistantModelArchConfigConvertor(ModelArchConfigConvertorBase):
+    def get_hidden_size(self) -> int:
+        # The Gemma4 MTP proposer's hidden-state feedback buffer holds the
+        # *target* model's last-layer hidden states (backbone_hidden_size),
+        # which differs from the draft model's own (smaller) hidden_size.
+        # The draft model's internal layers size themselves from text_config
+        # directly, so this only affects the proposer buffer / shape assert.
+        return getattr(
+            self.hf_config,
+            "backbone_hidden_size",
+            getattr(self.hf_text_config, "hidden_size", 0),
+        )
+
+
 # hf_config.model_type -> convertor class
 MODEL_ARCH_CONFIG_CONVERTORS = {
     "mamba": MambaModelArchConfigConvertor,
@@ -450,4 +464,5 @@ MODEL_ARCH_CONFIG_CONVERTORS = {
     "ernie_mtp": ErnieMTPModelArchConfigConvertor,
     "pangu_ultra_moe_mtp": PanguUltraMoeMTPModelArchConfigConvertor,
     "longcat_flash_mtp": LongCatFlashMTPModelArchConfigConvertor,
+    "gemma4_assistant": Gemma4AssistantModelArchConfigConvertor,
 }

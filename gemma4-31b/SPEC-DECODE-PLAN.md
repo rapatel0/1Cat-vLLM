@@ -96,6 +96,42 @@ The drafter `google/gemma-4-31B-it-assistant` (arch `Gemma4AssistantForCausalLM`
   check vs the no-spec deploy, decode speedup vs the current 18.4 tok/s single-stream. enforce-eager
   (cudagraph + spec at hd512 untested).
 
+## Phase C status (2026-06-04) — LOADS + FAST, but a correctness bug remains
+
+End-to-end spec decode **runs on V100**: the target + `gemma4-31b-it-assistant` drafter load, the
+KV-sharing wires correctly on all 4 TP workers (draft sliding layers 0–2 → target layer 58, full
+layer 3 → target layer 59), the profile run passes, and serving is **3.3× faster** (61.6 vs 18.4
+tok/s single-stream). Delivered via the PVC tarball overlay (`/models/gemma-overlay.tar.gz`, 16
+files) + `26-deployment-gemma4-31b-mtp.yaml`.
+
+Fixes needed to get there (committed): add `Gemma4Proposer` to every drafter `isinstance` guard in
+`gpu_model_runner.py` (5 asserts + the type annotation + the cudagraph assert — `use_eagle()` is True
+for gemma4 so it enters those eagle blocks); add a `gemma4_assistant` model-arch-config convertor so
+`get_hidden_size()` returns `backbone_hidden_size` (5376) — the proposer's hidden-state feedback
+buffer holds the *target's* last-layer hidden, not the draft's 1024.
+
+**BUG (open): output is garbage** ("Paris" then degenerates), so spec decode is NOT lossless yet.
+Diagnostic: acceptance is **all-or-nothing** — `num_accepted_per_pos` is uniform (453 at every
+position 0–3; 453/526 drafts accept all 4, 73 reject at pos 0). Genuine rejection sampling decays
+monotonically with position; uniform = draft and target are in lockstep on garbage, i.e. the
+*target's* spec path is producing the garbage and the draft mirrors it.
+- Ruled out: V100 KV-cache corruption by the draft — none of the flash_attn_v100 paths write the
+  paged cache (the common attention layer does the reshape_and_cache, and it honors
+  `kv_sharing_target_layer_name`).
+- **Prime suspect: the `constant_draft_positions` port.** Qwen MTP works on this exact V100 spec
+  path but does NOT use constant positions — that code path is new for gemma4 and the least tested.
+  The fork's `propose()` loop uses a fused `eagle_step_update_slot_mapping_and_metadata` kernel where
+  upstream uses `_update_positions_dependent_metadata`; my port gates that block + seeds
+  `self.positions[:batch_size]`, but the slot_mapping / seq_len state the target verify sees may be
+  subtly wrong.
+- Next step (needs instrumentation): enable the fork's spec-debug dump
+  (`_spec_dump_draft_logits_enabled`) or add logging to compare draft vs target logits at one spec
+  position; check whether the target verify forward alone (drafter stubbed to 1 token) is already
+  garbage, which would localize it to the target-side metadata vs the drafter.
+
+The no-spec deploy (`24-deployment`, 18.4/147 tok/s) is restored as the active service; the mtp
+deploy is scaled to 0 (manifest + overlay preserved for resuming).
+
 ## Open risks to watch
 - gpu_model_runner divergence (Phase B) is the dominant risk — could balloon if the fork's runner
   has refactored the spec-decode hooks the upstream gemma4 path depends on.

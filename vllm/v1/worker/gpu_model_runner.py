@@ -459,6 +459,7 @@ class GPUModelRunner(
                 | DFlashProposer
                 | DraftModelProposer
                 | MedusaProposer
+                | Gemma4Proposer
             )
             if self.speculative_config.method == "ngram":
                 from vllm.v1.spec_decode.ngram_proposer import NgramProposer
@@ -3827,7 +3828,8 @@ class GPUModelRunner(
                 # EAGLE/DraftModel speculative decoding can use the GPU sampled tokens
                 # as inputs, and does not need to wait for bookkeeping to finish.
                 assert isinstance(
-                    self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                    self.drafter,
+                    EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,  # noqa: E501
                 )
                 sampled_token_ids = sampler_output.sampled_token_ids
                 if input_fits_in_drafter:
@@ -4141,7 +4143,8 @@ class GPUModelRunner(
             or spec_config.uses_draft_model()
         ):
             assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                self.drafter,
+                    EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,  # noqa: E501
             )
 
             if spec_config.disable_padded_drafter_batch:
@@ -5055,7 +5058,8 @@ class GPUModelRunner(
                 or self.speculative_config.uses_draft_model()
             ):
                 assert isinstance(
-                    self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                    self.drafter,
+                    EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,  # noqa: E501
                 )
                 assert self.speculative_config is not None
                 # Eagle currently only supports PIECEWISE cudagraphs.
@@ -5604,7 +5608,8 @@ class GPUModelRunner(
             or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                self.drafter,
+                    EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,  # noqa: E501
             )
             self.drafter.initialize_attn_backend(kv_cache_config, kernel_block_sizes)
 
@@ -5768,7 +5773,9 @@ class GPUModelRunner(
             self.speculative_config.use_eagle()
             or self.speculative_config.use_dflash()
         ):
-            assert isinstance(self.drafter, EagleProposer | DFlashProposer)
+            assert isinstance(
+                self.drafter, EagleProposer | DFlashProposer | Gemma4Proposer
+            )
             self.drafter.initialize_cudagraph_keys(cudagraph_mode)
 
     def calculate_reorder_batch_threshold(self) -> None:
@@ -6255,7 +6262,8 @@ class GPUModelRunner(
             or self.speculative_config.uses_draft_model()
         ):
             assert isinstance(
-                self.drafter, EagleProposer | DFlashProposer | DraftModelProposer
+                self.drafter,
+                    EagleProposer | DFlashProposer | DraftModelProposer | Gemma4Proposer,  # noqa: E501
             )
             # validate all draft model layers belong to the same kv cache
             # group
