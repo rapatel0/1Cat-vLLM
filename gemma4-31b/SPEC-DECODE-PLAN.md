@@ -7,6 +7,36 @@
 ```
 Expected ~up to 3x decode speedup (lossless). Branch: continue on `gemma4-31b-awq-v100`.
 
+## ✅ RESOLVED — WORKING + LOSSLESS (2026-06-04)
+
+Gemma-4-31B native MTP speculative decoding **works correctly on V100**. Output is **lossless**
+(verified identical to no-spec: count-to-15, primes, planets, Declaration of Independence, Tokyo,
+144 — all match), with genuine monotonic acceptance (per-pos 56/23/13/7, mean accept length ~1.64)
+and a **1.19x single-stream speedup (21.9 vs 18.4 tok/s)**.
+
+**Two bugs had to be fixed (after the full Phase A/B port + ~18 instrumented debug cycles that
+verified every other component healthy):**
+1. **Draft RoPE null-key (the major bug).** `Gemma4MTPAttention` called
+   `self.rotary_emb(positions, q, None)`. The V100 fork's in-place `torch.ops._C.rotary_embedding`
+   leaves the QUERY un-rotated when `key=None`, so the draft was position-blind → garbage drafts →
+   0% acceptance. The draft is the *only* caller passing `key=None` (the target always passes a real
+   k, which is why the target always worked). **Fix:** pass a real (zeros) dummy key so q is rotated;
+   the rotated key is discarded (the draft is KV-shared). Committed in `gemma4_mtp.py`.
+2. **hd512 small-query verify imprecision (the residual).** After fix #1, output was correct on most
+   prompts but had rare token-slips (a stray "P3." vs "3."). The V100 `_flash_v100_small_query_prefill_as_decode`
+   verify path is numerically imprecise at head_dim 512, occasionally making the target's verify
+   greedy differ from the true greedy → a wrong draft token gets accepted (lossy). **Fix (config):**
+   `VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q=0` routes verify to the paged-prefill kernel → exactly
+   lossless. Baked into `26-deployment-gemma4-31b-mtp.yaml`. (A proper kernel fix for the small-q
+   hd512 path would restore the faster verify and likely lift acceptance/speedup — a follow-up.)
+
+**Headroom:** ~16% per-token acceptance is modest for a 0.5B MTP assistant; the paged-prefill verify
+is also slower than small-q. Fixing the hd512 small-q kernel + draft tuning could push the speedup
+well above 1.19x. But the deliverable — **correct, lossless Gemma-4 MTP spec decode on V100** — is done.
+
+---
+
+
 ## Feasibility (de-risked 2026-06-04) — GREEN on the model, AMBER on the integration
 
 Gemma-4 MTP is **activation-coupled, two-checkpoint** spec decode (see memory `gemma4-mtp-coupled-head`).
