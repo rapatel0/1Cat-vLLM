@@ -158,6 +158,16 @@ debug `flash_decode_paged.cu`'s partition path for the multi-row/long-seq verify
 D=512 config so it fits 96 KB at long context. Then drop the `VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q`
 workaround. The non-kernel port (Phases A/B + the runner/config wiring) is complete and correct.
 
+Kernel read (2026-06-04): `flash_attention_decode_partition_kernel<D,PART,KV>` processes each query
+row as an independent `(batch_idx, head, partition)` block — `q_shared[D]` is 1 KB at D=512, smem is
+fine, and the per-row block_table/seq_len indexing is independent — so a multi-row verify should
+behave like N independent (validated) single-row decodes. That means the D=512 defect is subtle
+(candidates: `dot_qk_cache<512>` warp-reduction over 16 elems/lane, or the K/V cache read at the
+verify's per-row seq_lens) and won't yield to static reading. Next debug step is numerical:
+deploy with `VLLM_FLASH_V100_DEBUG_PREFILL_COMPARE=1` (compares small-q-as-decode vs paged-prefill
+outputs in-kernel) to catch the first divergent layer/row — a deliberate active-session loop, not an
+autonomous one (each iteration is an nvcc rebuild + GPU redeploy).
+
 The no-spec deploy (`24-deployment`, 18.4/147 tok/s) is restored as the active service; the mtp
 deploy is scaled to 0 (manifest + overlay preserved for resuming).
 
