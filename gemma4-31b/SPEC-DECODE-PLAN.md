@@ -158,7 +158,34 @@ debug `flash_decode_paged.cu`'s partition path for the multi-row/long-seq verify
 D=512 config so it fits 96 KB at long context. Then drop the `VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q`
 workaround. The non-kernel port (Phases A/B + the runner/config wiring) is complete and correct.
 
-### UPDATE 4 (2026-06-04): draft forward is HEALTHY — bug isolated to the draft prediction/alignment
+### UPDATE 5 (2026-06-04): every component verified — bug is the draft hidden-state VALUES (needs ref compare)
+
+Token-level + weight-level instrumentation (all reverted; clean overlay on PVC):
+- Draft predicts high/garbage token IDs (e.g. input token 537 → draft predicts 238736, near top of the
+  262144 vocab) — systematically wrong, hence 0% even on easy tokens.
+- **lm_head is CORRECT**: shape (vocab/TP=65536, 1024), norm ~256, finite, absmax 0.68, `tied_now=False`
+  (correctly keeps the draft's own 1024-dim head, not the swapped-in 5376 target embed). So lm_head is
+  loaded + intact, NOT uninitialized.
+- Embedding sharing (eagle.py:1668: `del self.model.model.embed_tokens; ... = target_embed_tokens`)
+  works and runs AFTER weight load (log order: "Loading weights" then "Sharing ... embedding").
+
+**Conclusion — exhaustively narrowed:** every component is verified healthy — verify kernel, KV-share
+read, KV binding, hidden-state feedback (chains correctly), embedding share, weight load, lm_head. The
+draft forward is numerically sane (reasonable norms, finite). Yet it predicts garbage. The ONLY thing
+left is that the **draft's hidden-state VALUES are subtly wrong** (right magnitude, wrong direction) —
+sourced from the draft layer computation: the KV-shared Q-only attention (the draft computes its own Q
+from draft-dim 1024 against the target's K/V), the pre/post projections, q_norm, or p-RoPE on the
+draft's global (hd512) layer. This cannot be resolved by activation-norm inspection — it needs a
+**numerical per-layer comparison against a plain-transformers `assistant_model=` reference**.
+
+This is the limit of deployment-log debugging (~17 instrumented cycles). The remaining work is a
+reference harness: run gemma-4-31B-it + its assistant in HF transformers (large; may need CPU/offload
+or a smaller gemma-4 pair as proxy), capture the assistant's per-step hidden states + logits for a
+fixed input, and diff against the vLLM draft to find the first divergent op. Likely outcomes: a wrong
+KV-share Q/K alignment for the draft, a p-RoPE/q_norm detail on the hd512 draft layer, or a
+projection-order/scale mismatch vs how the assistant was trained.
+
+### (earlier) UPDATE 4: draft forward is HEALTHY — bug isolated to the draft prediction/alignment
 
 Instrumented the drafter forward (norm dumps, one-shot, filtered to real small-batch steps). On real
 inference steps everything is healthy:
