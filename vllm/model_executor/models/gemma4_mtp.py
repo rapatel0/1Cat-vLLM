@@ -243,17 +243,21 @@ class Gemma4MTPAttention(nn.Module):
         q = self.q_norm(q)
         q = q.flatten(-2, -1)
 
-        q, _ = self.rotary_emb(positions, q, None)
-
         # Attention reads K/V from the target's cache via KV sharing;
         # these dummy tensors are never consumed but required by the API.
         num_tokens = q.shape[0]
-        kv_dummy = torch.empty(
+        kv_dummy = torch.zeros(
             num_tokens,
             self.num_kv_heads * self.head_dim,
             dtype=q.dtype,
             device=q.device,
         )
+        # NOTE: pass a real (dummy) key to rotary_emb rather than None. On the
+        # V100 fork's in-place rotary_embedding op, a null key can leave the
+        # query un-rotated; the dummy key guarantees q is RoPE'd. The rotated
+        # key is discarded (the draft is KV-shared and reads the target's K/V).
+        q, _ = self.rotary_emb(positions, q, kv_dummy.clone())
+
         attn_output = self.attn(q, kv_dummy, kv_dummy)
         output, _ = self.o_proj(attn_output)
         return output
