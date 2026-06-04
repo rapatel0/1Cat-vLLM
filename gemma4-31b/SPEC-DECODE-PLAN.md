@@ -158,7 +158,34 @@ debug `flash_decode_paged.cu`'s partition path for the multi-row/long-seq verify
 D=512 config so it fits 96 KB at long context. Then drop the `VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q`
 workaround. The non-kernel port (Phases A/B + the runner/config wiring) is complete and correct.
 
-### CORRECTION (2026-06-04, later): it is NOT the verify kernel — it's the cross-model KV read
+### UPDATE 3 (2026-06-04, latest): short output is CORRECT — remaining bugs are draft quality + long degradation
+
+With ALL fixes applied (backbone-dim convertor + hd512 head-size advertising) and the DEFAULT verify
+config, the picture is much better than the earlier "all garbage" reads:
+- **Within a pod, output is deterministic** ("capital of France"→Paris, 3/3 identical). The earlier
+  cross-run variation was across different *configs/pods*, not a per-forward uninitialized read.
+- **Short outputs are CORRECT**: Paris, "25+17"→42. And acceptance **genuinely decays**
+  (per-pos 2/0/0/0) — the spec mechanism (proposer, rejection sampling, verify) is working.
+- Instrumented + DISPROVEN: (a) the verify-kernel hypothesis (all 3 paths behave the same), and
+  (b) the missing-KV-binding hypothesis — a one-shot `[g4dbg]` log confirmed the draft's 4 layers
+  ARE collected into `shared_kv_cache_layers` ({draft.0-2→target.58, draft.3→target.59}) and bound
+  to the target's KV tensors in `initialize_kv_cache_tensors` (pod loads with no KeyError).
+
+**Two remaining bugs (both in the gemma4 MTP *model* path, not the integration):**
+1. **Draft acceptance ~0%** (2/1440). A 0.5B MTP assistant should hit 50–70%. ~0% means the draft
+   forward predicts poorly → suspect the draft model module: the embedding-sharing dim dance
+   (`embed_tokens` replaced with the target's backbone-dim 5376 embed; draft `lm_head` kept at
+   draft-dim 1024 and tied to the *original* 1024 embed), the pre/post projections, or the
+   target-hidden-state feedback. Needs tensor-level instrumentation (dump draft logits vs a HF
+   `assistant_model=` reference for one step).
+2. **Long output degrades** ("vasts blues holdss", "yyyyy") accumulating with generation length —
+   likely a KV/position accumulation issue over many spec steps.
+
+Net: the port + integration are correct (short output lossless, genuine spec accounting); the work
+left is debugging the gemma4 MTP forward's draft quality + long-context accumulation — model-module
+tensor debugging, several cycles. NOT the verify kernel and NOT the KV binding (both disproven).
+
+### (earlier) CORRECTION: it is NOT the verify kernel — it's the cross-model KV read
 
 Broader testing overturned the "verify kernel" diagnosis. All THREE V100 verify paths were forced
 and tested (env-only, no rebuild): small-q-as-decode (`SMALLQ_DECODE_MAX_Q` default), the dedicated
