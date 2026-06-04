@@ -43,6 +43,7 @@ MTPModelTypes = Literal[
     "mtp",
     "pangu_ultra_moe_mtp",
     "step3p5_mtp",
+    "gemma4_assistant",
 ]
 DFlashModelTypes = Literal["dflash"]
 EagleModelTypes = Literal["eagle", "eagle3", MTPModelTypes, DFlashModelTypes]
