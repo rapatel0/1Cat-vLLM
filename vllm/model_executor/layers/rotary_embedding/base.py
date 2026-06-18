@@ -209,6 +209,14 @@ class RotaryEmbedding(RotaryEmbeddingBase):
             )
             return query, key
 
+        if key is None:
+            # The fork's in-place _C.rotary_embedding leaves `query` un-rotated
+            # when `key` is None; route Q-only inputs to the native impl (which
+            # rotates query correctly), mirroring forward_xpu. Needed by KV-shared
+            # MTP drafters (gemma4 assistant / gemma4_unified) so they don't need
+            # a per-model dummy-key workaround.
+            return self.forward_native(positions, query, key)
+
         from vllm import _custom_ops as ops
 
         cos_sin_cache = self._match_cos_sin_cache_dtype(query)
