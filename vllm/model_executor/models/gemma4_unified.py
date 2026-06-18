@@ -20,12 +20,17 @@ from collections.abc import Iterable, Mapping
 
 import torch
 from torch import nn
-from transformers.models.gemma4_unified.configuration_gemma4_unified import (
-    Gemma4UnifiedConfig,
-)
-from transformers.models.gemma4_unified.processing_gemma4_unified import (
-    Gemma4UnifiedProcessor,
-)
+# transformers 5.5 (this fork) does not ship the gemma4_unified config/processor
+# (they land in 5.10). Use vLLM's local config; the processor is only needed for
+# the vision/audio path (phase 2) — guard it so the text path imports cleanly.
+from vllm.transformers_utils.configs.gemma4_unified import Gemma4UnifiedConfig
+
+try:
+    from transformers.models.gemma4_unified.processing_gemma4_unified import (
+        Gemma4UnifiedProcessor,
+    )
+except ImportError:
+    Gemma4UnifiedProcessor = None
 
 from vllm.config import VllmConfig
 from vllm.config.multimodal import VideoDummyOptions
