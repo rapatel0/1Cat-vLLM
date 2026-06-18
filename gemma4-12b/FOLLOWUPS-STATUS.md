@@ -54,21 +54,28 @@ extract, hd512 `.so` copy). Folded into a self-contained image so the wrapper is
   the overlay deploy, with no boot-time install/extract. The live `gemma4-12b` deploy now runs the
   baked image; the overlay manifest (`28-deployment-gemma4-12b.yaml`) stays as the fallback.
 
-## Deferred (deep, low-ROI, or 31B-MTP which is offline)
+### #19 — FULL CUDA graphs (more single-slot) ✅ SOLVED via `FULL_AND_PIECEWISE` (no rewrite)
+Initial read was that the whole V100 attention is a host-driven per-seq dispatch loop needing a
+kernel rewrite. **That's only true of the PREFILL path** (`_flash_v100_prefill*`, host `.item()`
+loops at lines 593-603/807-852/925). The **DECODE path** (`_flash_v100_decode`, lines 631-666) is
+already device-resident — one batched `flash_attn_decode_paged` launch over `block_table`/`seq_lens`
+device tensors, **zero `.item()`** (it even logs "CUDA-graph safe"); `_flash_v100_small_query_prefill
+_as_decode` is likewise built for FULL replay. Pure `FULL` crashed earlier because it tried to capture
+*prefill*. **`cudagraph_mode: FULL_AND_PIECEWISE`** captures FULL graphs for **decode** batches (the
+graph-safe path) and PIECEWISE for mixed/prefill → no crash, no rewrite. Verified live (decode-FULL
+capture succeeds, 0.68 GiB, 0 restarts):
+| metric | PIECEWISE (#20) | FULL_AND_PIECEWISE (#19) |
+|---|---|---|
+| single-stream | 33.5 | **34.1** (+1.8%) |
+| conc=2 agg | 36.6 | **47.0** (+28%) |
+| conc=4 agg | 105.7 | 107.3 |
+| errors / restarts | 0 / 0 | **0 / 0** |
+Strictly better than PIECEWISE; now the committed config in both 12B manifests. The modest single-
+stream delta confirms decode-attention launch overhead is small — which means the once-feared
+**prefill** device-resident rewrite would be *even lower* ROI (prefill isn't the single-stream
+bottleneck), so it stays unbuilt by choice, not blocked.
 
-### #19 — FULL CUDA graphs (more single-slot) — DEFERRED, low ROI
-The V100 attention `forward()` is an **architectural host-driven per-sequence dispatch loop**
-(`for i in range(num_seqs): start = int(query_start_loc[i].item())`, lines 593-603/807-852/925),
-not a few stray syncs — `.item()` on seq_lens/query_start_loc/block_table drives per-seq kernel
-launches. FULL capture can't contain data-dependent host control flow → it crashes at replay.
-Making it graph-safe = rewriting it as a device-resident batched paged-attention kernel for SM70 at
-**hd512** (the same hard surface as #14). **Ceiling is small:** single-stream decode is num_seqs=1,
-~2 `.item()`/layer × 48 layers ≈ 96 host syncs/token ≈ ~3% of the ~30ms/token; FULL would also save
-the eager attention-kernel launch overhead, but that's a minority of per-token cost on a 12B (MLP +
-projections, already graphed by PIECEWISE, dominate). With #20 solved, the concurrency motivation for
-FULL is also gone. **Verdict: deep, risky kernel rewrite for a marginal gain on top of the 1.6× —
-deferred.** Unblock path: write/port a fixed-shape device-metadata paged-attention kernel (D=512),
-then enable `cudagraph_mode: FULL` (or `FULL_AND_PIECEWISE`).
+## Gated on 31B-MTP redeploy (not 12B tasks)
 
 ### #14 — hd512 small-query verify kernel (31B-MTP) — gated on 31B redeploy
 Small-query-as-decode verify path is numerically imprecise at hd512 (rare wrong-accepts), currently
@@ -83,8 +90,12 @@ Optimization-only (MTP is lossless, just a modest 1.19×); requires the 31B MTP 
 harness. Not a 12B task.
 
 ## Bottom line
-- **All live-12B follow-ups are resolved:** single-slot 21 → 33.5 tok/s (#17), concurrency unblocked
-  with no single-stream cost (#20), RoPE primitive hardened (#16), baked image built (#18).
-- **#19** is a deep hd512 kernel rewrite for a ~few-% single-stream gain — deferred as low-ROI.
-- **#14/#15** are 31B-MTP optimizations (already lossless), gated on redeploying the replaced 31B —
-  only worth it if the 31B-MTP comes back.
+- **Every live-12B follow-up is resolved:** single-slot 21 → 34.1 tok/s (#17 PIECEWISE → #19
+  FULL_AND_PIECEWISE), concurrency unblocked with no single-stream cost (#20), decode attention now
+  in FULL graphs (#19), RoPE primitive hardened (#16), overlay baked into a self-contained image and
+  validated live (#18).
+- **Live config:** `gemma4-12b` (omni, fp16, TP2, 262K) on the baked image
+  `onecat-vllm:v1-v100-110-gemma12b`, `cudagraph_mode: FULL_AND_PIECEWISE` + `cudagraph_copy_inputs`.
+  34.1 tok/s single-stream, 0 errors / 0 restarts through conc=4.
+- **#14/#15** are the only open follow-ups and are **out of 12B scope** — 31B-MTP optimizations
+  (already lossless), gated on redeploying the replaced 31B; worth doing only if the 31B-MTP returns.
