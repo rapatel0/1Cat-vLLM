@@ -60,6 +60,7 @@ _CLASS_TO_MODULE: dict[str, str] = {
     "Qwen3_5MoeConfig": "vllm.transformers_utils.configs.qwen3_5_moe",
     "Qwen3_5MoeTextConfig": "vllm.transformers_utils.configs.qwen3_5_moe",
     "Gemma4AssistantConfig": "vllm.transformers_utils.configs.gemma4_assistant",
+    "Gemma4UnifiedConfig": "vllm.transformers_utils.configs.gemma4_unified",
     "Tarsier2Config": "vllm.transformers_utils.configs.tarsier2",
     # Special case: DeepseekV3Config is from HuggingFace Transformers
     "DeepseekV3Config": "transformers",
@@ -109,6 +110,7 @@ __all__ = [
     "Qwen3_5MoeConfig",
     "Qwen3_5MoeTextConfig",
     "Gemma4AssistantConfig",
+    "Gemma4UnifiedConfig",
     "Tarsier2Config",
 ]
 
