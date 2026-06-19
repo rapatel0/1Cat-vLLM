@@ -79,11 +79,23 @@ def main() -> int:
 
     llm = LLM(**kwargs)
     nseq = int(os.environ.get("NUM_SEQS", "1"))
+    maxtok = int(os.environ.get("MAX_TOKENS", "8"))
     prompts = [{"prompt_token_ids": [1 + (i % 7), 2, 3, 4, 5, 6, 7, 8]}
                for i in range(nseq)]
-    out = llm.generate(prompts, SamplingParams(max_tokens=8, temperature=0.0))
+    sp = SamplingParams(max_tokens=maxtok, temperature=0.0, ignore_eos=True)
+
+    import time
+    # warmup (compile/capture), then timed
+    llm.generate(prompts, SamplingParams(max_tokens=4, temperature=0.0, ignore_eos=True))
+    t0 = time.perf_counter()
+    out = llm.generate(prompts, sp)
+    dt = time.perf_counter() - t0
+    toks = sum(len(o.outputs[0].token_ids) for o in out)
     ok = all(len(o.outputs[0].token_ids) > 0 for o in out)
-    print(f"[smoke] {nseq} seqs; sample token_ids: {list(out[0].outputs[0].token_ids)}")
+    tag = os.environ.get("BENCH_TAG", "")
+    print(f"[BENCH]{tag} nseq={nseq} maxtok={maxtok} tp={tp} "
+          f"tokens={toks} time={dt:.3f}s tok/s={toks/dt:.1f} "
+          f"sample={list(out[0].outputs[0].token_ids)[:4]}")
     print("[SMOKE OK]" if ok else "[SMOKE FAIL]")
     return 0 if ok else 1
 
