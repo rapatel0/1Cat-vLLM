@@ -86,11 +86,41 @@ class Int2Sm70Config(QuantizationConfig):
         return cls(group_size=config.get("group_size", 128))
 
     def get_quant_method(self, layer: Module, prefix: str):
-        # mixed precision: quantize Linear layers; leave others (incl. MoE for
-        # now) unquantized. MoE expert method is a follow-up (uses the same op).
+        # mixed precision: 2-bit the MoE experts (memory bulk) + Linear layers.
+        from vllm.model_executor.layers.fused_moe.layer import FusedMoE
+        if isinstance(layer, FusedMoE):
+            return _make_moe_method(layer.moe_config, self)
         if isinstance(layer, LinearBase):
             return Int2Sm70LinearMethod(self)
         return None
+
+
+def fake_quantize_2bit(W: torch.Tensor, group_size: int) -> torch.Tensor:
+    """dequant(quantize(W)) over the last dim — puts weights through the exact
+    2-bit affine format. For dev/validation (random dummy weights, gibberish OK)
+    until the production quantized-checkpoint loader lands."""
+    shp = W.shape
+    K = shp[-1]
+    g = group_size if (K % group_size == 0) else K
+    _, _, _, Wdq = quantize_affine_2bit(W.reshape(-1, K), g)
+    return Wdq.reshape(shp).to(W.dtype)
+
+
+def _make_moe_method(moe_config, quant_config: "Int2Sm70Config"):
+    """Subclass the unquantized FusedMoE method (inherits the selected backend +
+    apply) and route the expert weights through the 2-bit roundtrip on load."""
+    from vllm.model_executor.layers.fused_moe.unquantized_fused_moe_method import (
+        UnquantizedFusedMoEMethod,
+    )
+
+    class Int2Sm70MoEMethod(UnquantizedFusedMoEMethod):
+        def process_weights_after_loading(self, layer):
+            g = quant_config.group_size
+            layer.w13_weight.data = fake_quantize_2bit(layer.w13_weight.data, g)
+            layer.w2_weight.data = fake_quantize_2bit(layer.w2_weight.data, g)
+            super().process_weights_after_loading(layer)
+
+    return Int2Sm70MoEMethod(moe_config)
 
 
 class Int2Sm70LinearMethod(LinearMethodBase):
