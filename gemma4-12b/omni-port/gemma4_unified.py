@@ -75,6 +75,7 @@ __all__ = [
 # ---------------------------------------------------------------------------
 
 
+
 class Gemma4UnifiedVisionEmbedder(nn.Module):
     """Encoder-free vision embedder for Gemma4 Unified variants.
 
@@ -456,7 +457,15 @@ class Gemma4UnifiedForConditionalGeneration(Gemma4ForConditionalGeneration):
             self,
             ignore_unexpected_prefixes=ignore_prefixes,
         )
-        return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+        loaded = loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
+
+        # The encoder-free vision embedder (patch_dense weights have std ~15) and
+        # audio embedder overflow to inf/NaN when run in fp16 (Gemma is bf16-native).
+        # They are unquantized and tiny, so run them in fp32 to stay numerically safe;
+        # _process_image_input casts the fp32 output back to the projection dtype.
+        if self.vision_embedder is not None:
+            self.vision_embedder = self.vision_embedder.float()
+        return loaded
 
     # ------------------------------------------------------------------ #
     # LoRA / multimodal mapping

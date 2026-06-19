@@ -1621,6 +1621,12 @@ class Gemma4ForConditionalGeneration(
         Uses _full_attn_layer_idxs (precomputed in __init__) for O(1)
         lookup instead of per-call regex parsing.
         """
+        # No-op: this V100 fork shares one attn_metadata object across sliding and
+        # full-attention layers, so clearing mm_prefix_range for full-attn layers here
+        # would wipe it for the sliding layers too. Instead the per-layer bidi decision
+        # is made in the flash_attn_v100 impl (_triton_with_bidi_gate), which nulls
+        # mm_prefix_range only for the full-attn layer being processed.
+        return
         if not self._full_attn_layer_idxs:
             return
 
