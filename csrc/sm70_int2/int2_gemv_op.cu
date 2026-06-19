@@ -13,6 +13,7 @@
 // v1: M=1 (mm_int2_gemv_m1, register-A). M=2..8 (n-split) is a follow-up.
 
 #include <torch/extension.h>
+#include <c10/cuda/CUDAStream.h>
 #include <cuda_fp16.h>
 #include <cstdint>
 
@@ -93,7 +94,7 @@ torch::Tensor int2_gemv_m1(torch::Tensor A, torch::Tensor qweight,
 
     auto out = torch::empty({1, N}, A.options());
     const dim3 grid((N + CPB - 1) / CPB), block(WG * 32);
-    auto stream = at::cuda::getCurrentCUDAStream();
+    auto stream = c10::cuda::getCurrentCUDAStream();
     gemv_m1_kernel<<<grid, block, 0, stream>>>(
         qweight.data_ptr<uint8_t>(),
         reinterpret_cast<const __half *>(scales.data_ptr<at::Half>()),

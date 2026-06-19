@@ -14,10 +14,34 @@ Weight tensors (per linear partition, output O x input I):
   scales  : fp16   [O, I//group_size]
   qbias   : fp16   [O, I//group_size]   (the affine bias = min of the group)
 """
+import os
 from typing import Any, Optional
 
 import torch
 from torch.nn import Module, Parameter
+
+_OP = None
+
+
+def _get_op():
+    """Lazily load the compiled int2 GEMV op (cached build). Returns None if
+    unavailable so apply() falls back to the torch dequant path."""
+    global _OP
+    if _OP is None:
+        try:
+            from torch.utils.cpp_extension import load
+            src = os.environ.get(
+                "INT2_SM70_OP_SRC", "/workspace/csrc/sm70_int2/int2_gemv_op.cu")
+            _OP = load(name="int2_sm70_gemv", sources=[src],
+                       extra_cuda_cflags=["-O3", "-arch=sm_70"], verbose=False)
+            import sys
+            print("[int2_sm70] compiled GEMV op LOADED", file=sys.stderr, flush=True)
+        except Exception as e:
+            import sys
+            print(f"[int2_sm70] op load failed ({e}); using fallback",
+                  file=sys.stderr, flush=True)
+            _OP = False
+    return _OP or None
 
 from vllm.model_executor.layers.linear import LinearBase, LinearMethodBase
 from vllm.model_executor.layers.quantization import register_quantization_config
@@ -161,6 +185,18 @@ class Int2Sm70LinearMethod(LinearMethodBase):
 
     def apply(self, layer: Module, x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
-        # torch-fallback: y = x @ dequant(W).T  (+ bias)
-        out = torch.nn.functional.linear(x, layer._w_dq, bias)
-        return out
+        # compiled int2 GEMV for M==1 decode (validated rel ~6e-4); torch-fallback
+        # otherwise (prefill / M>1; the n-split op is a follow-up).
+        K = x.shape[-1]
+        if (x.dim() == 2 and x.shape[0] == 1 and K % 512 == 0
+                and os.environ.get("INT2_SM70_USE_OP", "1") == "1"):
+            op = _get_op()
+            if op is not None:
+                try:
+                    out = op.int2_gemv_m1(x.contiguous(), layer.qweight,
+                                          layer.scales, layer.qbias,
+                                          self.quant_config.group_size)
+                    return out if bias is None else out + bias
+                except Exception:
+                    pass
+        return torch.nn.functional.linear(x, layer._w_dq, bias)
