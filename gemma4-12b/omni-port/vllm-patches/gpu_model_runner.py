@@ -1968,6 +1968,11 @@ class GPUModelRunner(
                 image_doc_ranges = []
                 req_state = self.requests[req_id]
                 for mm_feature in req_state.mm_features:
+                    # Bidirectional attention applies to vision only
+                    # (use_bidirectional_attention='vision'); audio tokens stay
+                    # causal, so exclude them from the mm_prefix_range bidi span.
+                    if getattr(mm_feature, "modality", None) not in ("image", "video"):
+                        continue
                     pos_info = mm_feature.mm_position
                     img_doc_range = pos_info.extract_embeds_range()
                     image_doc_ranges.extend(img_doc_range)

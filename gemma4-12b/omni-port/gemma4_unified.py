@@ -76,6 +76,7 @@ __all__ = [
 
 
 
+
 class Gemma4UnifiedVisionEmbedder(nn.Module):
     """Encoder-free vision embedder for Gemma4 Unified variants.
 

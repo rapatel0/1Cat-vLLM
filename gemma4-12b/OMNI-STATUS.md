@@ -44,8 +44,24 @@ TP2, `--dtype float16`, AWQ W4A16 (CT→sm70), `FULL_AND_PIECEWISE` cudagraphs,
 gpu-mem 0.90, max-num-seqs 4. Overlay (`/models/gemma12b-overlay.tar.gz`) carries the patched
 vLLM files + vendored processors (21 files).
 
-## Open
-- **Audio**: feature extractor + `embed_audio` vendored/constructed but not run end-to-end (likely
-  needs the same fp32 treatment for any large-weight audio projection + validation).
-- **Video**: enabled (reuses the image path) but not yet validated with a real clip.
-- The fp32-vision and bidi-gate patches are V100-fork-specific; candidates to upstream into the fork.
+## Video — WORKING
+Validated with a synthetic mp4 (red/blue/green frames): the model lists "Red, Dark Blue, Dark Green".
+Reuses the vision path (frames → the fp32 vision embedder). Needs `librosa`/`soundfile` + `cv2`
+(opencv, already in the image) for decode. No extra fixes beyond the image work.
+
+## Audio — pipeline functional, perception NOT working
+Deps: add `librosa soundfile` to the boot install (vLLM raises "Please install vllm[audio]" otherwise).
+After that the pipeline runs end-to-end: the vendored `Gemma4UnifiedAudioFeatureExtractor` produces raw
+waveform frames `(N,640)`, `embed_audio` projects them (matches the HF `get_audio_features` exactly:
+RMSNorm→Linear), embeds are **healthy** (std ~1.3, no NaN), ~25 tokens/sec are injected (prompt tokens
+grow), and audio is excluded from the vision bidi span (runner modality filter: image/video only, since
+`use_bidirectional_attention='vision'`). **But the model does not perceive the audio** — it returns
+"SILENT" for both a full-scale tone and true silence, i.e. cannot distinguish them. The merge path is
+the same one image uses (which works), and the embedder matches HF, so this looks like the **QAT
+12B checkpoint's audio capability being weak/untrained** (or perception only emerging for real speech,
+which couldn't be synthesized here) rather than a code defect. Needs the full HF model as a reference
+(or a known audio-strong checkpoint) to settle.
+
+## Notes
+- The fp32-vision, bidi-gate, is_mm_prefix_lm and audio-modality-filter patches are V100-fork-specific;
+  candidates to upstream into the fork.
