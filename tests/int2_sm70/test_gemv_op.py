@@ -55,12 +55,30 @@ def run(N, K, group, seed=0):
     return rel
 
 
+def run_n(M, N, K, group, seed=0):
+    torch.manual_seed(seed)
+    W = (torch.randn(N, K, device="cuda") * 0.05).to(torch.float16)
+    qweight, scales, bias, Wdq = quantize_affine_2bit(W, group)
+    wt = ext.int2_repack_nmajor(qweight, K)
+    A = (torch.randn(M, K, device="cuda")).to(torch.float16)
+    out = ext.int2_gemv_n(A, wt, scales, bias, group)
+    ref = (A.float() @ Wdq.float().t()).to(torch.float16)
+    rel = ((out.float() - ref.float()).norm() / ref.float().norm().clamp_min(1e-6)).item()
+    print(f"  M={M} N={N:5d} K={K:6d} group={group:4d}  rel={rel:.3e}")
+    return rel
+
+
 def main():
     print("[int2 GEMV op] numerical validation vs torch dequant-matmul")
     worst = 0.0
+    print(" M=1 (gemv_m1):")
     for (N, K, group) in [(256, 2048, 128), (512, 4096, 128), (1024, 8192, 64),
                           (256, 2048, 512), (128, 16384, 128)]:
         worst = max(worst, run(N, K, group))
+    print(" M=2..8 (gemv_n, n-split + repack):")
+    for M in (2, 4, 8):
+        worst = max(worst, run_n(M, 256, 2048, 128))
+        worst = max(worst, run_n(M, 512, 8192, 128))
     ok = worst < 5e-3
     print(f"worst rel={worst:.3e}  ->  {'[GEMV OP OK]' if ok else '[GEMV OP FAIL]'}")
     raise SystemExit(0 if ok else 1)

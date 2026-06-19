@@ -21,21 +21,26 @@ import tempfile
 def build_tiny_config(path: str) -> str:
     from transformers import Glm4MoeConfig
 
+    E = int(os.environ.get("EXPERTS", "8"))
+    H = int(os.environ.get("HIDDEN", "512"))
+    L = int(os.environ.get("LAYERS", "4"))
+    NH = int(os.environ.get("HEADS", "8"))
+    KV = int(os.environ.get("KV_HEADS", "2"))
     cfg = Glm4MoeConfig(
-        vocab_size=2048,
-        hidden_size=512,
-        intermediate_size=1024,      # dense FFN (first_k_dense_replace layers)
-        moe_intermediate_size=512,   # per-expert FFN
-        num_hidden_layers=4,
-        first_k_dense_replace=1,     # layer 0 dense, 1..3 MoE
-        n_routed_experts=8,
-        num_experts_per_tok=2,
+        vocab_size=int(os.environ.get("VOCAB", "2048")),
+        hidden_size=H,
+        intermediate_size=int(os.environ.get("DENSE_INT", str(H * 2))),
+        moe_intermediate_size=int(os.environ.get("MOE_INT", str(H))),
+        num_hidden_layers=L,
+        first_k_dense_replace=1,     # layer 0 dense, rest MoE
+        n_routed_experts=E,
+        num_experts_per_tok=min(E, int(os.environ.get("TOPK", "2"))),
         n_shared_experts=1,
         n_group=1,
         topk_group=1,
-        num_attention_heads=8,
-        num_key_value_heads=2,       # GQA
-        head_dim=64,
+        num_attention_heads=NH,
+        num_key_value_heads=KV,      # GQA
+        head_dim=H // NH,
         max_position_embeddings=2048,
         rms_norm_eps=1e-5,
         hidden_act="silu",
@@ -73,13 +78,12 @@ def main() -> int:
         kwargs["quantization"] = quant
 
     llm = LLM(**kwargs)
-    out = llm.generate(
-        {"prompt_token_ids": [1, 2, 3, 4, 5, 6, 7, 8]},
-        SamplingParams(max_tokens=8, temperature=0.0),
-    )
-    toks = out[0].outputs[0].token_ids
-    ok = len(toks) > 0 and all(isinstance(t, int) for t in toks)
-    print(f"[smoke] generated token_ids: {list(toks)}")
+    nseq = int(os.environ.get("NUM_SEQS", "1"))
+    prompts = [{"prompt_token_ids": [1 + (i % 7), 2, 3, 4, 5, 6, 7, 8]}
+               for i in range(nseq)]
+    out = llm.generate(prompts, SamplingParams(max_tokens=8, temperature=0.0))
+    ok = all(len(o.outputs[0].token_ids) > 0 for o in out)
+    print(f"[smoke] {nseq} seqs; sample token_ids: {list(out[0].outputs[0].token_ids)}")
     print("[SMOKE OK]" if ok else "[SMOKE FAIL]")
     return 0 if ok else 1
 

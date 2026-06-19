@@ -176,27 +176,42 @@ class Int2Sm70LinearMethod(LinearMethodBase):
         layer.output_size_per_partition = O
 
     def process_weights_after_loading(self, layer: Module) -> None:
-        # cache the dequantized weight for the torch-fallback path (P1b replaces
-        # this with the compiled GEMV op on the packed tensors directly).
+        # fallback dequantized weight (M>8 / unsupported shapes)
         W = dequantize_affine_2bit(layer.qweight, layer.scales, layer.qbias,
                                    self.quant_config.group_size)
-        layer.register_parameter("_w_dq",
-                                 Parameter(W, requires_grad=False))
+        layer.register_parameter("_w_dq", Parameter(W, requires_grad=False))
+        # n-major repack for the M=2..8 op (once, on load), if shapes fit
+        O, Kp = layer.qweight.shape
+        K = Kp * 4
+        layer._wt = None
+        if O % 128 == 0 and K % 512 == 0:
+            op = _get_op()
+            if op is not None:
+                try:
+                    layer._wt = op.int2_repack_nmajor(layer.qweight.contiguous(), K)
+                except Exception:
+                    layer._wt = None
 
     def apply(self, layer: Module, x: torch.Tensor,
               bias: Optional[torch.Tensor] = None) -> torch.Tensor:
         # compiled int2 GEMV for M==1 decode (validated rel ~6e-4); torch-fallback
         # otherwise (prefill / M>1; the n-split op is a follow-up).
         K = x.shape[-1]
-        if (x.dim() == 2 and x.shape[0] == 1 and K % 512 == 0
-                and os.environ.get("INT2_SM70_USE_OP", "1") == "1"):
+        g = self.quant_config.group_size
+        use_op = os.environ.get("INT2_SM70_USE_OP", "1") == "1"
+        if use_op and x.dim() == 2 and K % 512 == 0:
+            M = x.shape[0]
             op = _get_op()
             if op is not None:
                 try:
-                    out = op.int2_gemv_m1(x.contiguous(), layer.qweight,
-                                          layer.scales, layer.qbias,
-                                          self.quant_config.group_size)
-                    return out if bias is None else out + bias
+                    if M == 1:
+                        out = op.int2_gemv_m1(x.contiguous(), layer.qweight,
+                                              layer.scales, layer.qbias, g)
+                        return out if bias is None else out + bias
+                    if 2 <= M <= 8 and getattr(layer, "_wt", None) is not None:
+                        out = op.int2_gemv_n(x.contiguous(), layer._wt,
+                                             layer.scales, layer.qbias, g)
+                        return out if bias is None else out + bias
                 except Exception:
                     pass
         return torch.nn.functional.linear(x, layer._w_dq, bias)
