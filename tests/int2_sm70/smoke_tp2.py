@@ -32,7 +32,7 @@ def build_tiny_config(path: str) -> str:
         intermediate_size=int(os.environ.get("DENSE_INT", str(H * 2))),
         moe_intermediate_size=int(os.environ.get("MOE_INT", str(H))),
         num_hidden_layers=L,
-        first_k_dense_replace=1,     # layer 0 dense, rest MoE
+        first_k_dense_replace=int(os.environ.get("DENSE_REPLACE", "1")),
         n_routed_experts=E,
         num_experts_per_tok=min(E, int(os.environ.get("TOPK", "2"))),
         n_shared_experts=1,
