@@ -484,7 +484,15 @@ class Gemma4DummyInputsBuilder(BaseDummyInputsBuilder[Gemma4ProcessingInfo]):
         }
 
         if num_audios > 0:
-            audio_len = processor.feature_extractor.fft_length
+            # Encoder-free audio: raw waveform chunked into frames of
+            # ``audio_samples_per_token`` (640) samples.  A worst-case dummy
+            # spans ``audio_seq_length`` tokens.  (The unified feature
+            # extractor has no ``fft_length`` — that was a conformer-era attr.)
+            fe = processor.feature_extractor
+            audio_len = getattr(fe, "fft_length", None) or (
+                processor.audio_seq_length
+                * getattr(fe, "audio_samples_per_token", 640)
+            )
             data["audio"] = self._get_dummy_audios(
                 length=audio_len,
                 num_audios=num_audios,
