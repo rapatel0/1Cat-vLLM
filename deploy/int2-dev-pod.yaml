@@ -1,0 +1,69 @@
+# 2-GPU vLLM dev pod on gpu-01 for the int2 SM70 integration.
+#
+# Uses the already-built fork image (vllm 1.1.0, torch 2.9.1+cu128) so we skip
+# the heavy full build and iterate via the overlay pattern (drop Python into
+# /opt/venv site-packages, compile our int2 .so over it). Sees all GPUs via
+# NVIDIA_VISIBLE_DEVICES=all; pick the 2 free ones at runtime with
+# CUDA_VISIBLE_DEVICES (e.g. 4,7) for TP=2. Source is synced to the hostPath.
+#
+#   rsync the worktree -> /localpool/dev/int2-vllm on gpu-01
+#   kubectl apply -f deploy/int2-dev-pod.yaml
+#   kubectl -n llm exec int2-dev -- bash -lc \
+#     'CUDA_VISIBLE_DEVICES=4,7 TP=2 /opt/venv/bin/python \
+#      /workspace/tests/int2_sm70/smoke_tp2.py'
+apiVersion: v1
+kind: Pod
+metadata:
+  name: int2-dev
+  namespace: llm
+  labels:
+    app: int2-dev
+spec:
+  restartPolicy: Always
+  nodeSelector:
+    kubernetes.io/hostname: gpu-01
+  securityContext:
+    runAsUser: 0
+    runAsGroup: 0
+    fsGroup: 0
+  containers:
+    - name: dev
+      image: localhost:32000/onecat-vllm:v1-v100-110
+      imagePullPolicy: IfNotPresent
+      securityContext:
+        privileged: true
+        capabilities:
+          add: ["SYS_ADMIN"]
+      workingDir: /workspace
+      command: ["/bin/bash", "-c", "mkdir -p /workspace/tmp /workspace/hf; echo int2-dev ready; exec sleep infinity"]
+      env:
+        - {name: TERM, value: xterm-256color}
+        - {name: TMPDIR, value: /workspace/tmp}
+        - {name: HF_HOME, value: /workspace/hf}
+        - {name: NVIDIA_VISIBLE_DEVICES, value: all}
+        - {name: NVIDIA_DRIVER_CAPABILITIES, value: "compute,utility"}
+        # vLLM TP multiprocessing wants spawn + a roomy shm (mounted below)
+        - {name: VLLM_WORKER_MULTIPROC_METHOD, value: spawn}
+      # NOTE: deliberately NO `nvidia.com/gpu` request — the device-plugin
+      # accounting on gpu-01 is fully claimed by the serving pods even though
+      # GPUs 4,7 are physically idle. privileged + NVIDIA_VISIBLE_DEVICES=all
+      # exposes all GPUs; pick the free ones at runtime via CUDA_VISIBLE_DEVICES.
+      resources:
+        requests:
+          cpu: "8"
+          memory: 32Gi
+          ephemeral-storage: 256Mi
+        limits:
+          ephemeral-storage: 4Gi
+      volumeMounts:
+        - {name: workspace, mountPath: /workspace}
+        - {name: dshm, mountPath: /dev/shm}
+  volumes:
+    - name: workspace
+      hostPath:
+        path: /localpool/dev/int2-vllm
+        type: DirectoryOrCreate
+    - name: dshm
+      emptyDir:
+        medium: Memory
+        sizeLimit: 16Gi
