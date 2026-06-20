@@ -32,6 +32,7 @@ def main() -> int:
         cpu_offload_gb=float(os.environ.get("CPU_OFFLOAD_GB", "0")),
         max_num_seqs=int(os.environ.get("MAX_NUM_SEQS", "1")),
         max_num_batched_tokens=int(os.environ.get("MAX_BATCHED_TOKENS", "2048")),
+        kv_cache_dtype=os.environ.get("KV_CACHE_DTYPE", "auto"),
     )
     nseq = int(os.environ.get("NUM_SEQS", "1"))
     maxtok = int(os.environ.get("MAX_TOKENS", "8"))
