@@ -45,9 +45,19 @@ if old in s:
     s = s.replace(old, new); open(p, "w").write(s)
     print("[fp8-mla-overlay] patched VLLM_BATCH_INVARIANT")
 PY
+# V100 Triton supports fp8 e5m2 ('fp8e5') but NOT e4m3 ('fp8e4nv' -> Hopper).
+# Add fp8_e5m2 to the supported list and USE IT (KV_CACHE_DTYPE=fp8_e5m2).
+/opt/venv/bin/python - "$SP/v1/attention/backends/mla/triton_mla.py" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+if '"fp8_e5m2"' not in s:
+    s = s.replace('"fp8_e4m3",\n', '"fp8_e4m3",\n        "fp8_e5m2",\n', 1)
+    open(p, "w").write(s)
+    print("[fp8-mla-overlay] added fp8_e5m2 to supported list")
+PY
 /opt/venv/bin/python -c "
 from vllm.v1.attention.backends.mla.triton_mla import TritonMLABackend
-assert 'fp8_e4m3' in TritonMLABackend.supported_kv_cache_dtypes, 'fp8 not enabled'
+assert 'fp8_e5m2' in TritonMLABackend.supported_kv_cache_dtypes, 'fp8_e5m2 not enabled'
 print('[fp8-mla-overlay] OK — supported:', TritonMLABackend.supported_kv_cache_dtypes)
 "
-echo "[fp8-mla-overlay] done — run with KV_CACHE_DTYPE=fp8_e4m3"
+echo "[fp8-mla-overlay] done — run with KV_CACHE_DTYPE=fp8_e5m2 (e4m3 unsupported on sm70)"
