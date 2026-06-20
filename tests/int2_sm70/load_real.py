@@ -16,11 +16,13 @@ import sys
 def main() -> int:
     model = os.environ["MODEL_DIR"]
     tp = int(os.environ.get("TP", "2"))
+    pp = int(os.environ.get("PP", "1"))
     from vllm import LLM, SamplingParams
     llm = LLM(
         model=model,
         runner="generate",
         tensor_parallel_size=tp,
+        pipeline_parallel_size=pp,
         enforce_eager=True,
         gpu_memory_utilization=float(os.environ.get("GMU", "0.85")),
         max_model_len=int(os.environ.get("MAX_MODEL_LEN", "512")),
@@ -39,7 +41,7 @@ def main() -> int:
     out = llm.generate(prompts, sp)
     toks = sum(len(o.outputs[0].token_ids) for o in out)
     ok = all(len(o.outputs[0].token_ids) > 0 for o in out)
-    print(f"[REAL-LOAD] tp={tp} tokens={toks} "
+    print(f"[REAL-LOAD] tp={tp} pp={pp} tokens={toks} "
           f"sample={list(out[0].outputs[0].token_ids)[:6]}")
     print("[REAL-LOAD OK]" if ok else "[REAL-LOAD FAIL]")
     return 0 if ok else 1
