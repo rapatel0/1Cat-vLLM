@@ -35,17 +35,35 @@ architecture-agnostic; attention is vLLM's job):
 - `glm_moe_dsa` registered to `DeepseekV3Config` (transformers 4.57 predates the
   5.12 native class) so the real `config.json` loads.
 
-**Validated (commit b6d3ec5d3, dummy weights — gibberish expected):**
+**Validated (dummy weights — gibberish expected; the full 2-bit path runs):**
 | run | result |
 |---|---|
-| tiny `glm_moe_dsa`, TP=2 | `[DSA SMOKE OK]` — MLA via FLASH_ATTN_V100, Triton MoE |
-| tiny `glm_moe_dsa`, **TP=8 (all 8 GPUs)** | `[DSA SMOKE OK]` |
-| `glm_moe_dsa` + `quantization=int2_sm70` | `[DSA SMOKE OK]`, GEMV op LOADED on DSA linears |
+| tiny `glm_moe_dsa`, TP=2 / **TP=8 (all 8 GPUs)** | `[DSA SMOKE OK]` — MLA via FLASH_ATTN_V100 |
+| `glm_moe_dsa` + `int2_sm70` (linears) | `[DSA SMOKE OK]`, GEMV op LOADED |
+| **+ `INT2_PACKED_MOE=1` (packed-2bit experts, kernel compute), TP=2 & TP=8** | `[DSA SMOKE OK]` |
 
-**Remaining for real-weight bring-up (P5, below):** GLM-5.2 won't fit at FP8
-(745 GB ≫ 256 GB VRAM). Need real packed-2-bit expert storage (memory win) and/or
-expert pruning, plus a quantize-on-load from the FP8 ckpt. Harness:
-`tests/int2_sm70/smoke_dsa.py`; overlay `tests/int2_sm70/dsa_overlay.sh`.
+**The 2-bit MoE compute path (the one new hard piece).** No grouped 2-bit MoE
+kernel exists (tc-grid docs list it as a follow-up), so the experts are stored
+packed 2-bit (~8x smaller → fits) and computed by the **compiled single-matrix
+int2 GEMV kernel called per expert** (dequant *inside* the kernel — never
+materializes fp16). M-adaptive: `gemv_m1` (M=1 decode), `gemv_n` (M=2-8),
+dequant+matmul fallback (M>8). Bit-exact compute proven in
+`tools/test_int2_moe.py`; storage 7.1x < fp16. `Int2Sm70PackedMoEMethod`,
+`INT2_PACKED_MOE=1`.
+
+**Information-preserving quantizer** (`tools/glm52_quantize.py`): block-FP8 →
+2-bit affine, group 128, MSE-optimal asymmetric clip. On real GLM-5.2 experts:
+2-bit rel **0.50 (min/max) → 0.333 (MSE-opt)**. GPTQ-2bit is the further upgrade
+(needs calibration; minimizes *output* error, which RTN doesn't).
+
+**Remaining for real-weight bring-up (P5):**
+1. ✅ packed-2-bit MoE storage+compute · ✅ info-preserving quantizer · ✅ DSA arch on V100
+2. ⛔ offline FP8→packed-2bit conversion (write checkpoint) + the expert
+   weight-loader mapping (route packed tensors → packed params).
+3. ⛔ mixed precision: keep attention/embed/lm_head fp16 (get_quant_method should
+   return unquantized for non-expert linears — §3d), 2-bit only experts.
+4. ⛔ TP=8 real bring-up + coherence (gated on the 745GB download, in progress).
+Harness: `tests/int2_sm70/smoke_dsa.py`; overlays `dsa_overlay.sh` + `dev_overlay.sh`.
 
 ---
 
