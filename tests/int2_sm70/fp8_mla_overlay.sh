@@ -38,6 +38,12 @@ new = ('self._sm_count = (getattr(current_platform, "num_compute_units", None) '
 if old in s:
     s = s.replace(old, new); open(p, "w").write(s)
     print("[fp8-mla-overlay] patched _sm_count fallback")
+# 1.1.0 envs lacks VLLM_BATCH_INVARIANT.
+old = "if envs.VLLM_BATCH_INVARIANT:"
+new = 'if getattr(envs, "VLLM_BATCH_INVARIANT", False):'
+if old in s:
+    s = s.replace(old, new); open(p, "w").write(s)
+    print("[fp8-mla-overlay] patched VLLM_BATCH_INVARIANT")
 PY
 /opt/venv/bin/python -c "
 from vllm.v1.attention.backends.mla.triton_mla import TritonMLABackend
