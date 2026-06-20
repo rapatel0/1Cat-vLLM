@@ -98,6 +98,7 @@ _CONFIG_REGISTRY: dict[str, type[PretrainedConfig]] = LazyConfigDict(
     cosmos3_omni="Cosmos3Config",
     deepseek_vl_v2="DeepseekVLV2Config",
     deepseek_v32="DeepseekV3Config",
+    glm_moe_dsa="DeepseekV3Config",  # GLM-5.x DSA: DeepSeek-V3.2-shaped MLA+DSA config
     deepseek_v4="DeepseekV4Config",
     flex_olmo="FlexOlmoConfig",
     fireredlid="FireRedLIDConfig",

@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only DeepseekV2/DeepseekV3 model."""
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 from itertools import islice
@@ -74,6 +75,7 @@ from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sparse_attn_indexer import (
     SparseAttnIndexer,
 )
+from vllm.utils.deep_gemm import has_deep_gemm
 from vllm.model_executor.layers.vocab_parallel_embedding import (
     ParallelLMHead,
     VocabParallelEmbedding,
@@ -112,6 +114,28 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _dsa_runtime_enabled(config) -> bool:
+    """Whether to run the DeepSeek Sparse Attention (DSA) *sparse* path.
+
+    GLM-5.2 / DeepSeek-V3.2 ship a lightning indexer whose CUDA kernels live in
+    DeepGEMM (FP8, sm90+). On hardware without DeepGEMM (e.g. V100 / sm70) there
+    is no indexer kernel, so we fall back to *dense* MLA: the indexer only
+    *selects* a top-k subset of KV to attend to, and full (dense) attention is a
+    strict superset of that selection — correctness is preserved (DSA is trained
+    to approximate dense), only long-context speed/memory is lost.
+
+    Returns True only when the model is a DSA arch (``index_topk`` present) AND
+    the sparse kernels are actually available. ``VLLM_SM70_DSA_DENSE=1`` forces
+    the dense fallback even where DeepGEMM exists (testing); ``=0`` forces sparse.
+    """
+    if not hasattr(config, "index_topk"):
+        return False
+    force = os.environ.get("VLLM_SM70_DSA_DENSE")
+    if force is not None:
+        return force == "0"
+    return has_deep_gemm()
 
 
 class DeepseekAttention(nn.Module):
@@ -988,7 +1012,8 @@ class DeepseekV2MLAAttention(nn.Module):
             mscale = yarn_get_mscale(scaling_factor, float(mscale_all_dim))
             self.scaling = self.scaling * mscale * mscale
 
-        self.is_v32 = hasattr(config, "index_topk")
+        # DSA sparse path only when its kernels exist; else dense MLA (sm70).
+        self.is_v32 = _dsa_runtime_enabled(config)
 
         _skip_topk = False
         if self.is_v32:
@@ -1220,7 +1245,8 @@ class DeepseekV2Model(nn.Module):
         self.device = current_platform.device_type
 
         self.vocab_size = config.vocab_size
-        self.is_v32 = hasattr(config, "index_topk")
+        # DSA sparse path only when its kernels exist; else dense MLA (sm70).
+        self.is_v32 = _dsa_runtime_enabled(config)
         if self.is_v32:
             topk_tokens = config.index_topk
             topk_indices_buffer = torch.empty(
@@ -1381,8 +1407,17 @@ class DeepseekV2Model(nn.Module):
 
         params_dict = dict(self.named_parameters())
         loaded_params: set[str] = set()
+        # DSA arch (index_topk) running the dense MLA fallback (no indexer built,
+        # e.g. sm70/no-DeepGEMM): the checkpoint's lightning-indexer tensors have
+        # no destination param — skip them rather than KeyError on load.
+        _dsa_dense_fallback = hasattr(self.config, "index_topk") and not getattr(
+            self.model, "is_v32", True
+        )
         for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
+                continue
+
+            if _dsa_dense_fallback and ".indexer." in name:
                 continue
 
             spec_layer = get_spec_layer_idx_from_weight_name(self.config, name)
