@@ -28,6 +28,8 @@ def main() -> int:
         trust_remote_code=True,
         quantization=os.environ.get("INT2_QUANT", "int2_sm70"),
         cpu_offload_gb=float(os.environ.get("CPU_OFFLOAD_GB", "0")),
+        max_num_seqs=int(os.environ.get("MAX_NUM_SEQS", "1")),
+        max_num_batched_tokens=int(os.environ.get("MAX_BATCHED_TOKENS", "2048")),
     )
     nseq = int(os.environ.get("NUM_SEQS", "1"))
     maxtok = int(os.environ.get("MAX_TOKENS", "8"))
