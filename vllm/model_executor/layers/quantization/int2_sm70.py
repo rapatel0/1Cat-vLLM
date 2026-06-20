@@ -121,6 +121,13 @@ class Int2Sm70Config(QuantizationConfig):
             # than 2-bit for the quality-sensitive layers). Without packed MoE
             # (dummy-weight smokes), 2-bit the linears too (validates the op).
             if os.environ.get("INT2_PACKED_MOE", "0") == "1":
+                # kv_b_proj is stored fp16 (MLA absorbs it on load); keep it
+                # unquantized so the fp8 method doesn't try to load fp8 scales.
+                if "kv_b_proj" in prefix:
+                    from vllm.model_executor.layers.linear import (
+                        UnquantizedLinearMethod,
+                    )
+                    return UnquantizedLinearMethod()
                 return self._fp8_delegate().get_quant_method(layer, prefix)
             return Int2Sm70LinearMethod(self)
         return None

@@ -229,10 +229,19 @@ def convert(src, dst, group, device, max_layers=None, shard=None):
         """Non-expert weights: keep the source's native block-FP8 (weight +
         weight_scale_inv) so the fp8 sm70 kernels handle them (half the memory,
         higher fidelity than 2-bit for the quality-sensitive layers). bf16
-        tensors (norms, embed, gate) -> fp16."""
+        tensors (norms, embed, gate) -> fp16.
+
+        EXCEPTION: kv_b_proj must be fp16 — the MLA-native backend (TRITON_MLA,
+        latent KV) dequantizes it in process_weights_after_loading to build the
+        W_UK/W_UV absorption matrices, and that path can't consume our fp8 block
+        layout. Keeping it fp16 (one weight/layer, ~290MB/GPU) unblocks latent
+        KV (~7x smaller KV than the materialized FLASH_ATTN_V100 path)."""
         nonlocal total
         w = get(name)
         if w is None:
+            return
+        if "kv_b_proj" in name:                       # MLA-absorbed -> fp16
+            put(name, deq(name))
             return
         if w.dtype == torch.float8_e4m3fn:
             out[name] = w.cpu()
