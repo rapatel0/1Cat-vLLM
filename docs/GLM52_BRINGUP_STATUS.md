@@ -78,3 +78,22 @@ MODEL_DIR=/models/GLM-5.2-int2 TP=8 INT2_QUANT=int2_sm70 INT2_PACKED_MOE=1 \
   the overlays patch the pod's files in place rather than swapping the tree.
 - Mixed precision: `INT2_PACKED_MOE=1` → experts 2-bit + attn/embed/lm_head fp16.
   Without it → int2 on linears too (dummy-weight numeric smokes only).
+
+## Update (2026-06-20): long-context via MLA latent KV
+
+The dense-MLA fallback was silently using FLASH_ATTN_V100 (materializes full
+multi-head K/V, ~600 KB/token) because the pod's is_deepseek_mla list lacked
+glm_moe_dsa -> use_mla=False. Fixed (dsa_overlay.sh patches the convertor +
+kv_b_proj kept fp16) -> TRITON_MLA (latent KV, ~84 KB/token, ~7x smaller).
+
+Measured (real GLM-5.2, 8xV100, MLA latent fp16 KV):
+| config | KV for 131K | max context | stable? |
+|---|---|---|---|
+| FLASH_ATTN_V100 (materialized) | 78 GiB | ~3.6K | yes |
+| TRITON_MLA latent, TP4xPP2 | 11 GiB | ~14K | knife-edge (PP1 tight) |
+| **TRITON_MLA latent, TP8** | 11 GiB | **~10.7K, [REAL-LOAD OK]** | **yes** |
+
+Stable production config: TP8 + MLA latent, GMU 0.97 -> 10,752 tok KV, generates.
+Path to 120K (follow-on, not one-flag): fp8 latent KV (worktree 1.2.0 TritonMLA
+supports it; pod 1.1.0 rejects -> overlay), g256 expert scales (+1.4GB/GPU ->
+~40K), or higher PP (more KV sharding, needs the tight-stage margin fixed).
