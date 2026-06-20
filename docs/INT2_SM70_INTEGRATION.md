@@ -1,11 +1,51 @@
 # INT2 SM70 (V100) GEMV/GEMM integration — design doc
 
 **Branch:** `int2-v100-gemv` (worktree `~/repos/1Cat-vLLM-int2`, off clean `origin/main` e64d39aa7).
-**Status:** design — no production code wired yet. Kernels staged in
-`csrc/sm70_int2/kernels_staged/`.
+**Status:** int2 path validated end-to-end (TP=8, dummy weights); **real GLM-5.2
+architecture validated on V100** (TP=2/8). Remaining: real-weight bring-up.
 **Goal:** serve **GLM 5.2** (large MoE) on V100s at **4–8 concurrency** with
 2-bit weights, using custom int2 kernels that beat cuBLAS in the small-M regime
 where decode / MoE-per-expert / spec-decode actually live.
+
+---
+
+## 0. GLM-5.2 architecture reality + bring-up status (2026-06-20)
+
+**Correction to the original assumption.** This doc (old §4/§7) assumed
+"GLM-5.2 = `glm4_moe.py` + config delta". **Wrong.** The released GLM-5.2 is
+**`GlmMoeDsaForCausalLM`** (`model_type: glm_moe_dsa`): a **DeepSeek-V3.2-style**
+stack — **MLA latent attention** (`kv_lora_rank=512`, `q_lora_rank=2048`,
+nope/rope split) + **DeepSeek Sparse Attention** (the lightning "indexer",
+`index_topk=2048`) + MoE (256 experts, 8/tok) + MTP — **not** GLM-4's GQA MoE.
+743B params, 78 layers, hidden 6144, vocab 154880. FP8 ckpt ≈ 745 GB, BF16 ≈
+1.51 TB.
+
+**Why it still runs on V100 with our work** (the int2 kernels are weight-only and
+architecture-agnostic; attention is vLLM's job):
+- The fork's `deepseek_v2.py` already carries the `GlmMoeDsa` alias + the full
+  MLA/DSA stack; `model_arch_config_convertor` already treats `glm_moe_dsa` as
+  deepseek-MLA. The only gaps for V100 were config recognition + the indexer's
+  hard sm90 dependency.
+- **DSA indexer is sm90-only** (its kernels live in DeepGEMM, FP8). We added a
+  **dense-MLA sm70 fallback** (`_dsa_runtime_enabled()` gates the sparse path on
+  `has_deep_gemm()`): on V100 → no indexer, **full dense MLA**. Correct because
+  dense attention ⊇ the indexer's top-k selection (DSA is trained to approximate
+  dense); only long-context speed is lost. MLA itself runs via the fork's
+  **`FLASH_ATTN_V100`** backend (KV materialized, prefill+decode).
+- `glm_moe_dsa` registered to `DeepseekV3Config` (transformers 4.57 predates the
+  5.12 native class) so the real `config.json` loads.
+
+**Validated (commit b6d3ec5d3, dummy weights — gibberish expected):**
+| run | result |
+|---|---|
+| tiny `glm_moe_dsa`, TP=2 | `[DSA SMOKE OK]` — MLA via FLASH_ATTN_V100, Triton MoE |
+| tiny `glm_moe_dsa`, **TP=8 (all 8 GPUs)** | `[DSA SMOKE OK]` |
+| `glm_moe_dsa` + `quantization=int2_sm70` | `[DSA SMOKE OK]`, GEMV op LOADED on DSA linears |
+
+**Remaining for real-weight bring-up (P5, below):** GLM-5.2 won't fit at FP8
+(745 GB ≫ 256 GB VRAM). Need real packed-2-bit expert storage (memory win) and/or
+expert pruning, plus a quantize-on-load from the FP8 ckpt. Harness:
+`tests/int2_sm70/smoke_dsa.py`; overlay `tests/int2_sm70/dsa_overlay.sh`.
 
 ---
 
