@@ -2,9 +2,12 @@
 
 Side-quest brainstorm → plan for raising cluster tok/s once the real model is up.
 Grounded in this stack: 8×V100-SXM2-32GB (sm70; HMMA.884 f16-acc, ~900 GB/s HBM2,
-NVLink), GLM-5.2 743B MoE (256 experts / 8 active), **2-bit experts + fp16 MLA**,
+NVLink), GLM-5.2 743B MoE (256 experts / 8 active), **2-bit experts + fp8
+attention/MLA** (block-fp8 on the fork's SM70 FP8 TurboMind W8A16 kernels),
 decode memory-bandwidth-bound. Current MoE compute = per-expert Python loop +
-`enforce_eager` (correct, serial, launch-overhead-bound).
+`enforce_eager` (correct, serial, launch-overhead-bound). **Validated deployment
+parallelism is TP4×PP2** (TP within each NVLink island, PP across the slow
+inter-island link) — see `GLM52_PARALLELISM_ARCH.md` for the topology rationale.
 
 ## Current bottlenecks (where time/bandwidth goes)
 1. **MoE per-expert Python loop** — 256-iter Python loop, one kernel launch per
@@ -13,7 +16,27 @@ decode memory-bandwidth-bound. Current MoE compute = per-expert Python loop +
 2. **`enforce_eager`** — every tiny kernel pays full launch latency every token.
 3. **Dense-MLA fallback** — materializes K/V for FLASH_ATTN_V100; O(seq²), and the
    materialization wastes the bandwidth MLA's latent compression is meant to save.
-4. **TP=8 all-reduce** each layer.
+4. **Inter-island all-reduce** — *largely mitigated by TP4×PP2.* Flat TP8's
+   per-layer all-reduce crossed the slow inter-island link 78×/token; under
+   TP4×PP2 the all-reduce is confined to the fast NVLink island (TP=4, on-island)
+   and only the cheap PP hidden-state handoff (~12 KB/token, point-to-point)
+   crosses the slow link. Remaining comm cost = per-stage TP4 all-reduce (cheap)
+   + PP bubbles. Items 1–3 are parallelism-independent and remain the real
+   bottlenecks.
+
+---
+
+### Parallelism is now fixed: TP4×PP2
+
+The deployment-parallelism question is **settled and validated** on the 8×V100
+node: **TP4×PP2** (TP within each NVLink island, PP across). It is topology-matched
+(all-reduce stays on-island), gives ~2× context headroom (KV sharded by stage, not
+replicated — 4.25 vs 2.24 GiB KV/GPU), and lowers per-GPU weights (25.91 vs 27.72
+GiB; embed/lm_head split across stages) and load time (437 vs 941 s). The
+throughput levers below are **orthogonal to the parallelism map** — they apply
+per-stage identically (each stage runs the MoE/attention for its ~39 layers). The
+*one* PP-specific throughput requirement is keeping the pipeline fed with
+concurrent microbatches (see Tier-2 D+E).
 
 ---
 
@@ -36,6 +59,9 @@ Replace the Python per-expert loop with **one kernel over all experts**:
   tile/SplitK/swizzle machinery; best for the larger-M experts.
 - **Effort:** high (kernel project). **Impact:** highest. This is *the* item that
   turns our validated-but-serial MoE into a bandwidth-saturating one.
+- **Under TP4×PP2:** each stage runs the MoE for its ~39 layers; the grouped kernel
+  applies per-stage identically — orthogonal to the parallelism map, no rework.
+  Still the largest ceiling.
 
 ### B. CUDA graphs for decode (drop `enforce_eager` in prod)
 Capture decode as CUDA graphs (per batch size). Amortizes exactly the per-launch
@@ -44,6 +70,9 @@ overhead small-M MoE kernels are most sensitive to (design doc calls this out).
   grouped-MoE offsets must be **graph-stable** (fixed capture buckets, padded
   token counts). Pairs naturally with A (one stable launch vs 256 variable ones).
 - **Effort:** low–med once shapes are stable. **Impact:** large, near-free.
+- **Under TP4×PP2:** graphs are captured per-stage; the pipeline microbatch shapes
+  must be graph-stable. PP *needs* multiple in-flight microbatches to keep both
+  stages full — which pairs naturally with capturing one graph per batch size.
 
 ### C. MTP speculative decoding  ⟵ highest model-level leverage
 GLM-5.2 **ships MTP** (`num_nextn_predict_layers`; card cites 5 draft tokens).
@@ -55,6 +84,9 @@ has MTP plumbing (`glm4_moe_mtp`, Qwen MTP, `vllm/v1/spec_decode/*`).
 - **Effort:** med (mostly integration, designed-in). **Impact:** 2–3×.
 - **Synergy:** MTP verify is a small-M batch (M = draft len) → exactly the regime
   our int2 GEMV + (A) grouped MoE win; and graphs (B) cover the fixed draft shape.
+- **Under TP4×PP2:** the MTP head sits at the **last stage (PP1)**, alongside
+  lm_head. Draft tokens flow through the full pipeline; verify is a small-M batch
+  that fits our int2 GEMV + grouped MoE regime. No conflict with PP.
 
 ---
 
@@ -83,6 +115,13 @@ bandwidth re-saturates. The lever to *grow* the batch is a smaller KV cache.
   top compounds it.
 - **Work:** wire `kv_cache_dtype=fp8_e4m3 / fp4_e2m1` through the MLA/FLASH_ATTN_V100
   path to the turbomind converters. **Effort:** med. **Impact:** large (batch ↑).
+- **Under TP4×PP2 — this is where PP matters MOST for throughput.** The 2-stage
+  pipeline must be **fed** with concurrent microbatches (≥2, ideally 16–32) to keep
+  both islands busy, so batching isn't just a throughput nicety — it's **required**
+  to amortize the pipeline (idle stages = bubbles). PP also shards KV by stage, so
+  each concurrent request can be **long-context**: the TP8-replicated-KV ceiling is
+  removed. fp8 KV (`kv_cache_dtype=fp8_e4m3`) is validated/plumbed via the fork's
+  `flash_attn_v100` FP8-KV routes, targeting ~128 K context.
 
 ### F. Absorbed-MLA path (stop materializing K/V)
 Our dense fallback materializes full per-head K/V for FLASH_ATTN_V100. The
@@ -109,6 +148,10 @@ count:
 - **Effort:** med (dispatch + threshold tuning; threshold already in design).
   **Impact:** med, grows with batch — and directly complements D/E (bigger batch
   pushes more experts into the large-M regime).
+- **Under TP4×PP2:** experts shard **EP=4 within each stage** (vs EP=8 flat), so
+  each GPU now owns **more experts per stage** (256/4 = 64 vs 256/8 = 32). Per-expert
+  token counts (M) may shift accordingly — **re-measure the M-threshold under the
+  TP4×PP2 expert distribution** before tuning the GEMV↔tensor-core crossover.
 
 ---
 
@@ -123,6 +166,12 @@ count:
 ---
 
 ## Sequencing (impact-per-effort)
+
+Parallelism is settled — **TP4×PP2** (validated, topology-matched). The throughput
+sequence below is **unchanged and orthogonal** to the parallelism map (it applies
+per-stage identically); the only PP-specific dependency is that D+E batching keeps
+the pipeline fed.
+
 1. **C — MTP** (designed-in, 2–3×, mostly wiring)
 2. **B — CUDA graphs** (near-free once shapes stable; enables A/C/G to be graph-safe)
 3. **A — grouped int2 MoE kernel** (largest ceiling; the real kernel project)
