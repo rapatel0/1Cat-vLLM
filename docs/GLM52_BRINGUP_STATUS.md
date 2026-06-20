@@ -97,3 +97,26 @@ Stable production config: TP8 + MLA latent, GMU 0.97 -> 10,752 tok KV, generates
 Path to 120K (follow-on, not one-flag): fp8 latent KV (worktree 1.2.0 TritonMLA
 supports it; pod 1.1.0 rejects -> overlay), g256 expert scales (+1.4GB/GPU ->
 ~40K), or higher PP (more KV sharding, needs the tight-stage margin fixed).
+
+## Update (2026-06-20): fp8 latent KV — BLOCKED on V100 (hardware wall)
+
+Attempted fp8 latent KV (2x context) by overlaying the worktree 1.2.0 TRITON_MLA
++ decode kernel (which carry the fp8 path) onto the pod. Cleared 3 API drifts
+(is_quantized_kv_cache import, num_compute_units, VLLM_BATCH_INVARIANT) and the
+fp8 KV *sizing* worked (10,752 -> 19,328 tokens, ~1.8x). BUT the decode kernel
+fails to compile:
+  ValueError: type fp8e4nv not supported in this architecture.
+              The supported fp8 dtypes are ('fp8e4b15', 'fp8e5').
+V100 (sm70) Triton cannot compute on fp8 e4m3 (fp8e4nv, Hopper-only). Setting
+KV_CACHE_DTYPE=fp8_e5m2 did NOT help: the e4m3 is used in the *query*
+quantization path for the QK dot-product (the 1.2.0 supports_quant_query_input
+=False flag that avoids this isn't honored by the pod's 1.1.0 MLACommonImpl).
+Porting deeper into the MLA common layer risks the working stack. fp8_mla_overlay.sh
+is kept for a future newer-image build (where e4m3 query-quant can be disabled)
+but does NOT work on this V100/1.1.0 stack.
+
+**Working long-context ceiling on V100: TP8 + fp16 latent KV = ~10.7K (stable).**
+120K is not reachable on V100: it needs fp8 KV (e4m3 hardware wall) AND PP8
+(KV-sharding, tight-stage margin). fp16-latent + PP8 alone -> ~80K but with the
+PP margin/throughput tradeoffs. Net: ~10-14K is the practical stable context;
+larger needs a newer image or different hardware.
