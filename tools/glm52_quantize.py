@@ -159,10 +159,15 @@ def _build_key_shard_map(src):
     return m
 
 
-def convert(src, dst, group, device, max_layers=None):
+def convert(src, dst, group, device, max_layers=None, shard=None):
     """Write a mixed-precision checkpoint: experts -> per-layer stacked packed
-    2-bit; everything else (attn/embed/lm_head/norms/gate/shared) -> fp16.
-    Indexer tensors are dropped (V100 runs dense MLA)."""
+    2-bit; everything else (attn/embed/lm_head/norms/gate/shared) -> source fp8
+    (passthrough) or fp16. Indexer tensors dropped (V100 runs dense MLA).
+
+    shard=(i, N): convert only layers where layer_idx % N == i (data-parallel
+    across N processes / GPUs). Process 0 also writes the top-level tensors +
+    config. Each writes a partial index `index-part{i}.json`; run --merge after
+    to assemble model.safetensors.index.json. ~N x faster wall-clock."""
     import json
     import glob
     import re
@@ -176,6 +181,8 @@ def convert(src, dst, group, device, max_layers=None):
     E = cfg["n_routed_experts"]
     if max_layers:
         L = min(L, max_layers)
+    si, sn = (shard if shard else (0, 1))
+    part = f"part{si:02d}-" if shard else ""
     ksmap = _build_key_shard_map(src)
     open_cache = {}
 
@@ -205,7 +212,7 @@ def convert(src, dst, group, device, max_layers=None):
         nonlocal out, shard_idx, total
         if not out or (not force and total < 4e9):
             return
-        fn = f"model-{shard_idx:05d}.safetensors"
+        fn = f"model-{part}{shard_idx:05d}.safetensors"
         save_file({k: v.contiguous().cpu() for k, v in out.items()},
                   os.path.join(dst, fn))
         for k in out:
@@ -237,12 +244,16 @@ def convert(src, dst, group, device, max_layers=None):
         else:
             put(name, w)
 
-    # non-layer tensors (embed, final norm, lm_head)
-    for name in ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"):
-        copy_fp8_or_f16(name)
+    # non-layer tensors (embed, final norm, lm_head) — process 0 only
+    if si == 0:
+        for name in ("model.embed_tokens.weight", "model.norm.weight",
+                     "lm_head.weight"):
+            copy_fp8_or_f16(name)
 
     dense_replace = cfg.get("first_k_dense_replace", 0)
     for li in range(L):
+        if li % sn != si:                 # this process's layer stripe
+            continue
         pfx = f"model.layers.{li}."
         # everything for this layer except experts + indexer -> fp16
         layer_keys = [k for k in ksmap if k.startswith(pfx)
@@ -279,20 +290,42 @@ def convert(src, dst, group, device, max_layers=None):
         flush()
     flush(force=True)
 
+    if shard:
+        json.dump(weight_map,
+                  open(os.path.join(dst, f"index-part{si:02d}.json"), "w"))
+        print(f"[convert] part {si}/{sn} done ({len(weight_map)} tensors)")
+        if si != 0:
+            return
     if max_layers:
         cfg["num_hidden_layers"] = L          # self-consistent truncated ckpt
     cfg["quantization_config"] = {"quant_method": "int2_sm70", "group_size": group,
                                   "packed_moe": True}
     json.dump(cfg, open(os.path.join(dst, "config.json"), "w"), indent=2)
-    json.dump({"metadata": {}, "weight_map": weight_map},
-              open(os.path.join(dst, "model.safetensors.index.json"), "w"), indent=2)
     for extra in ("generation_config.json", "tokenizer_config.json",
                   "tokenizer.json", "chat_template.jinja"):
         sp = os.path.join(src, extra)
         if os.path.exists(sp):
             import shutil
             shutil.copy(sp, os.path.join(dst, extra))
+    if not shard:
+        json.dump({"metadata": {}, "weight_map": weight_map},
+                  open(os.path.join(dst, "model.safetensors.index.json"), "w"),
+                  indent=2)
     print(f"[convert] done -> {dst}")
+
+
+def merge_indexes(dst):
+    """Combine all index-part*.json (from parallel --shard runs) into the final
+    model.safetensors.index.json."""
+    import json
+    import glob
+    wm = {}
+    parts = sorted(glob.glob(os.path.join(dst, "index-part*.json")))
+    for p in parts:
+        wm.update(json.load(open(p)))
+    json.dump({"metadata": {}, "weight_map": wm},
+              open(os.path.join(dst, "model.safetensors.index.json"), "w"), indent=2)
+    print(f"[merge] {len(parts)} parts -> {len(wm)} tensors in index")
 
 
 def main():
@@ -303,12 +336,24 @@ def main():
     ap.add_argument("--max-layers", type=int, default=None,
                     help="convert only first N layers (for testing on partial dl)")
     ap.add_argument("--selftest", action="store_true")
+    ap.add_argument("--shard", default=None,
+                    help="i/N: convert layer-stripe i of N (parallel). Run N "
+                         "procs (one per GPU), then --merge.")
+    ap.add_argument("--merge", action="store_true",
+                    help="merge index-part*.json -> model.safetensors.index.json")
     args = ap.parse_args()
     dev = "cuda" if torch.cuda.is_available() else "cpu"
     if args.selftest:
         selftest(args.src)
         return
-    convert(args.src, args.dst, args.group, dev, args.max_layers)
+    if args.merge:
+        merge_indexes(args.dst)
+        return
+    shard = None
+    if args.shard:
+        i, n = (int(x) for x in args.shard.split("/"))
+        shard = (i, n)
+    convert(args.src, args.dst, args.group, dev, args.max_layers, shard)
 
 
 if __name__ == "__main__":
