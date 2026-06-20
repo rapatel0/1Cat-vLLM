@@ -110,11 +110,19 @@ class Int2Sm70Config(QuantizationConfig):
         return cls(group_size=config.get("group_size", 128))
 
     def get_quant_method(self, layer: Module, prefix: str):
-        # mixed precision: 2-bit the MoE experts (memory bulk) + Linear layers.
         from vllm.model_executor.layers.fused_moe.layer import FusedMoE
         if isinstance(layer, FusedMoE):
             return _make_moe_method(layer.moe_config, self)
         if isinstance(layer, LinearBase):
+            # Mixed precision (design §3d): with packed-2bit MoE (the real
+            # converted ckpt), keep attention/router/shared/embed/lm_head FP16
+            # for quality — only the experts are 2-bit. Without packed MoE
+            # (dummy-weight smokes), 2-bit the linears too (validates the op).
+            if os.environ.get("INT2_PACKED_MOE", "0") == "1":
+                from vllm.model_executor.layers.linear import (
+                    UnquantizedLinearMethod,
+                )
+                return UnquantizedLinearMethod()
             return Int2Sm70LinearMethod(self)
         return None
 
@@ -206,9 +214,47 @@ def _make_packed_moe_method(moe_config, quant_config: "Int2Sm70Config"):
                 "w13_qbias": sc(w13_o, H),
                 "w2_qweight": pk(H, I), "w2_scales": sc(H, I), "w2_qbias": sc(H, I),
             }
+            from vllm.distributed import get_tensor_model_parallel_rank
+            tp_rank = get_tensor_model_parallel_rank()
+
+            def _ep_select(lw, param):
+                """dim0 (experts): pick this rank's local experts, in local order."""
+                emap = getattr(layer, "expert_map", None)
+                if emap is None or param.shape[0] == lw.shape[0]:
+                    return lw
+                dst = torch.empty(param.shape[0], *lw.shape[1:], dtype=lw.dtype,
+                                  device=lw.device)
+                for ge in range(lw.shape[0]):
+                    le = int(emap[ge].item())
+                    if 0 <= le < param.shape[0]:
+                        dst[le] = lw[ge]
+                return dst
+
+            def make_loader(kind):
+                def loader(param, loaded_weight):
+                    lw = _ep_select(loaded_weight.to(param.device), param)
+                    if kind == "w13" and param.shape[1] != lw.shape[1]:
+                        # column-parallel gate_up: dim1 = [gate(I) ; up(I)],
+                        # each half sliced to this rank's intermediate shard.
+                        i_loc = param.shape[1] // 2
+                        i_full = lw.shape[1] // 2
+                        g0 = tp_rank * i_loc
+                        param.data[:, :i_loc].copy_(lw[:, g0:g0 + i_loc])
+                        param.data[:, i_loc:].copy_(
+                            lw[:, i_full + g0: i_full + g0 + i_loc])
+                    elif kind == "w2" and param.shape[2] != lw.shape[2]:
+                        # row-parallel down: dim2 (input I) sliced contiguously.
+                        k_loc = param.shape[2]
+                        k0 = tp_rank * k_loc
+                        param.data.copy_(lw[:, :, k0:k0 + k_loc])
+                    else:
+                        param.data.copy_(lw)
+                return loader
+
             for name, p in params.items():
                 layer.register_parameter(name, p)
-                set_weight_attrs(p, extra)
+                set_weight_attrs(p, {"weight_loader":
+                                     make_loader("w13" if "w13" in name else "w2")})
             layer.w13_o, layer.w2_o = w13_o, H
 
         def process_weights_after_loading(self, layer):
