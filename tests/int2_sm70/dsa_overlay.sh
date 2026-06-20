@@ -100,5 +100,19 @@ if "glm_moe_dsa=" not in s:
     print("[dsa-overlay] patched config.py")
 else:
     print("[dsa-overlay] config.py already has glm_moe_dsa")
+
+# ---- 4/4: is_deepseek_mla — flip use_mla=True so the model uses the MLA-native
+#           backend (TRITON_MLA, latent KV) instead of FLASH_ATTN_V100 (which
+#           materializes full multi-head KV → ~7x more KV memory). GLM-5.2 has
+#           kv_lora_rank=512 so the method's kv_lora_rank check passes.
+p = f"{sp}/transformers_utils/model_arch_config_convertor.py"
+s = open(p).read()
+if '"glm_moe_dsa",' not in s:
+    s = s.replace('            "deepseek_v32",\n',
+                  '            "deepseek_v32",\n            "glm_moe_dsa",\n', 1)
+    open(p, "w").write(s)
+    print("[dsa-overlay] patched model_arch_config_convertor.py (use_mla)")
+else:
+    print("[dsa-overlay] convertor already has glm_moe_dsa")
 PY
 echo "[dsa-overlay] done"
