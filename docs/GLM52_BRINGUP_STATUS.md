@@ -120,3 +120,25 @@ but does NOT work on this V100/1.1.0 stack.
 (KV-sharding, tight-stage margin). fp16-latent + PP8 alone -> ~80K but with the
 PP margin/throughput tradeoffs. Net: ~10-14K is the practical stable context;
 larger needs a newer image or different hardware.
+
+## Update (2026-06-20): fp8 e5m2 latent KV — WORKING (~2x context)
+
+The e4m3 wall is V100-specific (sm70 Triton has no fp8e4nv). Switched to e5m2
+(fp8e5, which sm70 DOES support) and it works. [REAL-LOAD OK] at TP8, KV
+10,752 -> 19,328 tokens (~1.8x), generates. Full fix chain (fp8_mla_overlay.sh):
+  1. is_quantized_kv_cache import path (1.1.0 backend.py)
+  2. _sm_count fallback (1.1.0 lacks num_compute_units -> 80)
+  3. VLLM_BATCH_INVARIANT getattr fallback
+  4. fp8_e5m2 added to supported_kv_cache_dtypes
+  5. mla_attention: cache view -> e5m2 + keep query bf16 (skip e4m3 query-quant)
+  6. decode kernel: grouped BLOCK 32 -> 16 (V100 96KB smem; was 100KB required)
+Run: bash fp8_mla_overlay.sh + KV_CACHE_DTYPE=fp8_e5m2. e5m2 has 2 mantissa bits
+(vs e4m3's 3) — lower KV precision but acceptable; measure quality if needed.
+
+**Working long-context ceilings on V100 (TP8):**
+| KV | context | status |
+|---|---|---|
+| fp16 latent | ~10.7K | stable |
+| **fp8 e5m2 latent** | **~19K** | **[REAL-LOAD OK]** |
+Next for more: g256 expert scales (+~40%), or PP for KV-sharding toward 120K
+(now that fp8 e5m2 KV works, PP8 + e5m2 -> ~150K is the theoretical path).

@@ -60,4 +60,40 @@ from vllm.v1.attention.backends.mla.triton_mla import TritonMLABackend
 assert 'fp8_e5m2' in TritonMLABackend.supported_kv_cache_dtypes, 'fp8_e5m2 not enabled'
 print('[fp8-mla-overlay] OK — supported:', TritonMLABackend.supported_kv_cache_dtypes)
 "
+
+# --- MLA fp8 path: route e5m2 (not e4m3) through cache view + bf16 query ------
+# mla_attention.py hardwires e4m3 via current_platform.fp8_dtype() in 2 spots.
+# For e5m2 (the V100-capable fp8): view the cache as e5m2, and keep the query
+# in bf16 (skip the fp8 query-quant) so the kernel does bf16-q x fp8e5-KV.
+/opt/venv/bin/python - "$SP/model_executor/layers/attention/mla_attention.py" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read(); n = 0
+old1 = "            kv_cache = kv_cache.view(current_platform.fp8_dtype())"
+new1 = ('            _fp8dt = (torch.float8_e5m2 if self.kv_cache_dtype == "fp8_e5m2"\n'
+        '                      else current_platform.fp8_dtype())\n'
+        '            kv_cache = kv_cache.view(_fp8dt)')
+if old1 in s and "_fp8dt" not in s:
+    s = s.replace(old1, new1, 1); n += 1
+old2 = "            if fp8_attention:\n                assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]"
+new2 = '            if fp8_attention and self.kv_cache_dtype != "fp8_e5m2":\n                assert mqa_ql_nope.shape[0] == mqa_q_pe.shape[0]'
+if old2 in s:
+    s = s.replace(old2, new2, 1); n += 1
+open(p, "w").write(s)
+print(f"[fp8-mla-overlay] mla_attention e5m2 patches: {n}/2")
+PY
+
+# --- decode kernel: fit V100's 96KB shared memory ----------------------------
+# The grouped MLA decode kernel (BLOCK_DMODEL=512 + BLOCK_DPE=64) needs 100KB
+# smem at BLOCK=32; V100 has 96KB. Halve the KV iteration tile -> ~55KB.
+/opt/venv/bin/python - "$SP/v1/attention/ops/triton_decode_attention.py" <<'PY'
+import sys
+p = sys.argv[1]; s = open(p).read()
+old = "    BLOCK = 32\n    if is_hip_:\n        BLOCK = 16\n"
+new = "    BLOCK = 16  # V100: 96KB smem (was 32)\n    if is_hip_:\n        BLOCK = 16\n"
+if old in s:
+    s = s.replace(old, new, 1); open(p, "w").write(s)
+    print("[fp8-mla-overlay] decode-kernel BLOCK 32 -> 16 (V100 smem)")
+else:
+    print("[fp8-mla-overlay] decode BLOCK already patched")
+PY
 echo "[fp8-mla-overlay] done — run with KV_CACHE_DTYPE=fp8_e5m2 (e4m3 unsupported on sm70)"
