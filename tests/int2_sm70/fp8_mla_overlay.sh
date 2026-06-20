@@ -30,6 +30,14 @@ if "from vllm.utils.torch_utils import is_quantized_kv_cache" in s:
     print("[fp8-mla-overlay] patched is_quantized_kv_cache import")
 else:
     print("[fp8-mla-overlay] import already patched / not present")
+# 1.1.0 platform lacks num_compute_units() (returns None -> TypeError). Fall
+# back to V100's 80 SMs for the kv-split heuristic.
+old = "self._sm_count = current_platform.num_compute_units()"
+new = ('self._sm_count = (getattr(current_platform, "num_compute_units", None) '
+       'and current_platform.num_compute_units()) or 80')
+if old in s:
+    s = s.replace(old, new); open(p, "w").write(s)
+    print("[fp8-mla-overlay] patched _sm_count fallback")
 PY
 /opt/venv/bin/python -c "
 from vllm.v1.attention.backends.mla.triton_mla import TritonMLABackend
