@@ -218,11 +218,28 @@ def convert(src, dst, group, device, max_layers=None):
         out[name] = t.to(torch.float16).cpu() if t.dtype != torch.uint8 else t.cpu()
         total += out[name].numel() * (1 if out[name].dtype == torch.uint8 else 2)
 
+    def copy_fp8_or_f16(name):
+        """Non-expert weights: keep the source's native block-FP8 (weight +
+        weight_scale_inv) so the fp8 sm70 kernels handle them (half the memory,
+        higher fidelity than 2-bit for the quality-sensitive layers). bf16
+        tensors (norms, embed, gate) -> fp16."""
+        nonlocal total
+        w = get(name)
+        if w is None:
+            return
+        if w.dtype == torch.float8_e4m3fn:
+            out[name] = w.cpu()
+            total += w.numel()
+            s = get(name + "_scale_inv")
+            if s is not None:
+                out[name + "_scale_inv"] = s.cpu()
+                total += s.numel() * 4
+        else:
+            put(name, w)
+
     # non-layer tensors (embed, final norm, lm_head)
     for name in ("model.embed_tokens.weight", "model.norm.weight", "lm_head.weight"):
-        t = deq(name)
-        if t is not None:
-            put(name, t)
+        copy_fp8_or_f16(name)
 
     dense_replace = cfg.get("first_k_dense_replace", 0)
     for li in range(L):
@@ -232,9 +249,7 @@ def convert(src, dst, group, device, max_layers=None):
                       and ".mlp.experts." not in k and ".indexer." not in k
                       and not k.endswith("_scale_inv")]
         for k in layer_keys:
-            t = deq(k)
-            if t is not None:
-                put(k, t)
+            copy_fp8_or_f16(k)
         # experts -> packed 2-bit, stacked [E, O, K//4]
         if li >= dense_replace:
             w13_qw, w13_s, w13_b, w2_qw, w2_s, w2_b = [], [], [], [], [], []

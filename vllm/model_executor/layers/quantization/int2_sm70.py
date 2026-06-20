@@ -115,16 +115,24 @@ class Int2Sm70Config(QuantizationConfig):
             return _make_moe_method(layer.moe_config, self)
         if isinstance(layer, LinearBase):
             # Mixed precision (design §3d): with packed-2bit MoE (the real
-            # converted ckpt), keep attention/router/shared/embed/lm_head FP16
-            # for quality — only the experts are 2-bit. Without packed MoE
+            # converted ckpt), non-expert linears (attention/dense/shared/
+            # lm_head) stay in the source's native block-FP8 — handled by the
+            # fork's sm70 fp8 kernels (half the fp16 memory, far higher fidelity
+            # than 2-bit for the quality-sensitive layers). Without packed MoE
             # (dummy-weight smokes), 2-bit the linears too (validates the op).
             if os.environ.get("INT2_PACKED_MOE", "0") == "1":
-                from vllm.model_executor.layers.linear import (
-                    UnquantizedLinearMethod,
-                )
-                return UnquantizedLinearMethod()
+                return self._fp8_delegate().get_quant_method(layer, prefix)
             return Int2Sm70LinearMethod(self)
         return None
+
+    def _fp8_delegate(self):
+        d = getattr(self, "_fp8d", None)
+        if d is None:
+            from vllm.model_executor.layers.quantization.fp8 import Fp8Config
+            d = Fp8Config(is_checkpoint_fp8_serialized=True,
+                          weight_block_size=[128, 128])
+            self._fp8d = d
+        return d
 
 
 def fake_quantize_2bit(W: torch.Tensor, group_size: int) -> torch.Tensor:

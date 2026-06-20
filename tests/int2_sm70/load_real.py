@@ -27,6 +27,7 @@ def main() -> int:
         skip_tokenizer_init=True,
         trust_remote_code=True,
         quantization=os.environ.get("INT2_QUANT", "int2_sm70"),
+        cpu_offload_gb=float(os.environ.get("CPU_OFFLOAD_GB", "0")),
     )
     nseq = int(os.environ.get("NUM_SEQS", "1"))
     maxtok = int(os.environ.get("MAX_TOKENS", "8"))
