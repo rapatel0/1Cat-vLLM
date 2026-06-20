@@ -310,12 +310,24 @@ def convert(src, dst, group, device, max_layers=None, shard=None):
     cfg["quantization_config"] = {"quant_method": "int2_sm70", "group_size": group,
                                   "packed_moe": True}
     json.dump(cfg, open(os.path.join(dst, "config.json"), "w"), indent=2)
+    import shutil
     for extra in ("generation_config.json", "tokenizer_config.json",
-                  "tokenizer.json", "chat_template.jinja"):
+                  "tokenizer.json", "chat_template.jinja",
+                  "special_tokens_map.json"):
         sp = os.path.join(src, extra)
         if os.path.exists(sp):
-            import shutil
             shutil.copy(sp, os.path.join(dst, extra))
+    # GLM-5.2 ships a transformers-5.x tokenizer ("TokenizersBackend" + backend/
+    # is_local keys) that transformers<5 can't load. The tokenizer.json is a
+    # standard HF fast tokenizer — rewrite the config to the generic class.
+    tcp = os.path.join(dst, "tokenizer_config.json")
+    if os.path.exists(tcp):
+        tc = json.load(open(tcp))
+        for k in ("backend", "is_local", "tokenizer_class",
+                  "model_specific_special_tokens", "extra_special_tokens"):
+            tc.pop(k, None)
+        tc["tokenizer_class"] = "PreTrainedTokenizerFast"
+        json.dump(tc, open(tcp, "w"), indent=2)
     if not shard:
         json.dump({"metadata": {}, "weight_map": weight_map},
                   open(os.path.join(dst, "model.safetensors.index.json"), "w"),
