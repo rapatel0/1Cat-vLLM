@@ -1,0 +1,42 @@
+# GLM-5.2 (Unsloth UD-IQ1_S dynamic ~1-bit GGUF) served by llama.cpp on 8xV100.
+# Runs as dense MLA (DSA indexer loaded-but-unused, per llama.cpp PR #19460).
+#   kubectl -n llm apply -f deploy/glm52-gguf-llamacpp.yaml
+apiVersion: v1
+kind: Pod
+metadata:
+  name: glm52-gguf-llama
+  namespace: llm
+  labels: {app: glm52-gguf-llama}
+spec:
+  nodeName: gpu-01
+  restartPolicy: Never
+  containers:
+  - name: llama
+    image: ghcr.io/ggml-org/llama.cpp:server-cuda
+    args:
+    - --model
+    - /models/GLM-5.2-GGUF/UD-IQ1_S/GLM-5.2-UD-IQ1_S-00001-of-00006.gguf
+    - --alias
+    - glm-5.2-iq1s
+    - -ngl
+    - "99"                       # all layers on GPU
+    - --split-mode
+    - layer                      # split layers across the 8 GPUs
+    - -c
+    - "16384"                    # context; raise once KV headroom confirmed
+    - --host
+    - 0.0.0.0
+    - --port
+    - "8000"
+    - --jinja                    # use the model's chat template
+    env:
+    - {name: CUDA_VISIBLE_DEVICES, value: "0,1,2,3,4,5,6,7"}
+    - {name: NVIDIA_VISIBLE_DEVICES, value: "all"}
+    ports: [{containerPort: 8000}]
+    volumeMounts:
+    - {name: models, mountPath: /models}
+    - {name: dshm, mountPath: /dev/shm}
+    securityContext: {privileged: true}
+  volumes:
+  - {name: models, persistentVolumeClaim: {claimName: llm-models-local}}
+  - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 16Gi}}
