@@ -45,7 +45,8 @@ spec:
         --model /models/GLM-5.2-GGUF/UD-IQ1_S/GLM-5.2-UD-IQ1_S-00001-of-00006.gguf \
         --alias glm-5.2-iq1s \
         -ngl 99 --split-mode layer \
-        -c 16384 \
+        --tensor-split 12,10,10,10,8,10,10,10 \
+        -c 65536 --parallel 1 \
         --host 0.0.0.0 --port 8000 --jinja
     env:
     - {name: CUDA_VISIBLE_DEVICES, value: "0,1,2,3,4,5,6,7"}
