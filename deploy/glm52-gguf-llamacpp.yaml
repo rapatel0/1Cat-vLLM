@@ -1,5 +1,9 @@
 # GLM-5.2 (Unsloth UD-IQ1_S dynamic ~1-bit GGUF) served by llama.cpp on 8xV100.
 # Runs as dense MLA (DSA indexer loaded-but-unused, per llama.cpp PR #19460).
+#
+# The official ghcr.io llama.cpp image won't pull on this node (blob CDN is
+# IPv6-only, unreachable). docker.io works, so we build llama.cpp for sm70 from
+# nvidia/cuda devel, caching the build on /localpool so restarts skip it.
 #   kubectl -n llm apply -f deploy/glm52-gguf-llamacpp.yaml
 apiVersion: v1
 kind: Pod
@@ -10,33 +14,49 @@ metadata:
 spec:
   nodeName: gpu-01
   restartPolicy: Never
+  dnsConfig:
+    nameservers: ["10.152.183.10", "1.1.1.1", "8.8.8.8"]
+    options: [{name: ndots, value: "5"}]
+    searches: ["llm.svc.cluster.local", "svc.cluster.local", "cluster.local"]
+  dnsPolicy: None
   containers:
   - name: llama
-    image: ghcr.io/ggml-org/llama.cpp:server-cuda
-    args:
-    - --model
-    - /models/GLM-5.2-GGUF/UD-IQ1_S/GLM-5.2-UD-IQ1_S-00001-of-00006.gguf
-    - --alias
-    - glm-5.2-iq1s
-    - -ngl
-    - "99"                       # all layers on GPU
-    - --split-mode
-    - layer                      # split layers across the 8 GPUs
+    image: docker.io/nvidia/cuda:12.4.1-devel-ubuntu22.04
+    command:
+    - bash
     - -c
-    - "16384"                    # context; raise once KV headroom confirmed
-    - --host
-    - 0.0.0.0
-    - --port
-    - "8000"
-    - --jinja                    # use the model's chat template
+    - |
+      set -euo pipefail
+      echo "precedence ::ffff:0:0/96  100" >> /etc/gai.conf   # force IPv4
+      BIN=/build/llama.cpp/build/bin/llama-server
+      if [ ! -x "$BIN" ]; then
+        echo "=== building llama.cpp for sm70 (one-time, cached on /build) ==="
+        apt-get update -qq
+        apt-get install -y -qq git cmake build-essential libcurl4-openssl-dev >/dev/null
+        rm -rf /build/llama.cpp
+        git clone --depth 1 https://github.com/ggml-org/llama.cpp /build/llama.cpp
+        cd /build/llama.cpp
+        cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=70 \
+              -DLLAMA_CURL=ON -DCMAKE_BUILD_TYPE=Release
+        cmake --build build --config Release -j"$(nproc)" --target llama-server
+      fi
+      echo "=== starting llama-server ==="
+      exec "$BIN" \
+        --model /models/GLM-5.2-GGUF/UD-IQ1_S/GLM-5.2-UD-IQ1_S-00001-of-00006.gguf \
+        --alias glm-5.2-iq1s \
+        -ngl 99 --split-mode layer \
+        -c 16384 \
+        --host 0.0.0.0 --port 8000 --jinja
     env:
     - {name: CUDA_VISIBLE_DEVICES, value: "0,1,2,3,4,5,6,7"}
     - {name: NVIDIA_VISIBLE_DEVICES, value: "all"}
     ports: [{containerPort: 8000}]
     volumeMounts:
     - {name: models, mountPath: /models}
+    - {name: build, mountPath: /build}
     - {name: dshm, mountPath: /dev/shm}
     securityContext: {privileged: true}
   volumes:
   - {name: models, persistentVolumeClaim: {claimName: llm-models-local}}
+  - {name: build, hostPath: {path: /localpool/dev/llama-build}}
   - {name: dshm, emptyDir: {medium: Memory, sizeLimit: 16Gi}}
