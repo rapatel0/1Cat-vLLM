@@ -133,6 +133,10 @@ class GGUFModelLoader(BaseModelLoader):
             # Gemma3 models use "gemma3_text" in HuggingFace but
             # "gemma3" in GGUF architecture naming
             model_type = "gemma3"
+        if model_type == "qwen3_5":
+            # Transformers uses an underscore while the GGUF architecture
+            # registry uses the on-disk ``qwen35`` identifier.
+            model_type = "qwen35"
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             # GGUF layer map assumes that we will have a merged expert weights
