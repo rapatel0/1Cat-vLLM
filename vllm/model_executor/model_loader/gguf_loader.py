@@ -143,6 +143,13 @@ class GGUFModelLoader(BaseModelLoader):
             # Transformers uses an underscore while the GGUF architecture
             # registry uses the on-disk ``qwen35`` identifier.
             model_type = "qwen35"
+        if model_type == "qwen35":
+            # GGUF calls the GDN time-step bias ``ssm_dt.bias``, while the
+            # Transformers Qwen3.5 implementation stores it as ``dt_bias``.
+            for idx in range(text_config.num_hidden_layers):
+                gguf_to_hf_name_map[f"blk.{idx}.ssm_dt.bias"] = (
+                    f"model.language_model.layers.{idx}.linear_attn.dt_bias"
+                )
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             # GGUF layer map assumes that we will have a merged expert weights
