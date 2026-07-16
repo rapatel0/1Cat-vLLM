@@ -150,6 +150,9 @@ class GGUFModelLoader(BaseModelLoader):
                 gguf_to_hf_name_map[f"blk.{idx}.ssm_dt.bias"] = (
                     f"model.language_model.layers.{idx}.linear_attn.dt_bias"
                 )
+                gguf_to_hf_name_map[f"blk.{idx}.ssm_a"] = (
+                    f"model.language_model.layers.{idx}.linear_attn.A_log"
+                )
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             # GGUF layer map assumes that we will have a merged expert weights
