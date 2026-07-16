@@ -113,6 +113,11 @@ torch::stable::Tensor ggml_mul_mat_vec_a8(
                                          (void*)quant_X.data_ptr(), col, vecs,
                                          stream);
         switch (type) {
+          case 42:
+            mul_mat_vec_q2_0_q8_1_cuda<scalar_t>(
+                (void*)W.data_ptr(), (void*)quant_X.data_ptr(),
+                (scalar_t*)Y.data_ptr(), col, row, vecs, stream);
+            break;
           case 2:
             mul_mat_vec_q4_0_q8_1_cuda<scalar_t>(
                 (void*)W.data_ptr(), (void*)quant_X.data_ptr(),

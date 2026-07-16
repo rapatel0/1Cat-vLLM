@@ -64,6 +64,16 @@ typedef struct {
     int8_t  qs[QK8_0];      // quants
 } block_q8_1;
 
+// Prism Bonsai Q2_0: 128 ternary values (code - 1) and one FP16 scale.
+// This is GGML type 42, distinct from the upstream TQ2_0 format.
+#define QK2_0 128
+#define QR2_0 1
+#define QI2_0 (QK2_0 / (4 * QR2_0))
+typedef struct {
+    half    d;
+    uint8_t qs[QK2_0 / 4];
+} block_q2_0;
+
 #define QR2_K 4
 #define QI2_K (QK_K / (4*QR2_K))
 typedef struct {

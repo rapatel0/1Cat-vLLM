@@ -31,7 +31,8 @@ filelock >= 3.16.1 # need to contain https://github.com/tox-dev/filelock/pull/31
 partial-json-parser # used for parsing partial JSON outputs
 pyzmq >= 25.0.0
 msgspec
-gguf >= 0.17.0
+# Prism's Q2_0 (GGML type 42) is required for Bonsai 27B ternary GGUFs.
+gguf @ git+https://github.com/PrismML-Eng/llama.cpp.git@62061f91088281e65071cc38c5f69ee95c39f14e#subdirectory=gguf-py
 mistral_common[image] >= 1.11.2
 opencv-python-headless >= 4.13.0    # required for video IO
 pyyaml

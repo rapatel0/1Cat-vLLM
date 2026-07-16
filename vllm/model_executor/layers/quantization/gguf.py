@@ -161,6 +161,9 @@ def is_layer_skipped_gguf(
 
 
 UNQUANTIZED_TYPES = {WeightType.F32, WeightType.F16, WeightType.BF16}
+# Prism's Bonsai Q2_0 is type 42.  It has not yet landed in the upstream
+# gguf Python package, so retain this as its raw on-disk enum value.
+BONSAI_Q2_0 = 42
 STANDARD_QUANT_TYPES = {
     WeightType.Q4_0,
     WeightType.Q4_1,
@@ -190,8 +193,12 @@ IMATRIX_QUANT_TYPES = {
 # TODO(Isotr0py): Currently, we don't have MMQ kernel for I-Matrix quantization.
 # Consolidate DEQUANT_TYPES, MMVQ_QUANT_TYPES and MMQ_QUANT_TYPES after we add
 # MMQ kernel for I-Matrix quantization.
-DEQUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
-MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
+DEQUANT_TYPES = (
+    STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES | {BONSAI_Q2_0}
+)
+MMVQ_QUANT_TYPES = (
+    STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES | {BONSAI_Q2_0}
+)
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
 
 

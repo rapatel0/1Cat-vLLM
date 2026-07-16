@@ -43,6 +43,8 @@ static __device__ __forceinline__ int get_int_from_uint8_aligned(const uint8_t *
 #define VDR_Q4_0_Q8_1_MMVQ 2
 #define VDR_Q4_0_Q8_1_MMQ  4
 
+#define VDR_Q2_0_Q8_1_MMVQ 1
+
 template <int vdr> static __device__ __forceinline__ float vec_dot_q4_0_q8_1_impl(
     const int * v, const int * u, const float & d4, const half2 & ds8) {
 #if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
@@ -506,6 +508,25 @@ static __device__ __forceinline__ float vec_dot_q4_0_q8_1(
     }
 
     return vec_dot_q4_0_q8_1_impl<VDR_Q4_0_Q8_1_MMVQ>(v, u, __half2float(bq4_0->d), bq8_1->ds);
+}
+
+// Q2_0 packs four ternary codes per byte.  The encoded value is code - 1,
+// giving {-1, 0, +1}; code 3 is reserved by the format and is treated as +2.
+static __device__ __forceinline__ float vec_dot_q2_0_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+    const int & iqs) {
+#if defined __CUDA_ARCH__ && __CUDA_ARCH__ >= 610 || defined USE_ROCM
+    const block_q2_0 * bq2_0 = (const block_q2_0 *) vbq;
+    const block_q8_1 * bq8 = bq8_1 + iqs / 8;
+    const int q = bq2_0->qs[iqs];
+    const int codes = ((q >> 0) & 0x03) | (((q >> 2) & 0x03) << 8) |
+                      (((q >> 4) & 0x03) << 16) | (((q >> 6) & 0x03) << 24);
+    const int activations = get_int_from_int8_aligned(bq8->qs, iqs % 8);
+    const int dot_codes = __dp4a(codes, activations, 0);
+    const int activation_sum = __dp4a(0x01010101, activations, 0);
+    return __half2float(bq2_0->d) * __half2float(bq8->ds.x) *
+           (dot_codes - activation_sum);
+#endif
 }
 
 template <int mmq_y> static __device__ __forceinline__ void allocate_tiles_q4_0(int ** x_ql, half2 ** x_dm, int ** x_qh, int ** x_sc) {

@@ -441,6 +441,22 @@ static void dequantize_block_cuda(const void * __restrict__ vx, dst_t * __restri
 }
 
 template<typename dst_t>
+static __global__ void dequantize_block_q2_0(const void * __restrict__ vx,
+                                               dst_t * __restrict__ y) {
+    const int i = blockIdx.x * QK2_0 + threadIdx.x;
+    const block_q2_0 * x = (const block_q2_0 *)vx;
+    const uint8_t q = x[blockIdx.x].qs[threadIdx.x / 4];
+    const int code = (q >> (2 * (threadIdx.x % 4))) & 0x03;
+    y[i] = static_cast<dst_t>((code - 1) * __half2float(x[blockIdx.x].d));
+}
+
+template<typename dst_t>
+static void dequantize_row_q2_0_cuda(const void * vx, dst_t * y, const int k,
+                                      cudaStream_t stream) {
+    dequantize_block_q2_0<<<k / QK2_0, QK2_0, 0, stream>>>(vx, y);
+}
+
+template<typename dst_t>
 static void dequantize_row_q2_K_cuda(const void * vx, dst_t * y, const int k, cudaStream_t stream) {
     const int nb = k / QK_K;
     dequantize_block_q2_K<<<nb, 64, 0, stream>>>(vx, y);
@@ -527,6 +543,8 @@ static void dequantize_row_iq4_xs_cuda(const void * vx, dst_t * y, const int k, 
 template<typename dst_t>
 static to_cuda_ggml_t<dst_t> ggml_get_to_cuda(int64_t type) {
     switch (type) {
+        case 42:
+            return dequantize_row_q2_0_cuda;
         case 2:
             return dequantize_block_cuda<QK4_0, QR4_0, dequantize_q4_0>;
         case 3:
