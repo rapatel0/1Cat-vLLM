@@ -71,11 +71,16 @@ def main():
             description="vLLM CLI",
             epilog=VLLM_SUBCMD_PARSER_EPILOG.format(subcmd="[subcommand]"),
         )
+        try:
+            package_version = importlib.metadata.version("vllm")
+        except importlib.metadata.PackageNotFoundError:
+            package_version = importlib.metadata.version("1cat-vllm")
+
         parser.add_argument(
             "-v",
             "--version",
             action="version",
-            version=importlib.metadata.version("vllm"),
+            version=package_version,
         )
         subparsers = parser.add_subparsers(required=False, dest="subparser")
         cmds = {}

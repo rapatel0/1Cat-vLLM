@@ -31,6 +31,7 @@ from vllm.model_executor.layers.quantization.compressed_tensors.compressed_tenso
 )
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa
     WNA16_SUPPORTED_TYPES_MAP,
+    WNA16_ZP_SUPPORTED_TYPES_MAP,
 )
 from vllm.model_executor.layers.quantization.utils.flashinfer_mxint4_moe import (
     flashinfer_trtllm_mxint4_moe,
@@ -42,6 +43,7 @@ from vllm.model_executor.layers.quantization.utils.marlin_utils import (
     marlin_act_int8_process_scales,
     marlin_make_workspace_new,
     marlin_moe_permute_scales,
+    moe_awq_to_marlin_zero_points,
 )
 from vllm.model_executor.utils import replace_parameter, set_weight_attrs
 
@@ -64,9 +66,6 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         super().__init__(moe)
         self.weight_quant = weight_quant
         self.input_quant = input_quant
-        assert weight_quant.symmetric, (
-            "Only symmetric quantization is supported for MoE"
-        )
         # Extract properties from weight_quant
         self.num_bits = weight_quant.num_bits
         self.packed_factor = 32 // weight_quant.num_bits
@@ -74,11 +73,16 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         self.group_size = weight_quant.group_size
         self.actorder = weight_quant.actorder
 
-        self.quant_type = WNA16_SUPPORTED_TYPES_MAP[self.num_bits]
+        self.quant_type = (
+            WNA16_SUPPORTED_TYPES_MAP[self.num_bits]
+            if weight_quant.symmetric
+            else WNA16_ZP_SUPPORTED_TYPES_MAP[self.num_bits]
+        )
 
         self.marlin_input_dtype = get_marlin_input_dtype(layer_name)
         self.use_flashinfer_mxint4_moe = (
             is_flashinfer_mxint4_moe_available()
+            and weight_quant.symmetric
             and self.group_size == 32
             and weight_quant.num_bits == 4
         )
@@ -227,6 +231,7 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
 
         layer.num_groups_w13 = num_groups_w13
         layer.num_groups_w2 = num_groups_w2
+        w13_num_shards = 2 if self.moe.is_act_and_mul else 1
 
         w13_scale = torch.nn.Parameter(
             torch.ones(
@@ -260,6 +265,32 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         layer.register_parameter("w2_weight_scale", w2_scale)
         set_weight_attrs(w2_scale, extra_weight_attrs)
         set_weight_attrs(w2_scale, {"load_full_w2": load_full_w2})
+
+        if not self.weight_quant.symmetric:
+            w13_zero_point = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w13,
+                    w13_num_shards * intermediate_size_per_partition
+                    // self.packed_factor,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_zero_point", w13_zero_point)
+            set_weight_attrs(w13_zero_point, extra_weight_attrs)
+
+            w2_zero_point = torch.nn.Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w2,
+                    hidden_size // self.packed_factor,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_zero_point", w2_zero_point)
+            set_weight_attrs(w2_zero_point, extra_weight_attrs)
 
         w2_weight_shape = torch.nn.Parameter(
             torch.empty(num_experts, 2), requires_grad=False
@@ -456,6 +487,24 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             )
         replace_parameter(layer, "w2_weight_scale", marlin_w2_scales)
 
+        if not self.weight_quant.symmetric:
+            marlin_w13_zeros = moe_awq_to_marlin_zero_points(
+                layer.w13_weight_zero_point,
+                size_k=layer.w13_weight_zero_point.shape[1],
+                size_n=layer.w13_weight_zero_point.shape[2] * self.packed_factor,
+                num_bits=self.num_bits,
+                is_a_8bit=is_a_8bit,
+            )
+            replace_parameter(layer, "w13_weight_zero_point", marlin_w13_zeros)
+            marlin_w2_zeros = moe_awq_to_marlin_zero_points(
+                layer.w2_weight_zero_point,
+                size_k=layer.w2_weight_zero_point.shape[1],
+                size_n=layer.w2_weight_zero_point.shape[2] * self.packed_factor,
+                num_bits=self.num_bits,
+                is_a_8bit=is_a_8bit,
+            )
+            replace_parameter(layer, "w2_weight_zero_point", marlin_w2_zeros)
+
         layer.workspace = marlin_make_workspace_new(device, 4)
 
     def get_fused_moe_quant_config(
@@ -466,8 +515,8 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
         return int4_w4a16_moe_quant_config(
             w1_scale=layer.w13_weight_scale,
             w2_scale=layer.w2_weight_scale,
-            w1_zp=None,
-            w2_zp=None,
+            w1_zp=getattr(layer, "w13_weight_zero_point", None),
+            w2_zp=getattr(layer, "w2_weight_zero_point", None),
             block_shape=[0, self.group_size],
         )
 
@@ -570,6 +619,8 @@ class CompressedTensorsWNA16MarlinMoEMethod(CompressedTensorsMoEMethod):
             g_idx2=layer.w2_weight_g_idx,
             sort_indices1=layer.w13_g_idx_sort_indices,
             sort_indices2=layer.w2_g_idx_sort_indices,
+            w1_zeros=getattr(layer, "w13_weight_zero_point", None),
+            w2_zeros=getattr(layer, "w2_weight_zero_point", None),
             workspace=layer.workspace,
             input_dtype=self.marlin_input_dtype,
             is_k_full=self.is_k_full,
