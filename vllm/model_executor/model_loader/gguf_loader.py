@@ -150,12 +150,6 @@ class GGUFModelLoader(BaseModelLoader):
                 gguf_to_hf_name_map[f"blk.{idx}.ssm_dt.bias"] = (
                     f"model.language_model.layers.{idx}.linear_attn.dt_bias"
                 )
-            # A text-only Qwen3.5 GGUF is loaded through the conditional
-            # generation wrapper. Its weight mapper adds the inner ``model``
-            # component, so the embedding must use the outer HF prefix here.
-            gguf_to_hf_name_map["token_embd.weight"] = (
-                "model.language_model.embed_tokens.weight"
-            )
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
             # GGUF layer map assumes that we will have a merged expert weights
@@ -372,6 +366,13 @@ class GGUFModelLoader(BaseModelLoader):
                 f"Failed to map GGUF parameters "
                 f"({len(unmapped_params)}): "
                 f"{unmapped_params}"
+            )
+        if model_type == "qwen35":
+            # This must be applied after automatic map construction because
+            # its generic embedding rule otherwise overwrites the wrapper
+            # prefix required by Qwen3.5 conditional generation.
+            gguf_to_hf_name_map["token_embd.weight"] = (
+                "model.language_model.embed_tokens.weight"
             )
         return gguf_to_hf_name_map
 
