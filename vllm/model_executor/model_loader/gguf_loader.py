@@ -124,6 +124,12 @@ class GGUFModelLoader(BaseModelLoader):
         is_multimodal = (
             hasattr(config, "vision_config") and config.vision_config is not None
         )
+        # Some model families publish text-only GGUFs while their HuggingFace
+        # config remains multimodal. Do not require an absent mmproj file or
+        # its visual tensors in that case.
+        is_text_only_multimodal = is_multimodal and (
+            detect_gguf_multimodal(model_config.model) is None
+        )
         gguf_to_hf_name_map = {}
         sideload_params: list[re.Pattern] = []
         # hack: ggufs have a different name than transformers
@@ -214,9 +220,13 @@ class GGUFModelLoader(BaseModelLoader):
         text_num_layers = text_config.num_hidden_layers
         text_name_map = gguf.get_tensor_name_map(arch, text_num_layers)
 
-        if is_multimodal:
+        if is_multimodal and not is_text_only_multimodal:
             mm_proj_arch = gguf.MODEL_ARCH.MMPROJ
-            vision_num_layers = config.vision_config.num_hidden_layers
+            vision_num_layers = getattr(
+                config.vision_config,
+                "num_hidden_layers",
+                config.vision_config.depth,
+            )
             vision_name_map = gguf.get_tensor_name_map(mm_proj_arch, vision_num_layers)
         else:
             vision_name_map = None
@@ -340,6 +350,10 @@ class GGUFModelLoader(BaseModelLoader):
                     unmapped_params,
                 )
             )
+        if is_text_only_multimodal:
+            unmapped_params = [
+                name for name in unmapped_params if not name.startswith("model.visual.")
+            ]
         if unmapped_params:
             raise RuntimeError(
                 f"Failed to map GGUF parameters "
@@ -358,7 +372,9 @@ class GGUFModelLoader(BaseModelLoader):
         weight_type_map = {}
         for f in gguf_files:
             weight_type_map.update(get_gguf_weight_type_map(f, gguf_to_hf_name_map))
-        is_multimodal = hasattr(model_config.hf_config, "vision_config")
+        is_multimodal = hasattr(model_config.hf_config, "vision_config") and (
+            detect_gguf_multimodal(model_name_or_path) is not None
+        )
         if is_multimodal:
             mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (
@@ -389,7 +405,9 @@ class GGUFModelLoader(BaseModelLoader):
             Tuples of (parameter_name, tensor) for all model weights
         """
         hf_config = model_config.hf_config
-        is_multimodal = hasattr(hf_config, "vision_config")
+        is_multimodal = hasattr(hf_config, "vision_config") and (
+            detect_gguf_multimodal(model_name_or_path) is not None
+        )
 
         if is_multimodal:
             # Load mm_proj (mm_encoder + projector) for multimodal weights
