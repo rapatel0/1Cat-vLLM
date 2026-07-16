@@ -426,22 +426,38 @@ class GGUFModelLoader(BaseModelLoader):
             detect_gguf_multimodal(model_name_or_path) is not None
         )
 
+        def convert_qwen35_gdn_decay(
+            weights: Generator[tuple[str, torch.Tensor], None, None],
+        ) -> Generator[tuple[str, torch.Tensor], None, None]:
+            """Restore Qwen3.5's HF ``A_log`` from GGUF's fused decay.
+
+            The GGUF exporter stores ``ssm_a = -exp(A_log)`` for the
+            Qwen3.5 GDN implementation. vLLM retains the HF ``A_log``
+            parameter and applies that transform in its recurrent kernel.
+            """
+            for name, weight in weights:
+                if name.endswith(".linear_attn.A_log"):
+                    weight = torch.log(-weight)
+                yield name, weight
+
         if is_multimodal:
             # Load mm_proj (mm_encoder + projector) for multimodal weights
             mmproj_file = detect_gguf_multimodal(model_name_or_path)
             assert mmproj_file is not None, (
                 "Could not find mm_proj file for multimodal GGUF model"
             )
-            yield from gguf_quant_weights_iterator(mmproj_file, gguf_to_hf_name_map)
+            yield from convert_qwen35_gdn_decay(
+                gguf_quant_weights_iterator(mmproj_file, gguf_to_hf_name_map)
+            )
 
         gguf_files = self._get_all_gguf_files(model_name_or_path)
         if len(gguf_files) > 1:
-            yield from gguf_quant_weights_iterator_multi(
-                gguf_files, gguf_to_hf_name_map
+            yield from convert_qwen35_gdn_decay(
+                gguf_quant_weights_iterator_multi(gguf_files, gguf_to_hf_name_map)
             )
         else:
-            yield from gguf_quant_weights_iterator(
-                model_name_or_path, gguf_to_hf_name_map
+            yield from convert_qwen35_gdn_decay(
+                gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
             )
 
     def download_model(self, model_config: ModelConfig) -> None:
