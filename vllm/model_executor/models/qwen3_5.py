@@ -535,6 +535,11 @@ class Qwen3_5Model(Qwen3NextModel):
             if name.startswith("mtp."):
                 continue
 
+            # GGUF stores the GDN depthwise convolution as [channels, kernel],
+            # while the vLLM mixer parameter keeps its singleton group axis.
+            if name.endswith(".linear_attn.conv1d.weight") and loaded_weight.ndim == 2:
+                loaded_weight = loaded_weight.unsqueeze(1)
+
             # Remapping the name of FP8 kv-scale.
             if name.endswith("scale"):
                 name = maybe_remap_kv_scale_name(name, params_dict)
