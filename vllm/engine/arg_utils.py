@@ -1890,7 +1890,11 @@ class EngineArgs:
         # Skip speculator detection for cloud storage models (eg: S3, GCS) since
         # HuggingFace cannot load configs directly from S3 URLs. S3 models can still
         # use speculators with explicit --speculative-config.
-        if not is_cloud_storage(self.model):
+        # A local GGUF is parsed by ModelConfig using the explicit HF config
+        # (when supplied).  Do not send it through Transformers here merely
+        # to probe for a speculator: Transformers does not yet recognize all
+        # GGUF architectures, including Prism's Qwen3.5 variant.
+        if not is_cloud_storage(self.model) and not check_gguf_file(self.model):
             (self.model, self.tokenizer, self.speculative_config) = (
                 maybe_override_with_speculators(
                     model=self.model,
