@@ -124,6 +124,15 @@ class GGUFModelLoader(BaseModelLoader):
         is_multimodal = (
             hasattr(config, "vision_config") and config.vision_config is not None
         )
+        # A text-only Qwen3.5 GGUF can use the tokenizer/config published
+        # alongside a vision checkpoint. When the selected architecture is the
+        # causal LM, use its text backbone rather than the conditional wrapper.
+        is_qwen35_causal = (
+            model_type == "qwen3_5"
+            and "Qwen3_5ForCausalLM" in getattr(config, "architectures", [])
+        )
+        if is_qwen35_causal:
+            is_multimodal = False
         # Some model families publish text-only GGUFs while their HuggingFace
         # config remains multimodal. Do not require an absent mmproj file or
         # its visual tensors in that case.
@@ -146,12 +155,15 @@ class GGUFModelLoader(BaseModelLoader):
         if model_type == "qwen35":
             # GGUF calls the GDN time-step bias ``ssm_dt.bias``, while the
             # Transformers Qwen3.5 implementation stores it as ``dt_bias``.
+            qwen35_prefix = (
+                "model." if is_qwen35_causal else "model.language_model."
+            )
             for idx in range(text_config.num_hidden_layers):
                 gguf_to_hf_name_map[f"blk.{idx}.ssm_dt.bias"] = (
-                    f"model.language_model.layers.{idx}.linear_attn.dt_bias"
+                    f"{qwen35_prefix}layers.{idx}.linear_attn.dt_bias"
                 )
                 gguf_to_hf_name_map[f"blk.{idx}.ssm_a"] = (
-                    f"model.language_model.layers.{idx}.linear_attn.A_log"
+                    f"{qwen35_prefix}layers.{idx}.linear_attn.A_log"
                 )
         if model_type in ("deepseek_v3", "deepseek_v2"):
             model_type = "deepseek2"
@@ -248,9 +260,10 @@ class GGUFModelLoader(BaseModelLoader):
         auto_cls = (
             AutoModelForImageTextToText if is_multimodal else AutoModelForCausalLM
         )
+        dummy_config = text_config if is_qwen35_causal else config
         with torch.device("meta"):
             dummy_model = auto_cls.from_config(
-                config, trust_remote_code=model_config.trust_remote_code
+                dummy_config, trust_remote_code=model_config.trust_remote_code
             )
 
         state_dict = dummy_model.state_dict()
@@ -374,9 +387,14 @@ class GGUFModelLoader(BaseModelLoader):
             # This must be applied after automatic map construction because
             # its generic embedding rule otherwise overwrites the wrapper
             # prefix required by Qwen3.5 conditional generation.
-            gguf_to_hf_name_map["token_embd.weight"] = (
-                "model.language_model.embed_tokens.weight"
-            )
+            if is_qwen35_causal:
+                gguf_to_hf_name_map["token_embd.weight"] = (
+                    "model.embed_tokens.weight"
+                )
+            else:
+                gguf_to_hf_name_map["token_embd.weight"] = (
+                    "model.language_model.embed_tokens.weight"
+                )
         return gguf_to_hf_name_map
 
     def _get_gguf_weight_type(
@@ -426,15 +444,9 @@ class GGUFModelLoader(BaseModelLoader):
             detect_gguf_multimodal(model_name_or_path) is not None
         )
 
-        def convert_qwen35_gdn_decay(
+        def restore_qwen35_a_log(
             weights: Generator[tuple[str, torch.Tensor], None, None],
         ) -> Generator[tuple[str, torch.Tensor], None, None]:
-            """Restore Qwen3.5's HF ``A_log`` from GGUF's fused decay.
-
-            The GGUF exporter stores ``ssm_a = -exp(A_log)`` for the
-            Qwen3.5 GDN implementation. vLLM retains the HF ``A_log``
-            parameter and applies that transform in its recurrent kernel.
-            """
             for name, weight in weights:
                 if name.endswith(".linear_attn.A_log"):
                     weight = torch.log(-weight)
@@ -446,17 +458,17 @@ class GGUFModelLoader(BaseModelLoader):
             assert mmproj_file is not None, (
                 "Could not find mm_proj file for multimodal GGUF model"
             )
-            yield from convert_qwen35_gdn_decay(
+            yield from restore_qwen35_a_log(
                 gguf_quant_weights_iterator(mmproj_file, gguf_to_hf_name_map)
             )
 
         gguf_files = self._get_all_gguf_files(model_name_or_path)
         if len(gguf_files) > 1:
-            yield from convert_qwen35_gdn_decay(
+            yield from restore_qwen35_a_log(
                 gguf_quant_weights_iterator_multi(gguf_files, gguf_to_hf_name_map)
             )
         else:
-            yield from convert_qwen35_gdn_decay(
+            yield from restore_qwen35_a_log(
                 gguf_quant_weights_iterator(model_name_or_path, gguf_to_hf_name_map)
             )
 
