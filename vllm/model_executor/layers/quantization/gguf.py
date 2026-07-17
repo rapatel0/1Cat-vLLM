@@ -196,10 +196,19 @@ IMATRIX_QUANT_TYPES = {
 DEQUANT_TYPES = (
     STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES | {BONSAI_Q2_0}
 )
-MMVQ_QUANT_TYPES = (
-    STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
-)
+MMVQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES | IMATRIX_QUANT_TYPES
 MMQ_QUANT_TYPES = STANDARD_QUANT_TYPES | KQUANT_TYPES
+
+
+def _is_bonsai_q2_sm70() -> bool:
+    return current_platform.is_cuda() and current_platform.is_device_capability(70)
+
+
+def _is_bonsai_q2_mma_shape(x: torch.Tensor) -> bool:
+    num_tokens = x.shape[0]
+    return x.dtype == torch.half and (
+        num_tokens == 4 or num_tokens == 8 or num_tokens >= 64
+    )
 
 
 def _fused_mul_mat_gguf(
@@ -216,8 +225,16 @@ def _fused_mul_mat_gguf(
     # there is no need to call any kernel for fp16/bf16
     if qweight_type in UNQUANTIZED_TYPES:
         return x @ qweight.T
+    # Prism Q2_0 uses Tensor Cores only for the campaign's proven shapes.
+    # Batch 1 and unsupported SM70 shapes retain the existing DP4A kernel;
+    # other architectures keep the full-dequantization fallback below.
+    if qweight_type == BONSAI_Q2_0 and _is_bonsai_q2_sm70():
+        if _is_bonsai_q2_mma_shape(x):
+            y = ops.ggml_mul_mat_q2_0_sm70(qweight, x, qweight.shape[0])
+        else:
+            y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     # enable MMVQ in contiguous batching with batch_size=1
-    if x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
+    elif x.shape[0] <= mmvq_safe and qweight_type in MMVQ_QUANT_TYPES:
         y = ops.ggml_mul_mat_vec_a8(qweight, x, qweight_type, qweight.shape[0])
     # Use MMQ Kernel if it's available (standard + k-quants)
     elif qweight_type in MMQ_QUANT_TYPES:

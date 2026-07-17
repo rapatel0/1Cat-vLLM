@@ -336,6 +336,10 @@ torch::stable::Tensor ggml_mul_mat_vec_a8(torch::stable::Tensor W,
                                           torch::stable::Tensor X, int64_t type,
                                           int64_t row);
 
+torch::stable::Tensor ggml_mul_mat_q2_0_sm70(torch::stable::Tensor W,
+                                             torch::stable::Tensor X,
+                                             int64_t row);
+
 torch::stable::Tensor ggml_mul_mat_a8(torch::stable::Tensor W,
                                       torch::stable::Tensor X, int64_t type,
                                       int64_t row);

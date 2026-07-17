@@ -439,6 +439,9 @@ STABLE_TORCH_LIBRARY_FRAGMENT(_C, ops) {
       "ggml_mul_mat_vec_a8(Tensor W, Tensor X, int type, SymInt row) "
       "-> Tensor");
 
+  // Prism Q2_0 Tensor Core kernels for SM70.
+  ops.def("ggml_mul_mat_q2_0_sm70(Tensor W, Tensor X, SymInt row) -> Tensor");
+
   // mmq kernel for GGML.
   ops.def(
       "ggml_mul_mat_a8(Tensor W, Tensor X, int type, SymInt row) -> Tensor");
@@ -604,6 +607,7 @@ STABLE_TORCH_LIBRARY_IMPL(_C, CUDA, ops) {
   // GGML kernels
   ops.impl("ggml_dequantize", TORCH_BOX(&ggml_dequantize));
   ops.impl("ggml_mul_mat_vec_a8", TORCH_BOX(&ggml_mul_mat_vec_a8));
+  ops.impl("ggml_mul_mat_q2_0_sm70", TORCH_BOX(&ggml_mul_mat_q2_0_sm70));
   ops.impl("ggml_mul_mat_a8", TORCH_BOX(&ggml_mul_mat_a8));
   ops.impl("ggml_moe_a8", TORCH_BOX(&ggml_moe_a8));
   ops.impl("ggml_moe_a8_vec", TORCH_BOX(&ggml_moe_a8_vec));

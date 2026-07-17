@@ -15,6 +15,9 @@
 #include "../../../quantization/gguf/dequantize.cuh"
 #include "../../../quantization/gguf/mmvq.cuh"
 #include "../../../quantization/gguf/mmq.cuh"
+#if !defined(USE_ROCM)
+  #include "../../../quantization/gguf/q2_0_mma.cuh"
+#endif
 #include "moe.cuh"
 #include "moe_vec.cuh"
 
@@ -216,6 +219,49 @@ torch::stable::Tensor ggml_mul_mat_vec_a8(
         }
       });
   return Y;
+}
+
+torch::stable::Tensor ggml_mul_mat_q2_0_sm70(
+    torch::stable::Tensor W,  // packed Prism Q2_0 weight
+    torch::stable::Tensor X,  // FP16 input
+    int64_t row) {
+#if defined(USE_ROCM)
+  STD_TORCH_CHECK(false,
+                  "ggml_mul_mat_q2_0_sm70 is only available in CUDA builds");
+#else
+  constexpr int64_t kBlockBytes = sizeof(block_q2_0);
+  STD_TORCH_CHECK(X.dim() == 2, "Q2_0 SM70 input must be a matrix");
+  STD_TORCH_CHECK(W.dim() == 2, "Q2_0 SM70 weight must be a matrix");
+  const int64_t batch = X.sizes()[0];
+  const int64_t col = X.sizes()[1];
+  STD_TORCH_CHECK(X.scalar_type() == torch::headeronly::ScalarType::Half,
+                  "Q2_0 SM70 Tensor Core kernels require FP16 activations");
+  STD_TORCH_CHECK(W.scalar_type() == torch::headeronly::ScalarType::Byte,
+                  "Q2_0 SM70 weights must use packed uint8 storage");
+  STD_TORCH_CHECK(X.is_contiguous(), "Q2_0 SM70 input must be contiguous");
+  STD_TORCH_CHECK(W.is_contiguous(), "Q2_0 SM70 weight must be contiguous");
+  STD_TORCH_CHECK(batch == 4 || batch == 8 || batch >= 64,
+                  "Q2_0 SM70 supports batch 4/8 decode or batch >= 64 "
+                  "prefill, got ",
+                  batch);
+  STD_TORCH_CHECK(col > 0 && col % QK2_0 == 0,
+                  "Q2_0 SM70 K must be a positive multiple of ", QK2_0,
+                  ", got ", col);
+  STD_TORCH_CHECK(row > 0 && row <= W.sizes()[0],
+                  "Q2_0 SM70 output rows exceed the packed weight");
+  STD_TORCH_CHECK(W.sizes()[1] >= col / QK2_0 * kBlockBytes,
+                  "Q2_0 SM70 packed row is too short for K=", col);
+
+  const torch::stable::accelerator::DeviceGuard device_guard(
+      X.get_device_index());
+  auto Y = torch::stable::empty({batch, row}, X.scalar_type(), std::nullopt,
+                                W.device());
+  cudaStream_t stream = get_current_cuda_stream();
+  vllm::gguf::q2_0_sm70::mul_mat_q2_0_sm70_cuda(
+      W.data_ptr(), W.stride(0), static_cast<const half*>(X.data_ptr()),
+      static_cast<half*>(Y.data_ptr()), batch, row, col, stream);
+  return Y;
+#endif
 }
 
 torch::stable::Tensor ggml_mul_mat_a8(torch::stable::Tensor W,  // quant weight
