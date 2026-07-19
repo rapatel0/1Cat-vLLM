@@ -50,6 +50,7 @@ from vllm.v1.sample.metadata import SamplingMetadata
 from vllm.v1.sample.sampler import Sampler
 
 from .hy_v3 import HYV3DecoderLayer, get_spec_layer_idx_from_weight_name
+from .interfaces import SupportsPP
 from .utils import is_pp_missing_parameter, maybe_prefix
 
 
@@ -198,8 +199,7 @@ class HYV3MultiTokenPredictor(nn.Module):
         )
         return logits
 
-
-class HYV3MTP(nn.Module):
+class HYV3MTP(nn.Module, SupportsPP):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
         self.config = vllm_config.model_config.hf_config

@@ -1251,6 +1251,33 @@ def get_default_config(
         else:
             config = {"BLOCK_SIZE_M": 64, "GROUP_SIZE_M": 1, "SPLIT_K": 1}
     elif (
+        envs.VLLM_SM70_HY3_MTP_MOE_CONFIG
+        and dtype is None
+        and block_shape is None
+        and M <= 8
+        and E == 192
+        and N == 192
+        and K == 4096
+        and topk == 8
+        and current_platform.is_cuda()
+        and current_platform.has_device_capability(70)
+        and not current_platform.has_device_capability(75)
+    ):
+        # Hy3's one-layer MTP drafter is unquantized on TP8. On V100, the
+        # larger N tile reduces the small routed-expert stage by 19-54% across
+        # the live 1-8-row drafting shapes while preserving bitwise output.
+        config = {
+            "BLOCK_SIZE_M": 16,
+            "BLOCK_SIZE_N": 64,
+            "BLOCK_SIZE_K": 64,
+            "GROUP_SIZE_M": 1,
+            "SPLIT_K": 1,
+        }
+        logger.info_once(
+            "Using SM70 Hy3 MTP unquantized MoE config: "
+            f"{config}",
+        )
+    elif (
         envs.VLLM_SM70_UNQUANTIZED_MOE_0DOT3_CONFIG
         and dtype is None
         and block_shape is None
