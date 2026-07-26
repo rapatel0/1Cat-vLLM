@@ -595,6 +595,41 @@ class LagunaDecoderLayer(nn.Module):
 
 @support_torch_compile
 class LagunaModel(nn.Module, EagleModelMixin):
+    def _maybe_add_hidden_state(
+        self,
+        aux_hidden_states,
+        layer_idx,
+        hidden_states,
+        residual,
+    ):
+        # _laguna_sink_clamp -- see patch-laguna-aux-clamp.py.
+        # Laguna's pre-final-norm residual reaches |x| ~ 1e6, which overflows
+        # fp16 (max 65504, and fp16 is forced on sm70). inf + (-inf) in this sum
+        # NaNs the entire captured tensor, poisoning the DFlash drafter's KV
+        # cache and zeroing acceptance. Clamp the operands and accumulate in
+        # fp32 so the cancellation cannot happen. Same defect poolside fixed in
+        # llama.cpp commit cf7fe540.
+        if layer_idx in self.aux_hidden_state_layers:
+            _FMAX = 65504.0
+            if residual is not None:
+                _h = torch.nan_to_num(
+                    hidden_states.float(), nan=0.0, posinf=_FMAX, neginf=-_FMAX
+                )
+                _r = torch.nan_to_num(
+                    residual.float(), nan=0.0, posinf=_FMAX, neginf=-_FMAX
+                )
+                value = (_h + _r).clamp_(-_FMAX, _FMAX).to(hidden_states.dtype)
+            else:
+                value = (
+                    torch.nan_to_num(
+                        hidden_states.float(), nan=0.0, posinf=_FMAX, neginf=-_FMAX
+                    )
+                    .clamp_(-_FMAX, _FMAX)
+                    .to(hidden_states.dtype)
+                )
+            aux_hidden_states.append(value.clone())
+        return aux_hidden_states
+
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
