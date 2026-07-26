@@ -775,7 +775,20 @@ class LagunaModel(nn.Module, EagleModelMixin):
 
         tp_rank = get_tensor_model_parallel_rank()
 
+        # Checkpoints quantized with compressed-tensors (e.g.
+        # poolside/Laguna-S-2.1-FP8) name their block-wise FP8 scales
+        # `.weight_scale`, but vLLM's block-FP8 path -- and Fp8SM70MoEMethod,
+        # which is what runs this model on sm70 -- register `weight_scale_inv`.
+        # Same tensor, same semantics (w = q * s); only the name differs.
+        # Without this rename the expert scales hit `ignore_suffixes` and are
+        # dropped SILENTLY, yielding a clean load that produces garbage.
+        block_fp8_scales = (
+            getattr(self.quant_config, "weight_block_size", None) is not None
+        )
+
         for name, loaded_weight in weights:
+            if block_fp8_scales and name.endswith(".weight_scale"):
+                name = name[: -len(".weight_scale")] + ".weight_scale_inv"
             # Handle attention sinks (distributed across ranks). Derive the
             # per-rank slice from the parameter's own shape so per-layer
             # variations in head count are handled correctly.
