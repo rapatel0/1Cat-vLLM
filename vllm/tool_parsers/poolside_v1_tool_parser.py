@@ -71,8 +71,15 @@ class PoolsideV1ToolParser(ToolParser):
         self.tool_calls_start_token = self.tool_call_start_token
 
         self.func_call_regex = re.compile(r"<tool_call>.*?</tool_call>", re.DOTALL)
+        # _poolside_tool_name_terminator_fix -- see
+        # patch-poolside-tool-parser-newline.py. The original required a newline
+        # after the tool name, but Laguna-S-2.1 emits
+        #   <tool_call>get_weather<arg_key>city</arg_key>...
+        # with none, so the regex failed and tool calling silently returned raw
+        # markup as content. Terminate the name at the first newline OR '<'.
+        # The streaming path already did this; this makes them agree.
         self.func_detail_regex = re.compile(
-            r"<tool_call>([^\n]*)\n(.*)</tool_call>", re.DOTALL
+            r"<tool_call>([^\n<]*)\s*(.*?)</tool_call>", re.DOTALL
         )
         self.func_arg_regex = re.compile(
             r"<arg_key>(.*?)</arg_key>\s*<arg_value>(.*?)</arg_value>", re.DOTALL
