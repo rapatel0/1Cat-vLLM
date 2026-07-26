@@ -531,6 +531,12 @@ class LagunaDecoderLayer(nn.Module):
                 prefix=f"{prefix}.mlp",
             )
 
+        # _moe_compensating_divides: see patch-laguna-moe-compensating-divides.py
+        self.layer_idx = layer_idx
+        self.routed_scaling_factor = float(
+            getattr(config, "moe_routed_scaling_factor", 1.0)
+        )
+
         self.input_layernorm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = RMSNorm(
             config.hidden_size, eps=config.rms_norm_eps
@@ -554,11 +560,37 @@ class LagunaDecoderLayer(nn.Module):
             hidden_states=hidden_states,
         )
 
+        # _moe_compensating_divides (fp16 only).
+        # MoERunner's fp16 path emits `shared/s + routed` == y/s instead of
+        # `shared + s*routed`, and expects the decoder layer to put the rest of
+        # the residual stream in 1/s space to match (deepseek_v2.py:1186-1205).
+        # RMSNorm is scale-invariant, so the final norm removes the scale and the
+        # logits are unchanged. Scaling DOWN also keeps us away from the fp16
+        # ceiling, unlike moving the factor onto the router's top-k weights
+        # (measured: NaN).
+        if self._compensate_fp16(hidden_states):
+            hidden_states *= 1.0 / self.routed_scaling_factor
+            if self.layer_idx == 0:
+                # The residual is threaded through every layer; scaling it once
+                # here puts the whole stream in 1/s space.
+                residual *= 1.0 / self.routed_scaling_factor
+
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
 
+        # Dense-MLP layers are not scaled by the MoE runner, so scale here. MoE
+        # layers are already in 1/s space -- scaling them again would double-apply.
+        if not self.is_moe_layer and self._compensate_fp16(hidden_states):
+            hidden_states *= 1.0 / self.routed_scaling_factor
+
         return hidden_states, residual
+
+    def _compensate_fp16(self, x: torch.Tensor) -> bool:
+        # _moe_compensating_divides: only under fp16, where MoERunner takes the
+        # divide-the-shared-expert branch. On bf16/fp32 it does
+        # `fused_output *= s` and no compensation is wanted.
+        return x.dtype == torch.float16 and self.routed_scaling_factor != 1.0
 
 
 @support_torch_compile
