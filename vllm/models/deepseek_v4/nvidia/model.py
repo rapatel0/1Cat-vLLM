@@ -21,6 +21,12 @@ from vllm.model_executor.kernels.mhc.tilelang import (
     mhc_post_tilelang,
     mhc_pre_tilelang,
 )
+from vllm.model_executor.kernels.mhc.torch import (
+    hc_head_torch,
+    mhc_fused_post_pre_torch,
+    mhc_post_torch,
+    mhc_pre_torch,
+)
 from vllm.model_executor.layers.activation import SiluAndMul, SiluAndMulWithClamp
 from vllm.model_executor.layers.fused_moe import FusedMoE
 from vllm.model_executor.layers.fused_moe.router.fused_topk_bias_router import (
@@ -58,7 +64,15 @@ from vllm.models.deepseek_v4.attention import (
     DeepseekV4MultiHeadLatentAttentionWrapper,
 )
 from vllm.models.deepseek_v4.nvidia.ops.prepare_megamoe import prepare_megamoe_inputs
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
+
+
+def _use_sm70_reference_kernels() -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_cuda() and capability is not None and capability.major == 7
+    )
 
 
 class DeepseekV4MLP(nn.Module):
@@ -796,6 +810,7 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         config = vllm_config.model_config.hf_config
         self.hidden_size = config.hidden_size
+        self.use_sm70_reference_kernels = _use_sm70_reference_kernels()
 
         self.rms_norm_eps = config.rms_norm_eps
         self.attn = DeepseekV4Attention(
@@ -871,7 +886,10 @@ class DeepseekV4DecoderLayer(nn.Module):
         if residual is None:
             # Run standalone mhc_pre on first layer
             residual = x
-            post_mix, res_mix, x = mhc_pre_tilelang(
+            mhc_pre = (
+                mhc_pre_torch if self.use_sm70_reference_kernels else mhc_pre_tilelang
+            )
+            post_mix, res_mix, x = mhc_pre(
                 x,
                 self.hc_attn_fn,
                 self.hc_attn_scale,
@@ -885,7 +903,12 @@ class DeepseekV4DecoderLayer(nn.Module):
                 norm_eps=attn_norm_eps,
             )
         else:
-            residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+            mhc_fused_post_pre = (
+                mhc_fused_post_pre_torch
+                if self.use_sm70_reference_kernels
+                else mhc_fused_post_pre_tilelang
+            )
+            residual, post_mix, res_mix, x = mhc_fused_post_pre(
                 x,
                 residual,
                 post_mix,
@@ -909,7 +932,12 @@ class DeepseekV4DecoderLayer(nn.Module):
 
         ffn_norm_weight = self.ffn_norm.weight.data
         ffn_norm_eps = self.ffn_norm.variance_epsilon
-        residual, post_mix, res_mix, x = mhc_fused_post_pre_tilelang(
+        mhc_fused_post_pre = (
+            mhc_fused_post_pre_torch
+            if self.use_sm70_reference_kernels
+            else mhc_fused_post_pre_tilelang
+        )
+        residual, post_mix, res_mix, x = mhc_fused_post_pre(
             x,
             residual,
             post_mix,
@@ -939,6 +967,7 @@ class DeepseekV4Model(nn.Module):
         config = vllm_config.model_config.hf_config
         quant_config = vllm_config.quant_config
         self.config = config
+        self.use_sm70_reference_kernels = _use_sm70_reference_kernels()
         self.use_mega_moe = (
             vllm_config.kernel_config.moe_backend == "deep_gemm_mega_moe"
         )
@@ -1081,9 +1110,10 @@ class DeepseekV4Model(nn.Module):
                 residual,
             )
         if layer is not None:
-            hidden_states = mhc_post_tilelang(
-                hidden_states, residual, post_mix, res_mix
+            mhc_post = (
+                mhc_post_torch if self.use_sm70_reference_kernels else mhc_post_tilelang
             )
+            hidden_states = mhc_post(hidden_states, residual, post_mix, res_mix)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
@@ -1092,7 +1122,12 @@ class DeepseekV4Model(nn.Module):
         num_tokens = hidden_states.shape[0]
         self._mtp_hidden_buffer[:num_tokens].copy_(hidden_states.flatten(1))
 
-        hidden_states = hc_head_fused_kernel_tilelang(
+        hc_head = (
+            hc_head_torch
+            if self.use_sm70_reference_kernels
+            else hc_head_fused_kernel_tilelang
+        )
+        hidden_states = hc_head(
             hidden_states,
             self.hc_head_fn,
             self.hc_head_scale,

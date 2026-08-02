@@ -114,6 +114,10 @@ def _op_available() -> bool:
     return hasattr(torch.ops._C, "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert")
 
 
+def _is_sm70() -> bool:
+    return torch.cuda.is_available() and torch.cuda.get_device_capability()[0] == 7
+
+
 pytestmark = pytest.mark.skipif(
     not torch.cuda.is_available() or not _op_available(),
     reason="CUDA not available or fused DeepseekV4 op not built in",
@@ -159,7 +163,7 @@ def _call_fused(
 def test_q_path_matches_reference(num_tokens: int, n_heads: int, padded_heads: int):
     torch.manual_seed(0)
     device = "cuda"
-    dtype = torch.bfloat16
+    dtype = torch.float16 if _is_sm70() else torch.bfloat16
     eps = 1e-6
     max_pos = 4096
 
@@ -209,6 +213,7 @@ def _ue8m0_per_block_scales(kv_roped_nope_f32: torch.Tensor, qblock: int):
 
 @pytest.mark.parametrize("num_tokens", [1, 4, 17, 64, 2048])
 @pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.skipif(_is_sm70(), reason="The upstream reference cache is BF16-only")
 def test_kv_path_matches_reference(num_tokens: int, block_size: int):
     torch.manual_seed(1)
     device = "cuda"
@@ -299,6 +304,7 @@ def test_kv_path_matches_reference(num_tokens: int, block_size: int):
 @pytest.mark.parametrize("num_tokens", [4, 17, 2048])
 @pytest.mark.parametrize("pad", [1, 5])
 @pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.skipif(_is_sm70(), reason="The upstream reference cache is BF16-only")
 def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
     """slot_mapping.size(0) < q.size(0): the kernel must skip padded
     tokens in the KV branch while still running Q-norm+RoPE on all rows."""
@@ -366,6 +372,7 @@ def test_kv_path_with_dp_padding(num_tokens: int, pad: int, block_size: int):
     ],
 )
 @pytest.mark.parametrize("block_size", [16, 64])
+@pytest.mark.skipif(_is_sm70(), reason="The upstream reference cache is BF16-only")
 def test_combined_q_and_kv(
     num_tokens: int, n_heads: int, padded_heads: int, block_size: int
 ):
@@ -415,3 +422,103 @@ def test_combined_q_and_kv(
             "padded head slots must be exact zero"
         )
     torch.testing.assert_close(k_cache_fused, k_cache_ref, rtol=0, atol=0)
+
+
+@pytest.mark.skipif(not _is_sm70(), reason="FP16 cache fallback is SM70-only")
+@pytest.mark.parametrize("block_size", [16, 64])
+def test_sm70_fp16_kv_cache_layout_and_round_trip(block_size: int):
+    """Validate the V100 packed cache without relying on BF16 Triton ops."""
+    from vllm.models.deepseek_v4.nvidia.sm70 import _gather_fp8_ds_mla_rows
+
+    torch.manual_seed(4)
+    device = "cuda"
+    dtype = torch.float16
+    eps = 1e-6
+    num_tokens = 4
+    positions = torch.tensor([1, 7, 13, 19], dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(32, ROPE_DIM, torch.float32, device)
+    kv = torch.randn(num_tokens, HEAD_DIM, dtype=dtype, device=device)
+    q = torch.randn(num_tokens, 3, HEAD_DIM, dtype=dtype, device=device)
+
+    # Exercise non-contiguous physical slots and the slot_mapping=-1 no-op.
+    slot_mapping = torch.tensor(
+        [block_size + 1, 0, -1, 2 * block_size + 3],
+        dtype=torch.int64,
+        device=device,
+    )
+    num_blocks = 4
+    cache = torch.full(
+        (num_blocks, block_size * HEAD_BYTES),
+        0xA5,
+        dtype=torch.uint8,
+        device=device,
+    )
+    _call_fused(
+        q,
+        8,
+        kv,
+        cache,
+        slot_mapping,
+        positions,
+        cos_sin_cache,
+        eps,
+        block_size,
+    )
+
+    valid = slot_mapping >= 0
+    valid_slots = slot_mapping[valid]
+    expected = apply_rope_gptj_last_k(kv[valid], positions[valid], cos_sin_cache)
+    recovered = _gather_fp8_ds_mla_rows(cache, valid_slots, block_size)
+
+    scales = _ue8m0_per_block_scales(expected[:, :NOPE_DIM].float(), QUANT_BLOCK)
+    max_error = (16.0 * scales.amax(dim=-1)).unsqueeze(-1)
+    assert torch.all(
+        (recovered[:, :NOPE_DIM] - expected[:, :NOPE_DIM]).abs() <= max_error
+    )
+    torch.testing.assert_close(
+        recovered[:, NOPE_DIM:], expected[:, NOPE_DIM:], rtol=0, atol=0
+    )
+
+    # Scale bytes are UE8M0 exponents with bias 127; byte 7 is padding.
+    flat_cache = cache.view(num_blocks, -1)
+    block_indices = valid_slots // block_size
+    positions_in_block = valid_slots % block_size
+    scale_offsets = block_size * (HEAD_BYTES - 8) + positions_in_block * 8
+    offsets = torch.arange(8, device=device)
+    encoded = flat_cache[block_indices[:, None], scale_offsets[:, None] + offsets]
+    expected_scales = torch.cat(
+        (
+            (torch.log2(scales) + 127).to(torch.uint8),
+            torch.zeros(scales.shape[0], 1, dtype=torch.uint8, device=device),
+        ),
+        dim=-1,
+    )
+    torch.testing.assert_close(encoded, expected_scales, rtol=0, atol=0)
+
+    # A fully skipped call must not touch either data or scale bytes.
+    untouched = torch.full_like(cache, 0x5A)
+    _call_fused(
+        q,
+        8,
+        kv,
+        untouched,
+        torch.full((num_tokens,), -1, dtype=torch.int64, device=device),
+        positions,
+        cos_sin_cache,
+        eps,
+        block_size,
+    )
+    assert torch.all(untouched == 0x5A)
+
+
+@pytest.mark.skipif(not _is_sm70(), reason="BF16 rejection is SM70-only")
+def test_sm70_rejects_bfloat16():
+    device = "cuda"
+    q = torch.zeros(1, 1, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    kv = torch.zeros(1, HEAD_DIM, dtype=torch.bfloat16, device=device)
+    cache = torch.zeros(1, 16 * HEAD_BYTES, dtype=torch.uint8, device=device)
+    slots = torch.zeros(1, dtype=torch.int64, device=device)
+    positions = torch.zeros(1, dtype=torch.int64, device=device)
+    cos_sin_cache = make_cos_sin_cache(1, ROPE_DIM, torch.float32, device)
+    with pytest.raises(RuntimeError, match="bfloat16 requires sm_80"):
+        _call_fused(q, 8, kv, cache, slots, positions, cos_sin_cache, 1e-6, 16)

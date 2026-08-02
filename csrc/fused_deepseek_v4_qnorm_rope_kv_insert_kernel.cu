@@ -560,15 +560,16 @@ static void launchFusedDeepseekV4Templated(
   // so leave numAttrs = 0 and launch as a regular kernel.
 #ifndef USE_ROCM
   static int const sm_version = getSMVersion();
-  // Host-side guard: the device kernel body is compiled as a no-op for
-  // bf16 on pre-Ampere (sm_70/sm_75) because _typeConvert<BFloat16> is
-  // unavailable there.  Refuse the launch loudly instead of silently
-  // skipping the work.
-  TORCH_CHECK(
-      sm_version >= 80,
-      "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert requires sm_80+ "
-      "(Ampere or newer); got sm_",
-      sm_version);
+  // The FP16 specialization is valid on Volta/Turing. The BF16 device body
+  // is intentionally a no-op below sm_80 because _typeConvert<BFloat16> is
+  // unavailable there, so reject only that specialization on pre-Ampere.
+  if constexpr (std::is_same_v<scalar_t_in, c10::BFloat16>) {
+    TORCH_CHECK(
+        sm_version >= 80,
+        "fused_deepseek_v4_qnorm_rope_kv_rope_quant_insert with bfloat16 "
+        "requires sm_80+ (Ampere or newer); got sm_",
+        sm_version);
+  }
   cudaLaunchConfig_t config;
   config.gridDim = dim3(grid);
   config.blockDim = dim3(kBlockSize);

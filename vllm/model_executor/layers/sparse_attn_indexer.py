@@ -440,7 +440,17 @@ class SparseAttnIndexer(CustomOp):
         self.topk_indices_buffer = topk_indices_buffer
         self.skip_k_cache_insert = skip_k_cache_insert
         self.use_fp4_cache = use_fp4_cache
-        if current_platform.is_cuda() and not has_deep_gemm():
+        capability = current_platform.get_device_capability()
+        self.use_sm70_reference_kernels = (
+            current_platform.is_cuda()
+            and capability is not None
+            and capability.major == 7
+        )
+        if (
+            current_platform.is_cuda()
+            and not self.use_sm70_reference_kernels
+            and not has_deep_gemm()
+        ):
             raise RuntimeError(
                 "Sparse Attention Indexer CUDA op requires DeepGEMM to be installed."
             )
@@ -469,6 +479,21 @@ class SparseAttnIndexer(CustomOp):
         k: torch.Tensor,
         weights: torch.Tensor,
     ):
+        if self.use_sm70_reference_kernels:
+            assert isinstance(q_quant, torch.Tensor)
+            from vllm.models.deepseek_v4.nvidia.sm70 import (
+                sparse_attn_indexer_sm70,
+            )
+
+            return sparse_attn_indexer_sm70(
+                hidden_states=hidden_states,
+                k_cache_prefix=self.k_cache.prefix,
+                kv_cache=self.k_cache.kv_cache,
+                q=q_quant,
+                weights=weights,
+                topk_tokens=self.topk_tokens,
+                topk_indices_buffer=self.topk_indices_buffer,
+            )
         # FP8 path: single tensor (per-token scale is folded into `weights`).
         # FP4 path: (values, scales) tuple with scales required by the kernel.
         if isinstance(q_quant, tuple):

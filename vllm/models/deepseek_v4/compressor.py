@@ -335,6 +335,37 @@ class DeepseekCompressor(nn.Module):
         k_cache_metadata = cast(Any, attn_metadata[self.k_cache_prefix])
         kv_cache = self._static_forward_context[self.k_cache_prefix].kv_cache
 
+        capability = current_platform.get_device_capability()
+        if (
+            current_platform.is_cuda()
+            and capability is not None
+            and capability.major == 7
+        ):
+            from vllm.models.deepseek_v4.nvidia.sm70 import (
+                compress_norm_rope_store_sm70,
+            )
+
+            compress_norm_rope_store_sm70(
+                state_cache=state_cache,
+                num_actual=num_actual,
+                token_to_req_indices=token_to_req_indices,
+                positions=positions,
+                state_slot_mapping=slot_mapping,
+                block_table=block_table,
+                block_size=block_size,
+                state_width=state_width,
+                cos_sin_cache=cos_sin_cache,
+                kv_cache=kv_cache,
+                kv_slot_mapping=k_cache_metadata.slot_mapping,
+                head_dim=self.head_dim,
+                rope_head_dim=self.rope_head_dim,
+                compress_ratio=self.compress_ratio,
+                overlap=self.overlap,
+                rms_norm_weight=self.norm.weight,
+                rms_norm_eps=self.rms_norm_eps,
+            )
+            return
+
         if current_platform.is_cuda():
             # NVIDIA GPUs.
             if self.head_dim == 512:

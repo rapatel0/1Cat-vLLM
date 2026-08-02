@@ -177,8 +177,8 @@ class DeepseekSparseSWAMetadata:
     # calls skip planning and reuse the plan. Fresh instance per build(), so
     # have_initialized is always False at the start of a step and the plan
     # is re-derived from current seq_lens / topk_length on replay.
-    # None for layer types the model does not use (or when num_decode_tokens
-    # is zero).
+    # None for layer types the model does not use, when num_decode_tokens is
+    # zero, or when the selected attention backend does not use FlashMLA.
     tile_sched_swaonly: "FlashMLASchedMeta | None" = None
     tile_sched_c4a: "FlashMLASchedMeta | None" = None
     tile_sched_c128a: "FlashMLASchedMeta | None" = None
@@ -359,18 +359,27 @@ class DeepseekSparseSWAMetadataBuilder(AttentionMetadataBuilder):
         call of each type. Subsequent same-type calls reuse the plan because
         the tensors (and ``have_initialized``) are populated on the struct.
 
-        Returns all-``None`` when there are no decode tokens this step, so
-        ``_forward_decode`` sees a clean sentinel.
+        Returns all-``None`` when there are no decode tokens this step, or on
+        SM70 where DeepSeek V4 uses its non-FlashMLA fallback attention path.
+        In either case, ``_forward_decode`` sees a clean sentinel.
         """
         out: dict[str, FlashMLASchedMeta | None] = {
             _LAYER_TYPE_SWAONLY: None,
             _LAYER_TYPE_C4A: None,
             _LAYER_TYPE_C128A: None,
         }
+        capability = current_platform.get_device_capability()
+        is_sm70 = (
+            current_platform.is_cuda()
+            and capability is not None
+            and capability.major == 7
+            and capability.minor == 0
+        )
         if (
             num_decode_tokens == 0
             or current_platform.is_rocm()
             or current_platform.is_xpu()
+            or is_sm70
         ):
             return out
         for layer_type in self._layer_types:

@@ -75,6 +75,13 @@ if TYPE_CHECKING:
 logger = init_logger(__name__)
 
 
+def _is_sm70_cuda() -> bool:
+    capability = current_platform.get_device_capability()
+    return (
+        current_platform.is_cuda() and capability is not None and capability.major == 7
+    )
+
+
 def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
     """Pick the platform-specific V4 sparse MLA impl class. Sole platform check."""
     if current_platform.is_rocm():
@@ -83,6 +90,12 @@ def _select_v4_sparse_impl() -> "type[DeepseekV4SparseMLAAttentionImpl]":
         )
 
         return DeepseekV4ROCMAiterMLASparseImpl
+    if _is_sm70_cuda():
+        from vllm.models.deepseek_v4.nvidia.sm70 import (
+            DeepseekV4SM70SparseImpl,
+        )
+
+        return DeepseekV4SM70SparseImpl
     from vllm.models.deepseek_v4.nvidia.flashmla import (
         DeepseekV4FlashMLASparseImpl,
     )
@@ -305,6 +318,21 @@ class DeepseekV4MultiHeadLatentAttentionWrapper(PluggableLayer):
         # Keep ROCm on the BF16 reference wo_a path util kernel ready.
         if current_platform.is_rocm():
             z = rocm_inv_rope_einsum(
+                self.rotary_emb,
+                o,
+                positions,
+                self.rope_head_dim,
+                self.n_local_groups,
+                self.o_lora_rank,
+                self.wo_a,
+            )
+            return self.wo_b(z.flatten(1))
+        if _is_sm70_cuda():
+            from vllm.models.deepseek_v4.nvidia.sm70 import (
+                sm70_inv_rope_einsum,
+            )
+
+            z = sm70_inv_rope_einsum(
                 self.rotary_emb,
                 o,
                 positions,
@@ -744,9 +772,16 @@ class DeepseekV4Indexer(nn.Module):
         self.q_lora_rank = q_lora_rank  # 1536
         self.compress_ratio = compress_ratio
         self.use_fp4_kv = self.vllm_config.attention_config.use_fp4_indexer_cache
+        self.use_sm70_reference_kernels = _is_sm70_cuda()
+        if self.use_sm70_reference_kernels and self.use_fp4_kv:
+            raise ValueError("SM70 DeepSeek V4 indexer requires the FP16 cache")
         logger.info_once(
             "Using %s indexer cache for Lightning Indexer.",
-            "MXFP4" if self.use_fp4_kv else "FP8",
+            (
+                "FP16"
+                if self.use_sm70_reference_kernels
+                else ("MXFP4" if self.use_fp4_kv else "FP8")
+            ),
         )
 
         # no tensor parallel, just replicated
@@ -784,10 +819,14 @@ class DeepseekV4Indexer(nn.Module):
         # head_dim bytes = 128 fp8 + 4 fp32 scale = 132.
         # For FP4 indexer cache, we still allocate the same amount of memory as FP8,
         # but only use the first half of the memory.
-        k_cache_head_dim = self.head_dim + self.head_dim // self.quant_block_size * 4
+        k_cache_head_dim = (
+            self.head_dim
+            if self.use_sm70_reference_kernels
+            else self.head_dim + self.head_dim // self.quant_block_size * 4
+        )
         self.k_cache = DeepseekV4IndexerCache(
             head_dim=k_cache_head_dim,
-            dtype=torch.uint8,
+            dtype=(torch.float16 if self.use_sm70_reference_kernels else torch.uint8),
             prefix=f"{prefix}.k_cache",
             cache_config=cache_config,
             compress_ratio=self.compress_ratio,
@@ -838,6 +877,19 @@ class DeepseekV4Indexer(nn.Module):
             # ReplicatedLinear returns (output, bias); bias is None.
             q, _ = self.wq_b(qr)
             q = q.view(-1, self.n_head, self.head_dim)
+            if self.use_sm70_reference_kernels:
+                from vllm.models.deepseek_v4.nvidia.sm70 import _apply_gptj_rope
+
+                q = _apply_gptj_rope(
+                    q,
+                    positions,
+                    rotary_emb.cos_sin_cache,
+                    self.rope_dim,
+                )
+                weights = indexer_weights.to(torch.float32) * (
+                    self.softmax_scale * self.n_head**-0.5
+                )
+                return q, weights
             return fused_indexer_q_rope_quant(
                 positions,
                 q,
