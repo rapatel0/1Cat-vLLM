@@ -120,15 +120,17 @@ public:
                const MatrixLayout& _Vdesc,
                float               beta,
                const void*         C,
-               const MatrixLayout& Cdesc,
+               const MatrixLayout& _Cdesc,
                void*               D,
-               const MatrixLayout& Ddesc,
+               const MatrixLayout& _Ddesc,
                int                 swizzle,
                int                 splits,
                Workspace&          workspace,
                cudaStream_t        stream) override
     {
         MatrixLayout Adesc = _Adesc;
+        MatrixLayout Cdesc = _Cdesc;
+        MatrixLayout Ddesc = _Ddesc;
 
         const int m = Ddesc.rows;
         const int n = Ddesc.cols;
@@ -149,6 +151,15 @@ public:
         Sched sched{{m, n, k, l}, swizzle, std::min(splits, max_splits)};
         sched.offsets_ = Ddesc.offsets;
         sched.set_active_groups(Ddesc.group_idxs, operation.active_group_count);
+        // The scheduler converts each compact logical slot to a physical
+        // expert ID before the matrix iterators run. The output epilogue then
+        // receives that physical ID, so leaving this mapping on C/D would
+        // translate it a second time (and can index past the compact array).
+        // Keep the map scheduler-private once it has been consumed.
+        if (operation.active_group_count > 0 && Ddesc.group_idxs) {
+            Cdesc.group_idxs = nullptr;
+            Ddesc.group_idxs = nullptr;
+        }
 
         using Ta = typename Gemm::Ta;
         using Tb = typename Gemm::Tb;

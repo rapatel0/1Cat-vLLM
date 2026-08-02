@@ -294,6 +294,21 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
   ops.impl("awq_moe_gemm_sm70_out", torch::kCUDA, &awq_moe_gemm_sm70_out);
 
   ops.def(
+      "awq_moe_build_active_group_indices_out(Tensor(a!) active_group_indices, "
+      "Tensor expert_offsets, int num_experts, int active_group_count) -> ()");
+  ops.impl("awq_moe_build_active_group_indices_out", torch::kCUDA,
+           &awq_moe_build_active_group_indices_out);
+
+  ops.def(
+      "awq_moe_gemm_sm70_active_groups_out("
+      "Tensor(a!) out, Tensor sorted_input, Tensor expert_offsets, "
+      "Tensor strided_ptrs_w, Tensor strided_ptrs_s, "
+      "Tensor active_group_indices, int num_experts, int active_group_count, "
+      "int k, int n, int group_size, bool gated_silu) -> ()");
+  ops.impl("awq_moe_gemm_sm70_active_groups_out", torch::kCUDA,
+           &awq_moe_gemm_sm70_active_groups_out);
+
+  ops.def(
       "awq_moe_gemm_sm70_per_expert_dispatch_out("
       "Tensor(a!) out, Tensor sorted_input, Tensor expert_offsets, "
       "Tensor strided_ptrs_w, Tensor strided_ptrs_s, int num_experts, "

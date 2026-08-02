@@ -4142,11 +4142,13 @@ void awq_moe_gemm_sm70_out_impl(
     int64_t n,
     int64_t group_size,
     bool gated_silu,
-    torch::Tensor b_group_indices,
-    bool per_expert_dispatch,
-    torch::Tensor reduce_out,
-    torch::Tensor sorted_weights,
-    bool weighted_reduce);
+    torch::Tensor b_group_indices = torch::Tensor(),
+    bool per_expert_dispatch = false,
+    torch::Tensor reduce_out = torch::Tensor(),
+    torch::Tensor sorted_weights = torch::Tensor(),
+    bool weighted_reduce = false,
+    torch::Tensor active_group_indices = torch::Tensor(),
+    int64_t active_group_count = -1);
 
 template <typename index_t>
 __global__ void awq_moe_single_token_prepare_kernel(
@@ -5067,11 +5069,13 @@ void awq_moe_gemm_sm70_out_impl(
     int64_t n,
     int64_t group_size,
     bool gated_silu,
-    torch::Tensor b_group_indices = torch::Tensor(),
-    bool per_expert_dispatch = false,
-    torch::Tensor reduce_out = torch::Tensor(),
-    torch::Tensor sorted_weights = torch::Tensor(),
-    bool weighted_reduce = false) {
+    torch::Tensor b_group_indices,
+    bool per_expert_dispatch,
+    torch::Tensor reduce_out,
+    torch::Tensor sorted_weights,
+    bool weighted_reduce,
+    torch::Tensor active_group_indices,
+    int64_t active_group_count) {
   TORCH_CHECK(sorted_input.is_cuda() && sorted_input.scalar_type() == torch::kFloat16,
               "awq_moe_gemm_sm70: input must be CUDA float16.");
   TORCH_CHECK(expert_offsets.is_cuda() && expert_offsets.scalar_type() == torch::kInt32,
@@ -5102,6 +5106,21 @@ void awq_moe_gemm_sm70_out_impl(
     b_group_indices_flat = b_group_indices.contiguous().view({-1});
     TORCH_CHECK(b_group_indices_flat.numel() >= num_experts,
                 "awq_moe_gemm_sm70: B group indices size mismatch.");
+  }
+
+  torch::Tensor active_group_indices_flat = active_group_indices;
+  const bool use_active_group_indices =
+      active_group_indices.defined() && active_group_indices.numel() > 0 &&
+      active_group_count > 0;
+  if (use_active_group_indices) {
+    TORCH_CHECK(active_group_indices.is_cuda() &&
+                    active_group_indices.scalar_type() == torch::kInt32,
+                "awq_moe_gemm_sm70: active group indices must be CUDA int32.");
+    active_group_indices_flat = active_group_indices.contiguous().view({-1});
+    TORCH_CHECK(active_group_indices_flat.numel() >= active_group_count,
+                "awq_moe_gemm_sm70: active group indices size mismatch.");
+    TORCH_CHECK(active_group_count <= num_experts,
+                "awq_moe_gemm_sm70: active group count exceeds source experts.");
   }
 
   const at::cuda::OptionalCUDAGuard device_guard(device_of(sorted_input));
@@ -5224,8 +5243,15 @@ void awq_moe_gemm_sm70_out_impl(
   };
   desc_D.num = static_cast<int>(num_experts);
   desc_D.offsets = expert_offsets.data_ptr<int>();
+  desc_D.group_idxs =
+      use_active_group_indices ? active_group_indices_flat.data_ptr<int>()
+                               : nullptr;
 
   turbomind::gemm::Operation op{};
+  // The active mapping compacts the scheduler's launch axis, but the physical
+  // GEMM descriptor still carries all source experts. Keep dispatch tuning
+  // keyed to that physical shape: otherwise every active-route cardinality
+  // triggers an independent exhaustive tune for the same descriptor.
   op.dispatch = vllm::awq_sm70::select_awq_moe_dispatch_policy(
       device, static_cast<int>(total_tokens), static_cast<int>(n),
       static_cast<int>(k), static_cast<int>(num_experts),
@@ -5248,6 +5274,8 @@ void awq_moe_gemm_sm70_out_impl(
   op.quant_b = {turbomind::gemm::QuantType::kK, static_cast<int>(group_size)};
   op.batch_dim = 0;
   op.dispatch_num_override = per_expert_dispatch ? 1 : 0;
+  op.active_group_count =
+      use_active_group_indices ? static_cast<int>(active_group_count) : 0;
 
   auto& workspace_holder = vllm::awq_sm70::get_workspace(device, stream);
   auto& gemm = vllm::awq_sm70::get_gemm(device);
@@ -5264,6 +5292,61 @@ void awq_moe_gemm_sm70_out_impl(
 
   TORCH_CHECK(ec == 0, "awq_moe_gemm_sm70: TurboMind batched GEMM failed (ec=",
               ec, ").");
+}
+
+__global__ void awq_moe_build_active_group_indices_kernel(
+    const int* expert_offsets,
+    int* active_group_indices,
+    int num_experts,
+    int active_group_count) {
+  if (blockIdx.x != 0 || threadIdx.x != 0) {
+    return;
+  }
+
+  int written = 0;
+  for (int expert = 0; expert < num_experts; ++expert) {
+    if (written < active_group_count &&
+        expert_offsets[expert + 1] > expert_offsets[expert]) {
+      active_group_indices[written++] = expert;
+    }
+  }
+  for (int expert = 0;
+       expert < num_experts && written < active_group_count;
+       ++expert) {
+    if (expert_offsets[expert + 1] == expert_offsets[expert]) {
+      active_group_indices[written++] = expert;
+    }
+  }
+}
+
+void awq_moe_build_active_group_indices_out(
+    torch::Tensor active_group_indices,
+    torch::Tensor expert_offsets,
+    int64_t num_experts,
+    int64_t active_group_count) {
+  TORCH_CHECK(expert_offsets.is_cuda() &&
+                  expert_offsets.scalar_type() == torch::kInt32 &&
+                  expert_offsets.is_contiguous(),
+              "awq_moe_build_active_group_indices_out: expert_offsets must "
+              "be contiguous CUDA int32.");
+  TORCH_CHECK(active_group_indices.is_cuda() &&
+                  active_group_indices.scalar_type() == torch::kInt32 &&
+                  active_group_indices.is_contiguous(),
+              "awq_moe_build_active_group_indices_out: active_group_indices "
+              "must be contiguous CUDA int32.");
+  TORCH_CHECK(num_experts > 0 && active_group_count > 0 &&
+                  active_group_count <= num_experts,
+              "awq_moe_build_active_group_indices_out: invalid group count.");
+  TORCH_CHECK(expert_offsets.numel() >= num_experts + 1 &&
+                  active_group_indices.numel() >= active_group_count,
+              "awq_moe_build_active_group_indices_out: buffer too small.");
+
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(expert_offsets));
+  awq_moe_build_active_group_indices_kernel<<<
+      1, 1, 0, at::cuda::getCurrentCUDAStream()>>>(
+      expert_offsets.data_ptr<int>(), active_group_indices.data_ptr<int>(),
+      static_cast<int>(num_experts), static_cast<int>(active_group_count));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
 void awq_moe_gemm_sm70_out(
@@ -5288,6 +5371,42 @@ void awq_moe_gemm_sm70_out(
       n,
       group_size,
       gated_silu);
+}
+
+void awq_moe_gemm_sm70_active_groups_out(
+    torch::Tensor out,
+    torch::Tensor sorted_input,
+    torch::Tensor expert_offsets,
+    torch::Tensor strided_ptrs_w,
+    torch::Tensor strided_ptrs_s,
+    torch::Tensor active_group_indices,
+    int64_t num_experts,
+    int64_t active_group_count,
+    int64_t k,
+    int64_t n,
+    int64_t group_size,
+    bool gated_silu) {
+  awq_moe_gemm_sm70_out_impl(
+      out,
+      sorted_input,
+      expert_offsets,
+      strided_ptrs_w,
+      strided_ptrs_s,
+      num_experts,
+      k,
+      n,
+      group_size,
+      gated_silu,
+      torch::Tensor(),
+      // Keep the physical 256-expert descriptor: the scheduler compacts its
+      // logical launch axis with active_group_indices. Overriding this to one
+      // expert silently bypasses that compaction.
+      false,
+      torch::Tensor(),
+      torch::Tensor(),
+      false,
+      active_group_indices,
+      active_group_count);
 }
 
 void awq_moe_gemm_sm70_per_expert_dispatch_out(

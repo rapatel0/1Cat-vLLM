@@ -449,6 +449,47 @@ def test_flash_v100_smallq_metadata_masks_cudagraph_padding(
     )
 
 
+def test_flash_v100_smallq_eager_workspace_uses_live_sequence_length(
+    monkeypatch,
+    local_flash_v100_model,
+):
+    """Do not reserve a max-model-length workspace for every prompt token."""
+    from tests.v1.attention.utils import (
+        BatchSpec,
+        create_common_attn_metadata,
+        create_standard_kv_cache_spec,
+        create_vllm_config,
+    )
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        FlashAttnV100MetadataBuilder,
+    )
+
+    monkeypatch.setenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16")
+
+    vllm_config = create_vllm_config(
+        model_name=local_flash_v100_model(),
+        max_model_len=4096,
+        max_num_seqs=32,
+    )
+    kv_cache_spec = create_standard_kv_cache_spec(vllm_config)
+    builder = FlashAttnV100MetadataBuilder(
+        kv_cache_spec=kv_cache_spec,
+        layer_names=["language_model.model.layers.3.self_attn.attn"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[18, 17], query_lens=[4, 3]),
+        block_size=16,
+        device=torch.device("cpu"),
+    )
+
+    attn_metadata = builder.build(0, common)
+
+    assert attn_metadata.smallq_decode_max_seq_len_hint == 18
+    assert attn_metadata.smallq_decode_workspace_seq_capacity_hint is None
+
+
 def test_flash_v100_smallq_replay_shape_overflow_fails_fast(
     monkeypatch,
     local_flash_v100_model,

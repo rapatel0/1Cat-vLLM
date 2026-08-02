@@ -245,6 +245,25 @@ void awq_moe_gemm_sm70_out(torch::Tensor out,
                            int64_t group_size,
                            bool gated_silu);
 
+void awq_moe_build_active_group_indices_out(torch::Tensor active_group_indices,
+                                            torch::Tensor expert_offsets,
+                                            int64_t num_experts,
+                                            int64_t active_group_count);
+
+void awq_moe_gemm_sm70_active_groups_out(
+    torch::Tensor out,
+    torch::Tensor sorted_input,
+    torch::Tensor expert_offsets,
+    torch::Tensor strided_ptrs_w,
+    torch::Tensor strided_ptrs_s,
+    torch::Tensor active_group_indices,
+    int64_t num_experts,
+    int64_t active_group_count,
+    int64_t k,
+    int64_t n,
+    int64_t group_size,
+    bool gated_silu);
+
 void awq_moe_gemm_sm70_per_expert_dispatch_out(torch::Tensor out,
                                                torch::Tensor sorted_input,
                                                torch::Tensor expert_offsets,

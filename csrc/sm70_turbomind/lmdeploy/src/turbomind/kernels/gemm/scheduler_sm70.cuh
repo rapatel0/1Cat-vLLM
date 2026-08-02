@@ -137,6 +137,15 @@ struct SchedulerSm70 {
             int beg, end, beg_tile, end_tile;
             get_group_bounds(g, beg, end, beg_tile, end_tile);
 
+            // The compact MoE route pads its active-group map to the number
+            // of routed slots. Those padding entries have an empty [beg, end)
+            // range. They reserve a scheduler tile for layout purposes, but
+            // must not reach the GEMM iterator: a zero-M CTA can otherwise
+            // consume invalid fragments and poison later MoE layers with NaNs.
+            if (beg == end) {
+                continue;
+            }
+
             if (beg_tile <= tile_id[axis] && tile_id[axis] < end_tile) {
                 storage.group_id     = source_group(g);
                 storage.dynamic_dim  = end - beg;

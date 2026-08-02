@@ -659,6 +659,50 @@ def awq_moe_gemm_sm70_out(
     )
 
 
+def awq_moe_build_active_group_indices_out(
+    active_group_indices: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    num_experts: int,
+    active_group_count: int,
+) -> None:
+    _op("awq_moe_build_active_group_indices_out")(
+        active_group_indices,
+        expert_offsets,
+        num_experts,
+        active_group_count,
+    )
+
+
+def awq_moe_gemm_sm70_active_groups_out(
+    out: torch.Tensor,
+    sorted_input: torch.Tensor,
+    expert_offsets: torch.Tensor,
+    strided_ptrs_w: torch.Tensor,
+    strided_ptrs_s: torch.Tensor,
+    active_group_indices: torch.Tensor,
+    num_experts: int,
+    active_group_count: int,
+    k: int,
+    n: int,
+    group_size: int,
+    gated_silu: bool = False,
+) -> None:
+    _op("awq_moe_gemm_sm70_active_groups_out")(
+        out,
+        sorted_input,
+        expert_offsets,
+        strided_ptrs_w,
+        strided_ptrs_s,
+        active_group_indices,
+        num_experts,
+        active_group_count,
+        k,
+        n,
+        group_size,
+        gated_silu,
+    )
+
+
 def awq_moe_gemm_sm70_per_expert_dispatch_out(
     out: torch.Tensor,
     sorted_input: torch.Tensor,
@@ -700,6 +744,53 @@ if hasattr(torch.ops._C, "awq_moe_gemm_sm70_out"):
         group_size: int,
         gated_silu: bool,
     ) -> None:
+        return None
+
+
+if hasattr(torch.ops._C, "awq_moe_build_active_group_indices_out"):
+
+    @register_fake("_C::awq_moe_build_active_group_indices_out")
+    def _awq_moe_build_active_group_indices_out_fake(
+        active_group_indices: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        num_experts: int,
+        active_group_count: int,
+    ) -> None:
+        del active_group_indices, expert_offsets, num_experts, active_group_count
+        return None
+
+
+if hasattr(torch.ops._C, "awq_moe_gemm_sm70_active_groups_out"):
+
+    @register_fake("_C::awq_moe_gemm_sm70_active_groups_out")
+    def _awq_moe_gemm_sm70_active_groups_out_fake(
+        out: torch.Tensor,
+        sorted_input: torch.Tensor,
+        expert_offsets: torch.Tensor,
+        strided_ptrs_w: torch.Tensor,
+        strided_ptrs_s: torch.Tensor,
+        active_group_indices: torch.Tensor,
+        num_experts: int,
+        active_group_count: int,
+        k: int,
+        n: int,
+        group_size: int,
+        gated_silu: bool,
+    ) -> None:
+        del (
+            out,
+            sorted_input,
+            expert_offsets,
+            strided_ptrs_w,
+            strided_ptrs_s,
+            active_group_indices,
+            num_experts,
+            active_group_count,
+            k,
+            n,
+            group_size,
+            gated_silu,
+        )
         return None
 
 

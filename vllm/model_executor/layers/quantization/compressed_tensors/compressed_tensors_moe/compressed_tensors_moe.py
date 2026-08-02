@@ -9,11 +9,13 @@ from compressed_tensors.quantization import (
     QuantizationStrategy,
 )
 
+from vllm import envs
 from vllm.logger import init_logger
 from vllm.model_executor.layers.fused_moe import (
     FusedMoEMethodBase,
     UnquantizedFusedMoEMethod,
 )
+from vllm.model_executor.layers.quantization import sm70_turbomind as sm70_tm
 from vllm.model_executor.layers.quantization.compressed_tensors.schemes.compressed_tensors_wNa16 import (  # noqa
     WNA16_SUPPORTED_BITS,
 )
@@ -91,6 +93,29 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                     f" and bits: {WNA16_SUPPORTED_BITS} is supported ",
                     f"but got format: {CompressionFormat.pack_quantized.value} "
                     f" and bits: {weight_quant.num_bits}",
+                )
+
+            use_sm70_turbomind = (
+                current_platform.is_cuda()
+                and current_platform.is_device_capability(70)
+                and sm70_tm.use_turbomind(
+                    envs.VLLM_SM70_COMPRESSED_TENSORS_TURBOMIND
+                )
+                and weight_quant.num_bits == 4
+                and weight_quant.group_size in sm70_tm.COMPRESSED_UINT4_GROUP_SIZES
+                and weight_quant.symmetric
+                and weight_quant.strategy == QuantizationStrategy.GROUP
+                and not weight_quant.actorder
+                and not layer.moe_config.has_bias
+            )
+            if use_sm70_turbomind:
+                from .compressed_tensors_moe_wna16_turbomind import (
+                    CompressedTensorsWNA16TurboMindMoEMethod,
+                )
+
+                logger.info_once("Using CompressedTensorsWNA16TurboMindMoEMethod")
+                return CompressedTensorsWNA16TurboMindMoEMethod(
+                    weight_quant, input_quant, layer.moe_config, layer_name
                 )
 
             # Prefer to use the MarlinMoE kernel when it is supported.

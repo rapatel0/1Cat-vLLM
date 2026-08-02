@@ -1779,6 +1779,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         common_attn_metadata,
         *,
         force: bool = False,
+        static_workspace: bool = False,
     ) -> None:
         self._clear_smallq_decode_metadata(attn_metadata)
 
@@ -1918,14 +1919,20 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         )
         raw_seq_capacity = int(block_table.shape[1]) * int(self.block_size)
         max_seq_len_hint = int(seq_lens_cpu.max().item())
-        if max_seq_len_hint > 0 and raw_seq_capacity > 0:
+        if max_seq_len_hint > 0:
             # MTP verification reaches this backend as q>1 prefix prefill, but
             # the Flash-V100 long-context optimization still applies because
             # the actual compute is paged decode over each tiny query row.
-            # Keep graph replay capacity fixed while letting kernels skip
-            # inactive partitions for the current runtime sequence length.
+            # Eager execution should grow the temporary workspace with the
+            # actual sequence length. Reserving the full block-table envelope
+            # for every prompt token makes a short, concurrent prefill consume
+            # O(batch * max_model_len) temporary memory. CUDA graph capture,
+            # however, requires a stable workspace envelope for replay.
             attn_metadata.smallq_decode_max_seq_len_hint = max_seq_len_hint
-            attn_metadata.smallq_decode_workspace_seq_capacity_hint = raw_seq_capacity
+            if static_workspace and raw_seq_capacity > 0:
+                attn_metadata.smallq_decode_workspace_seq_capacity_hint = (
+                    raw_seq_capacity
+                )
         if _draft_graph_debug_enabled():
             _graph_metadata_debug_log(
                 "smallq_update",
@@ -1982,6 +1989,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                 attn_metadata,
                 common_attn_metadata,
                 force=True,
+                static_workspace=True,
             )
         else:
             # PIECEWISE graph replay captures the q=1 decode kernel arguments

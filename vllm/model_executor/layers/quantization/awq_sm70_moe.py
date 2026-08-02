@@ -274,6 +274,26 @@ def _diff_stats(left: torch.Tensor, right: torch.Tensor) -> dict[str, float | in
     }
 
 
+def _active_groups_compare_safe_enabled() -> bool:
+    """Compare the experimental compact dispatch against the safe route."""
+    return os.getenv("VLLM_SM70_AWQ_MOE_ACTIVE_GROUPS_COMPARE_SAFE") == "1"
+
+
+def _log_active_groups_compare_safe(
+    layer: RoutedExperts,
+    stage: str,
+    active: torch.Tensor,
+    safe: torch.Tensor,
+) -> None:
+    stats = _diff_stats(active, safe)
+    logger.warning(
+        "SM70 active-group %s comparison layer=%s: %s",
+        stage,
+        _get_layer_id(layer),
+        stats,
+    )
+
+
 def _write_compare_dense_record(record: dict[str, object]) -> None:
     out_dir = envs.VLLM_SM70_AWQ_MOE_COMPARE_DENSE_DIR
     if not out_dir:
@@ -764,6 +784,11 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer._awq_moe_buf_active_expert_offsets = torch.arange(
             max_slots + 1, dtype=torch.int32, device=device
         )
+        layer._awq_moe_buf_active_group_indices = torch.empty(
+            min(max_slots, layer.sm70_num_experts),
+            dtype=torch.int32,
+            device=device,
+        )
         ptr_row_bytes = int(layer.sm70_ptr_row_bytes)
         layer._awq_moe_buf_compact_w13_ptrs_w = torch.empty(
             top_k * ptr_row_bytes, dtype=torch.uint8, device=device
@@ -825,6 +850,11 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 ],
                 "active_expert_offsets": (
                     layer._awq_moe_buf_active_expert_offsets[: total_slots + 1]
+                ),
+                "active_group_indices": (
+                    layer._awq_moe_buf_active_group_indices[
+                        : min(total_slots, layer.sm70_num_experts)
+                    ]
                 ),
                 "strict_expert_offsets": layer._awq_moe_buf_strict_expert_offsets,
                 "strict_expert_offsets64": (
@@ -941,6 +971,11 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 total_slots, dtype=torch.int32, device=device
             ),
             "active_expert_offsets": active_expert_offsets,
+            "active_group_indices": torch.empty(
+                min(total_slots, layer.sm70_num_experts),
+                dtype=torch.int32,
+                device=device,
+            ),
             "strict_expert_offsets": torch.empty(
                 layer.sm70_num_experts + 1, dtype=torch.int32, device=device
             ),
@@ -1278,8 +1313,31 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             ),
             exact_w2=envs.VLLM_SM70_AWQ_MOE_BATCHED_EXACT_W2,
             active_exact_w2=envs.VLLM_SM70_AWQ_MOE_BATCHED_ACTIVE_EXACT_W2,
-            w13_per_expert_dispatch=True,
-            w2_per_expert_dispatch=True,
+            # Native AWQ keeps the established per-expert selector. Other
+            # compatible formats can opt into the generic grouped selector
+            # after preparing the same TurboMind pointer layout.
+            w13_per_expert_dispatch=getattr(
+                layer, "sm70_awq_moe_batched_w13_per_expert_dispatch", True
+            ),
+            w2_per_expert_dispatch=getattr(
+                layer, "sm70_awq_moe_batched_w2_per_expert_dispatch", True
+            ),
+        )
+        active_group_count = 0
+        if (
+            getattr(layer, "sm70_awq_moe_batched_active_groups", False)
+            and total_slots < layer.sm70_num_experts
+            and route_plan.use_batched_moe_gemm
+        ):
+            active_group_count = total_slots
+            sm70_ops.awq_moe_build_active_group_indices_out(
+                buffers["active_group_indices"],
+                buffers["expert_offsets"],
+                layer.sm70_num_experts,
+                active_group_count,
+            )
+        compare_active_groups_to_safe = (
+            active_group_count > 0 and _active_groups_compare_safe_enabled()
         )
         use_batched_strict_moe = route_plan.use_batched_strict_w13
         use_batched_moe_gemm = route_plan.use_batched_moe_gemm
@@ -1355,6 +1413,61 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 compare_dense_w13_stats = _diff_stats(
                     buffers["gate_up"], dense_gate_up
                 )
+        elif route_plan.w13 == Sm70MoeStageRoute.BATCHED:
+            _log_runtime_route_once(
+                "SM70 AWQ MoE batched W13 using grouped dispatch "
+                "(experts=%d, active-group limit=%d).",
+                layer.sm70_num_experts,
+                active_group_count,
+            )
+            if active_group_count:
+                sm70_ops.awq_moe_gemm_sm70_active_groups_out(
+                    buffers["gate_up"],
+                    buffers["permuted_input"],
+                    buffers["expert_offsets"],
+                    layer.w13_strided_ptrs_w,
+                    layer.w13_strided_ptrs_s,
+                    buffers["active_group_indices"],
+                    layer.sm70_num_experts,
+                    active_group_count,
+                    layer.sm70_w13_k_dim,
+                    layer.sm70_w13_n_dim,
+                    self.group_size,
+                    False,
+                )
+                if compare_active_groups_to_safe:
+                    safe_gate_up = torch.empty_like(buffers["gate_up"])
+                    sm70_ops.awq_moe_gemm_sm70_per_expert_dispatch_out(
+                        safe_gate_up,
+                        buffers["permuted_input"],
+                        buffers["expert_offsets"],
+                        layer.w13_strided_ptrs_w,
+                        layer.w13_strided_ptrs_s,
+                        layer.sm70_num_experts,
+                        layer.sm70_w13_k_dim,
+                        layer.sm70_w13_n_dim,
+                        self.group_size,
+                        False,
+                    )
+                    _log_active_groups_compare_safe(
+                        layer, "W13", buffers["gate_up"], safe_gate_up
+                    )
+            else:
+                sm70_ops.awq_moe_gemm_sm70_out(
+                    buffers["gate_up"],
+                    buffers["permuted_input"],
+                    buffers["expert_offsets"],
+                    layer.w13_strided_ptrs_w,
+                    layer.w13_strided_ptrs_s,
+                    layer.sm70_num_experts,
+                    layer.sm70_w13_k_dim,
+                    layer.sm70_w13_n_dim,
+                    self.group_size,
+                    False,
+                )
+            buffers["gate_up"] = _dump_awq_moe_buffer(
+                layer, buffers["gate_up"], "w13_batched_out"
+            )
         else:
             if use_batched_strict_moe:
                 _log_runtime_route_once(
@@ -1650,6 +1763,64 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                         .cpu()
                         .tolist(),
                     }
+        elif route_plan.w2 == Sm70MoeStageRoute.BATCHED:
+            _log_runtime_route_once(
+                "SM70 AWQ MoE batched W2 using grouped dispatch "
+                "(experts=%d, active-group limit=%d).",
+                layer.sm70_num_experts,
+                active_group_count,
+            )
+            if active_group_count:
+                sm70_ops.awq_moe_gemm_sm70_active_groups_out(
+                    buffers["sorted_output"],
+                    buffers["intermediate"],
+                    buffers["expert_offsets"],
+                    layer.w2_strided_ptrs_w,
+                    layer.w2_strided_ptrs_s,
+                    buffers["active_group_indices"],
+                    layer.sm70_num_experts,
+                    active_group_count,
+                    layer.sm70_w2_k_dim,
+                    layer.sm70_w2_n_dim,
+                    self.group_size,
+                    False,
+                )
+                if compare_active_groups_to_safe:
+                    safe_sorted_output = torch.empty_like(buffers["sorted_output"])
+                    sm70_ops.awq_moe_gemm_sm70_per_expert_dispatch_out(
+                        safe_sorted_output,
+                        buffers["intermediate"],
+                        buffers["expert_offsets"],
+                        layer.w2_strided_ptrs_w,
+                        layer.w2_strided_ptrs_s,
+                        layer.sm70_num_experts,
+                        layer.sm70_w2_k_dim,
+                        layer.sm70_w2_n_dim,
+                        self.group_size,
+                        False,
+                    )
+                    _log_active_groups_compare_safe(
+                        layer,
+                        "W2",
+                        buffers["sorted_output"],
+                        safe_sorted_output,
+                    )
+            else:
+                sm70_ops.awq_moe_gemm_sm70_out(
+                    buffers["sorted_output"],
+                    buffers["intermediate"],
+                    buffers["expert_offsets"],
+                    layer.w2_strided_ptrs_w,
+                    layer.w2_strided_ptrs_s,
+                    layer.sm70_num_experts,
+                    layer.sm70_w2_k_dim,
+                    layer.sm70_w2_n_dim,
+                    self.group_size,
+                    False,
+                )
+            buffers["sorted_output"] = _dump_awq_moe_buffer(
+                layer, buffers["sorted_output"], "w2_batched_out"
+            )
         else:
             if use_batched_exact_w2:
                 _log_runtime_route_once(
