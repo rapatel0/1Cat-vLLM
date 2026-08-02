@@ -479,12 +479,43 @@ class Fp8LinearMethod(LinearMethodBase):
             weight, weight_scale_inv = process_fp8_weight_block_strategy(
                 weight, weight_scale_inv
             )
+            if getattr(layer, "is_bmm", False):
+                # DeepSeek V4 WO_A is a grouped BMM. Pack each group as an
+                # independent TurboMind GEMM: packing the flattened matrix and
+                # later viewing it as logical [group, rank, hidden] storage
+                # corrupts the output-column layout.
+                num_groups = layer.bmm_batch_size
+                output_size, input_size = weight.shape
+                output_size_per_group = output_size // num_groups
+                weight = weight.view(num_groups, output_size_per_group, input_size)
+                weight_scale_inv = weight_scale_inv.to(torch.float32).view(
+                    num_groups,
+                    output_size_per_group // self.weight_block_size[0],
+                    input_size // self.weight_block_size[1],
+                )
+                prepared = [
+                    sm70_ops.fp8_sm70_prepare(
+                        weight[group],
+                        weight_scale_inv[group],
+                        self.weight_block_size[0],
+                        False,
+                    )
+                    for group in range(num_groups)
+                ]
+                tm_weight = torch.stack([group[0] for group in prepared])
+                tm_scales = torch.stack([group[1] for group in prepared])
+                meta = torch.stack([group[2] for group in prepared])
+                replace_parameter(layer, "weight", tm_weight)
+                replace_parameter(layer, "weight_scale_inv", tm_scales)
+                layer.input_scale = None
+                layer.sm70_fp8_grouped_bmm = True
+                layer.register_buffer("sm70_fp8_grouped_meta", meta, persistent=False)
+                logger.info_once("SM70 FP8 grouped BMM TurboMind path enabled.")
+                return
             if weight_scale_inv.dtype != torch.float32:
                 weight_scale_inv = weight_scale_inv.to(torch.float32)
             is_gated_silu_layer = self._is_sm70_gated_silu_layer(layer)
-            use_gated_silu = (
-                is_gated_silu_layer and envs.VLLM_SM70_FP8_DENSE_GATED_SILU
-            )
+            use_gated_silu = is_gated_silu_layer and envs.VLLM_SM70_FP8_DENSE_GATED_SILU
             tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
                 weight,
                 weight_scale_inv,
@@ -1123,16 +1154,12 @@ class Fp8MoEMethod(FusedMoEMethodBase):
                 w13 = self._dequantize_block_moe_weight(
                     w13, w13_scale, layer.orig_dtype
                 )
-                w2 = self._dequantize_block_moe_weight(
-                    w2, w2_scale, layer.orig_dtype
-                )
+                w2 = self._dequantize_block_moe_weight(w2, w2_scale, layer.orig_dtype)
             else:
                 w13 = self._dequantize_tensor_moe_weight(
                     w13, w13_scale, layer.orig_dtype
                 )
-                w2 = self._dequantize_tensor_moe_weight(
-                    w2, w2_scale, layer.orig_dtype
-                )
+                w2 = self._dequantize_tensor_moe_weight(w2, w2_scale, layer.orig_dtype)
             replace_parameter(layer, "w13_weight", w13)
             replace_parameter(layer, "w2_weight", w2)
             layer.w13_input_scale = None

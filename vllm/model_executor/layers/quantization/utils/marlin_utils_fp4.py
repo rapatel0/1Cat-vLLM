@@ -28,10 +28,7 @@ def is_fp4_marlin_supported():
         return False
     if current_platform.has_device_capability(75):
         return True
-    return (
-        current_platform.is_device_capability((7, 0))
-        and ops.sm70_marlin_available()
-    )
+    return current_platform.is_device_capability((7, 0)) and ops.sm70_marlin_available()
 
 
 def _nvfp4_compute_scale_factor(
@@ -120,8 +117,16 @@ def nvfp4_marlin_process_scales(
 
 
 def mxfp4_marlin_process_scales(marlin_scales, input_dtype=None):
-    # fit the layout of fp8 dequantization
-    if input_dtype is None or input_dtype.itemsize == 2:
+    # Generic Marlin's FP8 dequantization expects the middle two scales in
+    # each group of four to be swapped.  The SM70 iterators load metadata
+    # directly in logical N-contiguous order, so applying that permutation on
+    # Volta associates scales with the wrong output columns.
+    uses_sm70_logical_scales = (
+        current_platform.is_device_capability((7, 0)) and ops.sm70_marlin_available()
+    )
+    if not uses_sm70_logical_scales and (
+        input_dtype is None or input_dtype.itemsize == 2
+    ):
         marlin_scales = marlin_scales.view(-1, 4)[:, [0, 2, 1, 3]].view(
             marlin_scales.size(0), -1
         )

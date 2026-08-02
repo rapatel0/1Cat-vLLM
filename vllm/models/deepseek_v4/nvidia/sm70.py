@@ -8,6 +8,7 @@ from typing import TYPE_CHECKING, ClassVar, cast
 import torch
 import torch.nn.functional as F
 
+from vllm import _sm70_ops as sm70_ops
 from vllm.forward_context import get_forward_context
 from vllm.models.deepseek_v4.common.ops import (
     combine_topk_swa_indices,
@@ -97,25 +98,32 @@ def _reference_sparse_attention(
     attn_sink: torch.Tensor | None,
 ) -> torch.Tensor:
     """FP32 softmax reference over already-gathered FP16 KV rows."""
-    q_float = q.to(torch.float32)
-    kv_float = kv.to(torch.float32)
-    scores = torch.bmm(q_float, kv_float.transpose(1, 2)) * scale
+    if q.is_cuda:
+        scores = torch.bmm(
+            q,
+            kv.transpose(1, 2),
+            out_dtype=torch.float32,
+        )
+    else:
+        scores = torch.bmm(q.to(torch.float32), kv.to(torch.float32).transpose(1, 2))
+    scores *= scale
     scores.masked_fill_(invalid.unsqueeze(1), -torch.inf)
 
-    row_max = scores.amax(dim=-1)
     if attn_sink is not None:
-        sink = attn_sink[: q.shape[1]].to(torch.float32).view(1, -1)
-        row_max = torch.maximum(row_max, sink)
+        sink = (
+            attn_sink[: q.shape[1]]
+            .to(torch.float32)
+            .view(1, -1, 1)
+            .expand(q.shape[0], -1, -1)
+        )
+        probabilities = torch.softmax(torch.cat((scores, sink), dim=-1), dim=-1)
+        probabilities = probabilities[..., :-1]
     else:
-        sink = None
-    finite_max = torch.where(torch.isfinite(row_max), row_max, 0.0)
-    probabilities = torch.exp(scores - finite_max.unsqueeze(-1))
-    probabilities.masked_fill_(invalid.unsqueeze(1), 0.0)
-    denominator = probabilities.sum(dim=-1)
-    if sink is not None:
-        denominator = denominator + torch.exp(sink - finite_max)
-    probabilities = probabilities / denominator.clamp_min(1e-30).unsqueeze(-1)
-    return torch.bmm(probabilities, kv_float).to(q.dtype)
+        probabilities = torch.softmax(scores, dim=-1)
+        probabilities.nan_to_num_(nan=0.0)
+    if q.is_cuda:
+        return torch.bmm(probabilities.to(q.dtype), kv)
+    return torch.bmm(probabilities, kv.to(torch.float32)).to(q.dtype)
 
 
 def _gather_scope(
@@ -722,6 +730,28 @@ def sm70_inv_rope_einsum(
         inverse=True,
     ).view(o.shape[0], n_local_groups, -1)
     hidden_dim = o_ref.shape[-1]
+
+    if getattr(wo_a, "sm70_fp8_grouped_bmm", False):
+        output = torch.empty(
+            o.shape[0],
+            n_local_groups,
+            o_lora_rank,
+            dtype=o.dtype,
+            device=o.device,
+        )
+        meta = wo_a.sm70_fp8_grouped_meta
+        for group in range(n_local_groups):
+            sm70_ops.fp8_gemm_sm70_out(
+                output[:, group, :],
+                o_ref[:, group, :],
+                wo_a.weight[group],
+                wo_a.weight_scale_inv[group],
+                128,
+                int(meta[group, 0].item()),
+                int(meta[group, 1].item()),
+                False,
+            )
+        return output
 
     weight = wo_a.weight.view(n_local_groups, o_lora_rank, hidden_dim)
     if weight.dtype in (torch.float8_e4m3fn, torch.uint8):
