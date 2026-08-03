@@ -8,7 +8,11 @@ import torch
 from typing_extensions import override
 
 from vllm.config import VllmConfig
-from vllm.distributed.parallel_state import get_pp_group, graph_capture
+from vllm.distributed.parallel_state import (
+    get_pp_group,
+    get_tensor_model_parallel_rank,
+    graph_capture,
+)
 from vllm.logger import init_logger
 from vllm.v1.attention.backend import CommonAttentionMetadata
 from vllm.v1.sample.metadata import SamplingMetadata
@@ -325,6 +329,7 @@ class DSparkProposer(DFlashProposer):
         self.confidence_threshold = float(
             getattr(spec_config, "dspark_confidence_threshold", 0.0)
         )
+        self._dspark_confidence_logged = False
         self.use_forward_cudagraph = _spec_bool(
             spec_config,
             "dspark_forward_cudagraph",
@@ -770,6 +775,19 @@ class DSparkProposer(DFlashProposer):
             confidence_logits = predict_confidence(
                 proposal_hidden, prev_token_ids
             ).squeeze(-1)
+            if (
+                not self._dspark_confidence_logged
+                and get_pp_group().is_last_rank
+                and get_tensor_model_parallel_rank() == 0
+            ):
+                confidence_means = (
+                    confidence_logits.sigmoid().mean(dim=0).detach().cpu().tolist()
+                )
+                logger.info(
+                    "DSpark mean confidence by draft position: %s",
+                    [round(value, 4) for value in confidence_means],
+                )
+                self._dspark_confidence_logged = True
             mask_dspark_confidence_prefix_(
                 sampled_token_ids,
                 confidence_logits,
