@@ -321,6 +321,7 @@ class DSparkProposer(DFlashProposer):
             device=device,
         )
         self._dspark_draft_probs_out: torch.Tensor | None = None
+        self._dspark_confidence_hidden_states: torch.Tensor | None = None
         self.valid_vocab_size = int(hf_config.vocab_size)
         self.use_fp64_gumbel = vllm_config.model_config.use_fp64_gumbel
         self.use_fused_markov_sampler = bool(
@@ -372,6 +373,10 @@ class DSparkProposer(DFlashProposer):
                 return
             self.model = _DSparkForwardCUDAGraph(self, self.model)
             logger.info("DSpark draft forward CUDA graph is enabled.")
+
+    @override
+    def model_returns_tuple(self) -> bool:
+        return self.confidence_threshold > 0.0
 
     @override
     def _maybe_share_embeddings(self, target_language_model: Any) -> None:
@@ -754,6 +759,10 @@ class DSparkProposer(DFlashProposer):
             )
 
         if self.confidence_threshold > 0.0:
+            if self._dspark_confidence_hidden_states is None:
+                raise RuntimeError(
+                    "DSpark confidence hidden states were not initialized"
+                )
             predict_confidence = getattr(self.model, "predict_dspark_confidence", None)
             if predict_confidence is None:
                 raise NotImplementedError(
@@ -762,7 +771,7 @@ class DSparkProposer(DFlashProposer):
                     "prev_token_ids)"
                 )
             sampled_token_ids, _ = output
-            proposal_hidden = hidden_states.view(
+            proposal_hidden = self._dspark_confidence_hidden_states.view(
                 batch_size, self.num_speculative_tokens, -1
             )
             prev_token_ids = torch.cat(

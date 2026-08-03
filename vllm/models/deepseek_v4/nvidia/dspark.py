@@ -843,7 +843,6 @@ class DeepSeekV4DSpark(nn.Module):
             else float(getattr(spec_config, "dspark_confidence_threshold", 0.0))
         )
         self.use_confidence_scheduling = confidence_threshold > 0.0
-        self._dspark_confidence_hidden: torch.Tensor | None = None
         self._dspark_markov_embeds: list[torch.Tensor | None] = [None] * self.block_size
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
@@ -892,7 +891,7 @@ class DeepSeekV4DSpark(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         main_positions: torch.Tensor | None = None,
         main_x: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         return self._forward_impl(
             input_ids,
             positions,
@@ -910,7 +909,7 @@ class DeepSeekV4DSpark(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         main_positions: torch.Tensor | None = None,
         main_x: torch.Tensor | None = None,
-    ) -> torch.Tensor:
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         if input_ids is None:
             raise ValueError("DSpark requires input_ids")
 
@@ -1003,21 +1002,32 @@ class DeepSeekV4DSpark(nn.Module):
             self.rms_norm_eps,
             self.hc_eps,
         )
-        if self.use_confidence_scheduling:
-            # The released implementation trains the confidence projection
-            # on the pre-head-RMSNorm state, while draft logits consume the
-            # normalized state below. Preserve the exact trained feature.
-            self._dspark_confidence_hidden = x[:num_input_rows]
+        # The released implementation trains the confidence projection on the
+        # pre-head-RMSNorm state, while draft logits consume the normalized
+        # state below. Return both as graph outputs so the confidence state is
+        # updated correctly during CUDA graph replay.
+        confidence_hidden = x
         x = self.norm(x)
         if x.shape[0] < num_input_rows:
+            pad_rows = num_input_rows - x.shape[0]
             x = torch.cat(
                 [
                     x,
-                    x.new_zeros(num_input_rows - x.shape[0], x.shape[1]),
+                    x.new_zeros(pad_rows, x.shape[1]),
                 ],
                 dim=0,
             )
-        return x[:num_input_rows]
+            confidence_hidden = torch.cat(
+                [
+                    confidence_hidden,
+                    confidence_hidden.new_zeros(pad_rows, confidence_hidden.shape[1]),
+                ],
+                dim=0,
+            )
+        logits_hidden = x[:num_input_rows]
+        if self.use_confidence_scheduling:
+            return logits_hidden, confidence_hidden[:num_input_rows]
+        return logits_hidden
 
     def compute_logits(self, hidden_states: torch.Tensor) -> torch.Tensor | None:
         return self.logits_processor(self.head, hidden_states)
@@ -1057,26 +1067,21 @@ class DeepSeekV4DSpark(nn.Module):
         proposal hidden state concatenated with that position's Markov
         predecessor embedding. The projection is intentionally float32.
         """
-        if self._dspark_confidence_hidden is None:
-            raise RuntimeError("DSpark confidence hidden states were not initialized")
         if any(embed is None for embed in self._dspark_markov_embeds):
             raise RuntimeError(
                 "DSpark confidence Markov embeddings were not initialized"
             )
-        confidence_hidden = self._dspark_confidence_hidden.view(
-            *prev_token_ids.shape, -1
-        )
-        if confidence_hidden.shape != hidden_states.shape:
+        if hidden_states.shape[:-1] != prev_token_ids.shape:
             raise ValueError(
                 "DSpark confidence hidden-state shape mismatch: "
-                f"cached={confidence_hidden.shape}, logits={hidden_states.shape}"
+                f"hidden={hidden_states.shape}, tokens={prev_token_ids.shape}"
             )
         markov_embed = torch.stack(
             [embed for embed in self._dspark_markov_embeds if embed is not None],
             dim=1,
         )
         features = torch.cat(
-            (confidence_hidden, markov_embed.to(confidence_hidden.dtype)), dim=-1
+            (hidden_states, markov_embed.to(hidden_states.dtype)), dim=-1
         )
         return _linear_output(self.confidence_head(features.float())).float()
 

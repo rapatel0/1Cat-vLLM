@@ -946,6 +946,10 @@ class SpecDecodeBaseProposer:
         )
 
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
+        if method == "dspark" and self.model_returns_tuple():
+            self._dspark_confidence_hidden_states = hidden_states[
+                token_indices_to_sample
+            ]
         debug_logits = None
         debug_summary: dict[str, Any] | None = None
         should_collect_draft_logits = _spec_debug_corruption_enabled(
