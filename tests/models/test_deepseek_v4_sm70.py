@@ -7,6 +7,7 @@ from vllm.models.deepseek_v4.nvidia.sm70 import (
     _apply_gptj_rope,
     _e4m3fn_fp16_lut,
     _indexer_logits_sm70,
+    _paged_indexer_logits_sm70,
     _reference_sparse_attention,
 )
 from vllm.platforms.interface import DeviceCapability
@@ -70,6 +71,52 @@ def test_sm70_indexer_logits_masks_each_query_range() -> None:
     expected[0, 3:] = -torch.inf
     expected[1, :2] = -torch.inf
     torch.testing.assert_close(actual, expected)
+
+
+def test_sm70_paged_indexer_logits_supports_cuda_graph() -> None:
+    if not torch.cuda.is_available():
+        return
+
+    torch.manual_seed(3)
+    device = torch.device("cuda")
+    block_size = 64
+    num_blocks = 4
+    q = torch.randn(2, 64, 128, dtype=torch.float16, device=device)
+    kv_cache = torch.randn(
+        num_blocks,
+        block_size,
+        128,
+        dtype=torch.float16,
+        device=device,
+    )
+    weights = torch.randn(2, 64, dtype=torch.float32, device=device) * 0.01
+    seq_lens = torch.tensor([[63], [129]], dtype=torch.int32, device=device)
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).repeat(
+        2, 1
+    )
+
+    actual = _paged_indexer_logits_sm70(q, kv_cache, weights, seq_lens, block_table)
+    dense = kv_cache.reshape(-1, 128)
+    expected = _indexer_logits_sm70(
+        q,
+        dense,
+        weights,
+        torch.zeros(2, dtype=torch.int32, device=device),
+        seq_lens.flatten(),
+    )
+    torch.testing.assert_close(actual, expected, rtol=3e-2, atol=3e-2)
+
+    torch.accelerator.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _paged_indexer_logits_sm70(
+            q, kv_cache, weights, seq_lens, block_table
+        )
+    seq_lens.copy_(torch.tensor([[17], [193]], dtype=torch.int32, device=device))
+    graph.replay()
+    torch.accelerator.synchronize()
+    positions = torch.arange(captured.shape[1], device=device)
+    assert torch.equal(torch.isfinite(captured), positions.unsqueeze(0) < seq_lens)
 
 
 def test_sm70_decode_metadata_does_not_require_flashmla(monkeypatch) -> None:

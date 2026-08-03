@@ -19,6 +19,7 @@ from vllm.models.deepseek_v4.nvidia.flashmla import (
     DeepseekV4SparseMLAAttentionImpl,
 )
 from vllm.platforms.interface import DeviceCapability
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backends.mla.flashmla_sparse import FlashMLASparseMetadata
 from vllm.v1.worker.workspace import current_workspace_manager
 
@@ -47,12 +48,149 @@ def _e4m3fn_fp16_lut(device: torch.device) -> torch.Tensor:
     return (sign * value).to(torch.float16).to(device)
 
 
-def _gather_fp8_ds_mla_rows(
+@triton.jit
+def _gather_fp8_ds_mla_rows_sm70_kernel(
+    output_ptr,
+    cache_ptr,
+    indices_ptr,
+    fp8_lut_ptr,
+    num_cache_tokens,
+    block_stride: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    token_data_bytes: tl.constexpr,
+    scale_bytes: tl.constexpr,
+    nope_dim: tl.constexpr,
+    head_dim: tl.constexpr,
+) -> None:
+    """Gather one packed cache row per program without hardware FP8 casts."""
+    row = tl.program_id(0)
+    index = tl.load(indices_ptr + row).to(tl.int64)
+    valid = (index >= 0) & (index < num_cache_tokens)
+    safe_index = tl.where(valid, index, 0)
+    block = safe_index // cache_block_size
+    position = safe_index % cache_block_size
+    cache_block_ptr = cache_ptr + block * block_stride
+    token_ptr = cache_block_ptr + position * token_data_bytes
+    scale_ptr = (
+        cache_block_ptr + cache_block_size * token_data_bytes + position * scale_bytes
+    )
+
+    offsets = tl.arange(0, head_dim)
+    is_nope = offsets < nope_dim
+    fp8_bytes = tl.load(token_ptr + offsets, mask=is_nope, other=0)
+    fp8 = tl.load(fp8_lut_ptr + fp8_bytes.to(tl.int32), mask=is_nope, other=0.0)
+    encoded_scale = tl.load(
+        scale_ptr + offsets // 64,
+        mask=is_nope,
+        other=127,
+    )
+    scale = tl.exp2(encoded_scale.to(tl.float32) - 127.0)
+    nope = fp8 * scale
+
+    rope_ptr = (token_ptr + nope_dim).to(tl.pointer_type(tl.float16))
+    rope = tl.load(
+        rope_ptr + offsets - nope_dim,
+        mask=~is_nope,
+        other=0.0,
+    )
+    value = tl.where(is_nope, nope, rope)
+    value = tl.where(valid, value, 0.0)
+    tl.store(output_ptr + row * head_dim + offsets, value)
+
+
+@triton.jit
+def _store_fp16_paged_rows_sm70_kernel(
+    cache_ptr,
+    rows_ptr,
+    slots_ptr,
+    num_cache_tokens,
+    cache_stride_block: tl.constexpr,
+    cache_stride_token: tl.constexpr,
+    cache_block_size: tl.constexpr,
+    row_width: tl.constexpr,
+) -> None:
+    """Store fixed-shape compressor rows while skipping inactive slots."""
+    row = tl.program_id(0)
+    slot = tl.load(slots_ptr + row).to(tl.int64)
+    valid = (slot >= 0) & (slot < num_cache_tokens)
+    safe_slot = tl.where(valid, slot, 0)
+    block = safe_slot // cache_block_size
+    position = safe_slot % cache_block_size
+    offsets = tl.arange(0, row_width)
+    values = tl.load(rows_ptr + row * row_width + offsets)
+    output = (
+        cache_ptr + block * cache_stride_block + position * cache_stride_token + offsets
+    )
+    tl.store(output, values, mask=valid)
+
+
+@triton.jit
+def _paged_indexer_logits_sm70_kernel(
+    logits_ptr,
+    q_ptr,
+    cache_ptr,
+    weights_ptr,
+    seq_lens_ptr,
+    block_table_ptr,
+    q_stride_token,
+    q_stride_head,
+    cache_stride_block,
+    cache_stride_token,
+    block_table_stride,
+    seq_lens_stride,
+    cache_block_size: tl.constexpr,
+    max_context: tl.constexpr,
+    num_heads: tl.constexpr,
+    head_dim: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+) -> None:
+    """Compute paged FP16 indexer logits without host-side cache gathers."""
+    query = tl.program_id(0)
+    column_block = tl.program_id(1)
+    columns = column_block * BLOCK_N + tl.arange(0, BLOCK_N)
+    context_len = tl.load(seq_lens_ptr + query * seq_lens_stride)
+    if column_block * BLOCK_N < context_len:
+        valid_columns = (columns < context_len) & (columns < max_context)
+        logical_blocks = columns // cache_block_size
+        physical_blocks = tl.load(
+            block_table_ptr + query * block_table_stride + logical_blocks,
+            mask=valid_columns,
+            other=0,
+        ).to(tl.int64)
+        cache_positions = columns % cache_block_size
+
+        heads = tl.arange(0, num_heads)
+        features = tl.arange(0, head_dim)
+        q = tl.load(
+            q_ptr
+            + query * q_stride_token
+            + heads[:, None] * q_stride_head
+            + features[None, :]
+        ).to(tl.float16)
+        k = tl.load(
+            cache_ptr
+            + physical_blocks[None, :] * cache_stride_block
+            + cache_positions[None, :] * cache_stride_token
+            + features[:, None],
+            mask=valid_columns[None, :],
+            other=0.0,
+        ).to(tl.float16)
+        scores = tl.dot(q, k, out_dtype=tl.float32)
+        head_weights = tl.load(weights_ptr + query * num_heads + heads)
+        logits = tl.sum(tl.maximum(scores, 0.0) * head_weights[:, None], axis=0)
+        tl.store(
+            logits_ptr + query * max_context + columns,
+            logits,
+            mask=valid_columns,
+        )
+
+
+def _gather_fp8_ds_mla_rows_reference(
     kv_cache: torch.Tensor,
     flat_indices: torch.Tensor,
     block_size: int,
 ) -> torch.Tensor:
-    """Gather packed FP8-DS-MLA rows and dequantize them to FP16."""
+    """Framework reference for packed FP8-DS-MLA row gathering."""
     assert kv_cache.dtype == torch.uint8
     nope_dim = 448
     rope_dim = 64
@@ -88,6 +226,39 @@ def _gather_fp8_ds_mla_rows(
     rows = torch.cat((nope, rope), dim=-1)
     rows.masked_fill_(~valid.unsqueeze(-1), 0)
     return rows
+
+
+def _gather_fp8_ds_mla_rows(
+    kv_cache: torch.Tensor,
+    flat_indices: torch.Tensor,
+    block_size: int,
+) -> torch.Tensor:
+    """Gather packed FP8-DS-MLA rows and dequantize them to FP16."""
+    assert kv_cache.dtype == torch.uint8
+    if not kv_cache.is_cuda:
+        return _gather_fp8_ds_mla_rows_reference(kv_cache, flat_indices, block_size)
+
+    indices = flat_indices.contiguous().reshape(-1)
+    output = torch.empty(
+        (indices.numel(), 512),
+        dtype=torch.float16,
+        device=kv_cache.device,
+    )
+    _gather_fp8_ds_mla_rows_sm70_kernel[(indices.numel(),)](
+        output,
+        kv_cache,
+        indices,
+        _e4m3fn_fp16_lut(kv_cache.device),
+        kv_cache.shape[0] * block_size,
+        block_stride=kv_cache.stride(0),
+        cache_block_size=block_size,
+        token_data_bytes=576,
+        scale_bytes=8,
+        nope_dim=448,
+        head_dim=512,
+        num_warps=8,
+    )
+    return output
 
 
 def _reference_sparse_attention(
@@ -502,6 +673,8 @@ def compress_norm_rope_store_sm70(
     rms_norm_eps: float,
 ) -> None:
     """Reference compressor used to establish a correct FP16 SM70 boot."""
+    if num_actual == 0:
+        return
     positions = positions[:num_actual]
     requests = token_to_req_indices[:num_actual].to(torch.long)
     state_slots = state_slot_mapping[:num_actual]
@@ -509,14 +682,16 @@ def compress_norm_rope_store_sm70(
     boundary = (
         ((positions + 1) % compress_ratio == 0) & (state_slots >= 0) & (kv_slots >= 0)
     )
-    active = torch.nonzero(boundary, as_tuple=False).flatten()
-    if active.numel() == 0:
-        return
-
-    active_positions = positions.index_select(0, active).to(torch.long)
-    active_requests = requests.index_select(0, active)
-    active_slots = kv_slots.index_select(0, active).to(torch.long)
     window = (1 + int(overlap)) * compress_ratio
+    # CUDA graphs require fixed-shape intermediates. Process every scheduled
+    # row, but direct non-boundary writes to slot -1 so the store kernels skip
+    # them in-device. Dummy rows use a valid request/window to avoid an
+    # all-masked softmax while leaving the cache untouched.
+    active_positions = torch.where(boundary, positions, window - 1).to(torch.long)
+    active_requests = torch.where(boundary, requests, 0).clamp(
+        0, block_table.shape[0] - 1
+    )
+    active_slots = torch.where(boundary, kv_slots, -1).to(torch.long)
     offsets = torch.arange(window, device=state_cache.device)
     source_positions = active_positions[:, None] - window + 1 + offsets
     valid = source_positions >= 0
@@ -532,7 +707,7 @@ def compress_norm_rope_store_sm70(
     feature_offsets = torch.arange(head_dim, device=state_cache.device)
     head_offsets = (offsets >= compress_ratio).to(torch.long) * head_dim
     feature_indices = head_offsets[None, :, None] + feature_offsets
-    feature_indices = feature_indices.expand(active.shape[0], -1, -1)
+    feature_indices = feature_indices.expand(num_actual, -1, -1)
     kv = torch.gather(states, 2, feature_indices).to(torch.float32)
     score = torch.gather(states, 2, feature_indices + state_width).to(torch.float32)
     score.masked_fill_(~valid.unsqueeze(-1), -torch.inf)
@@ -578,10 +753,17 @@ def compress_norm_rope_store_sm70(
         rope_head_dim,
     )
     cache_block_size = kv_cache.shape[1]
-    kv_cache[
-        active_slots // cache_block_size,
-        active_slots % cache_block_size,
-    ] = rotated
+    _store_fp16_paged_rows_sm70_kernel[(num_actual,)](
+        kv_cache,
+        rotated,
+        active_slots,
+        kv_cache.shape[0] * cache_block_size,
+        cache_stride_block=kv_cache.stride(0),
+        cache_stride_token=kv_cache.stride(1),
+        cache_block_size=cache_block_size,
+        row_width=head_dim,
+        num_warps=4,
+    )
 
 
 def _gather_fp16_paged_sequence(
@@ -626,6 +808,52 @@ def _write_indexer_topk(
     indices = indices.to(torch.int32)
     indices.masked_fill_(~torch.isfinite(values), -1)
     output[:, :width].copy_(indices)
+
+
+def _paged_indexer_logits_sm70(
+    q: torch.Tensor,
+    kv_cache: torch.Tensor,
+    weights: torch.Tensor,
+    seq_lens: torch.Tensor,
+    block_table: torch.Tensor,
+) -> torch.Tensor:
+    """Batched graph-safe decode logits over the FP16 paged indexer cache."""
+    assert q.dtype == torch.float16 and kv_cache.dtype == torch.float16
+    assert q.shape[1:] == (64, 128)
+    num_queries = q.shape[0]
+    cache_block_size = kv_cache.shape[1]
+    max_context = block_table.shape[1] * cache_block_size
+    logits = torch.full(
+        (num_queries, max_context),
+        -torch.inf,
+        dtype=torch.float32,
+        device=q.device,
+    )
+    # Volta favors narrow N tiles here: 16 columns with eight warps was the
+    # fastest measured geometry from 32 through 8,192 context tokens at both
+    # batch 1 and batch 4.
+    block_n = 16
+    _paged_indexer_logits_sm70_kernel[(num_queries, triton.cdiv(max_context, block_n))](
+        logits,
+        q,
+        kv_cache,
+        weights,
+        seq_lens,
+        block_table,
+        q.stride(0),
+        q.stride(1),
+        kv_cache.stride(0),
+        kv_cache.stride(1),
+        block_table.stride(0),
+        seq_lens.stride(0),
+        cache_block_size=cache_block_size,
+        max_context=max_context,
+        num_heads=q.shape[1],
+        head_dim=q.shape[2],
+        BLOCK_N=block_n,
+        num_warps=8,
+    )
+    return logits
 
 
 def sparse_attn_indexer_sm70(
@@ -681,33 +909,33 @@ def sparse_attn_indexer_sm70(
     if metadata.num_decodes > 0:
         assert metadata.decode is not None
         decode = metadata.decode
-        cursor = 0
-        for request_idx in range(decode.decode_lens.shape[0]):
-            query_len = int(decode.decode_lens[request_idx].item())
-            for query_offset in range(query_len):
-                if decode.seq_lens.ndim == 2:
-                    context_len = int(decode.seq_lens[request_idx, query_offset].item())
-                else:
-                    context_len = int(decode.seq_lens[request_idx].item())
-                k = _gather_fp16_paged_sequence(
-                    kv_cache,
-                    decode.block_table[request_idx],
-                    context_len,
-                )
-                logits = _indexer_logits_sm70(
-                    q[cursor : cursor + 1],
-                    k,
-                    weights[cursor : cursor + 1],
-                    torch.zeros(1, dtype=torch.int32, device=q.device),
-                    torch.full((1,), context_len, dtype=torch.int32, device=q.device),
-                )
-                _write_indexer_topk(
-                    logits,
-                    topk_indices_buffer[cursor : cursor + 1],
-                    topk_tokens,
-                )
-                cursor += 1
-        assert cursor == metadata.num_decode_tokens
+        num_decode_tokens = metadata.num_decode_tokens
+        assert decode.decode_lens.shape[0] == num_decode_tokens, (
+            "SM70 graph decode requires one token per indexer request"
+        )
+        seq_lens = decode.seq_lens.reshape(num_decode_tokens, -1)[:, :1]
+        logits = _paged_indexer_logits_sm70(
+            q[:num_decode_tokens],
+            kv_cache,
+            weights[:num_decode_tokens],
+            seq_lens,
+            decode.block_table,
+        )
+        topk_output = topk_indices_buffer[:num_decode_tokens, :topk_tokens]
+        if topk_tokens in (512, 1024, 2048):
+            (topk_workspace,) = current_workspace_manager().get_simultaneous(
+                ((1024 * 1024,), torch.uint8),
+            )
+            torch.ops._C.persistent_topk(
+                logits,
+                seq_lens,
+                topk_output,
+                topk_workspace,
+                topk_tokens,
+                logits.shape[1],
+            )
+        else:
+            _write_indexer_topk(logits, topk_output, topk_tokens)
 
     return topk_indices_buffer
 
