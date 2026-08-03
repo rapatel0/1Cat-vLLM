@@ -670,7 +670,11 @@ class SpecDecodeBaseProposer:
         if calls != 1 and calls % _sm70_mtp_profile_interval() != 0:
             return
         try:
-            should_log = is_global_first_rank()
+            should_log = (
+                get_pp_group().is_last_rank and get_tp_group().rank_in_group == 0
+                if self.method == "dspark"
+                else is_global_first_rank()
+            )
         except RuntimeError:
             should_log = True
         if not should_log:
