@@ -1870,6 +1870,64 @@ def new_mla_spec(cache_dtype_str=None):
     )
 
 
+def test_deepseek_v4_kv_groups_keep_ordinary_drafter_layers():
+    """An independent DFlash cache must survive DeepSeek V4 grouping."""
+    full_mla = new_mla_spec()
+    sliding_mla = SlidingWindowMLASpec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=128,
+        dtype=torch.float32,
+        sliding_window=128,
+    )
+    small_draft = new_sliding_window_spec(
+        block_size=16,
+        num_kv_heads=1,
+        head_size=64,
+        sliding_window=128,
+    )
+    large_draft = new_sliding_window_spec(
+        block_size=16,
+        num_kv_heads=4,
+        head_size=512,
+        sliding_window=128,
+    )
+    specs = {
+        "target.full": full_mla,
+        "target.sliding": sliding_mla,
+        "draft.small": small_draft,
+        "draft.large": large_draft,
+    }
+
+    groups = kv_cache_utils.get_kv_cache_groups(VllmConfig(), specs)
+    grouped_layer_names = {
+        layer_name for group in groups for layer_name in group.layer_names
+    }
+
+    assert grouped_layer_names == set(specs)
+    draft_group = next(group for group in groups if "draft.large" in group.layer_names)
+    assert isinstance(draft_group.kv_cache_spec, UniformTypeKVCacheSpecs)
+    grouped_small_draft = draft_group.kv_cache_spec.kv_cache_specs["draft.small"]
+    grouped_large_draft = draft_group.kv_cache_spec.kv_cache_specs["draft.large"]
+    target_page_sizes = {
+        spec.page_size_bytes for spec in groups[0].kv_cache_spec.kv_cache_specs.values()
+    }
+    assert grouped_small_draft.real_page_size_bytes == small_draft.real_page_size_bytes
+    assert grouped_small_draft.page_size_bytes in target_page_sizes
+    assert grouped_large_draft.page_size_bytes == large_draft.real_page_size_bytes
+    assert grouped_large_draft.page_size_bytes > max(target_page_sizes)
+
+    all_page_sizes = {
+        spec.page_size_bytes
+        for group in groups
+        for spec in group.kv_cache_spec.kv_cache_specs.values()
+    }
+    config = kv_cache_utils.get_kv_cache_config_from_groups(
+        VllmConfig(), groups, available_memory=2 * sum(all_page_sizes)
+    )
+    assert any("draft.large" in tensor.shared_by for tensor in config.kv_cache_tensors)
+
+
 def test_get_kv_cache_spec_kind_prefers_specific_attention_subclasses():
     assert get_kv_cache_spec_kind(new_mla_spec()) == KVCacheSpecKind.MLA_ATTENTION
 

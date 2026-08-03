@@ -3,6 +3,7 @@
 
 import torch
 
+from vllm.models.deepseek_v4.nvidia.model import _format_aux_hidden_state
 from vllm.models.deepseek_v4.nvidia.sm70 import (
     _apply_gptj_rope,
     _e4m3fn_fp16_lut,
@@ -21,6 +22,17 @@ def test_sm70_e4m3fn_software_decode() -> None:
         dtype=torch.float16,
     )
     torch.testing.assert_close(lut[encoded], expected, rtol=0, atol=0)
+
+
+def test_dflash_preserves_deepseek_v4_mhc_aux_streams() -> None:
+    hidden_states = torch.arange(2 * 4 * 3).reshape(2, 4, 3)
+
+    dflash_states = _format_aux_hidden_state(hidden_states, True)
+    dspark_states = _format_aux_hidden_state(hidden_states.float(), False)
+
+    assert dflash_states.shape == (2, 12)
+    torch.testing.assert_close(dflash_states, hidden_states.flatten(1))
+    torch.testing.assert_close(dspark_states, hidden_states.float().mean(dim=1))
 
 
 def test_sm70_gptj_rope_inverse_round_trip() -> None:

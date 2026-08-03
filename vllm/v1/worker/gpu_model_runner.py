@@ -1180,6 +1180,20 @@ class GPUModelRunner(
         self.encoder_cudagraph_manager: EncoderCudaGraphManager | None = None
 
         self.use_aux_hidden_state_outputs = False
+        if self.speculative_config:
+            if self.speculative_config.use_dflash():
+                draft_config = self.speculative_config.draft_model_config
+                dflash_config = (
+                    getattr(draft_config.hf_config, "dflash_config", {})
+                    if draft_config is not None
+                    else {}
+                )
+                self.use_aux_hidden_state_outputs = bool(
+                    dflash_config.get("use_aux_hidden_state", True)
+                    and not envs.VLLM_DFLASH_DISABLE_AUX_OUTPUTS
+                )
+            elif self.speculative_config.use_dspark():
+                self.use_aux_hidden_state_outputs = True
         # Set up speculative decoding.
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
@@ -6067,7 +6081,7 @@ class GPUModelRunner(
 
         trace_postprocess_t0 = time.perf_counter() if trace_log else 0.0
         with record_function_or_nullcontext("gpu_model_runner: postprocess"):
-            if self.use_aux_hidden_state_outputs:
+            if self.use_aux_hidden_state_outputs and isinstance(model_output, tuple):
                 # True when EAGLE 3 is used.
                 hidden_states, aux_hidden_states = model_output
             else:
@@ -8065,7 +8079,7 @@ class GPUModelRunner(
                 )
                 _sm70_profile_trace("_dummy_run model forward exit")
 
-            if self.use_aux_hidden_state_outputs:
+            if self.use_aux_hidden_state_outputs and isinstance(outputs, tuple):
                 hidden_states, _ = outputs
             else:
                 hidden_states = outputs

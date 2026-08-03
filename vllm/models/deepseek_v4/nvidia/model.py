@@ -79,6 +79,18 @@ def _use_sm70_reference_kernels() -> bool:
     )
 
 
+_AUX_HIDDEN_STATE_PREFIX = "aux_hidden_state_"
+
+
+def _format_aux_hidden_state(
+    hidden_states: torch.Tensor,
+    preserve_mhc_streams: bool,
+) -> torch.Tensor:
+    if preserve_mhc_streams:
+        return hidden_states.flatten(1)
+    return hidden_states.mean(dim=1)
+
+
 class DeepseekV4MLP(nn.Module):
     def __init__(
         self,
@@ -986,6 +998,29 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         self.hc_mult = config.hc_mult
         self.hc_dim = self.hc_mult * config.hidden_size
         self.rms_norm_eps = config.rms_norm_eps
+        spec_config = vllm_config.speculative_config
+        draft_hf_config = (
+            spec_config.draft_model_config.hf_config
+            if spec_config is not None and spec_config.draft_model_config is not None
+            else None
+        )
+        target_hidden_size = getattr(
+            draft_hf_config,
+            "target_hidden_size",
+            config.hidden_size,
+        )
+        # DeepSeek V4 keeps hc_mult residual streams until hc_head. DFlash
+        # checkpoints trained against that representation have an FC input
+        # width of target_hidden_size * num_aux_layers. DSpark checkpoints use
+        # the conventional mean-reconstructed hidden state instead.
+        self.preserve_aux_mhc_streams = bool(
+            spec_config is not None
+            and spec_config.use_dflash()
+            and target_hidden_size == self.hc_dim
+        )
+        self.aux_hidden_state_size = (
+            self.hc_dim if self.preserve_aux_mhc_streams else config.hidden_size
+        )
 
         # Three aux streams: one per non-default input GEMM in
         # DeepseekV4MultiHeadLatentAttentionWrapper.attn_gemm_parallel_execute
@@ -1074,15 +1109,24 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
         # of shape (num_tokens, hc_mult, hidden_size) — V4 expands the
         # token embedding to hc_mult streams before the first decoder
         # layer and keeps that shape until hc_head() collapses it.
-        return IntermediateTensors(
-            {
-                "hidden_states": torch.zeros(
-                    (batch_size, self.hc_mult, self.config.hidden_size),
+        tensors = {
+            "hidden_states": torch.zeros(
+                (batch_size, self.hc_mult, self.config.hidden_size),
+                dtype=dtype,
+                device=device,
+            ),
+        }
+        # Auxiliary states captured on earlier PP stages travel beside the
+        # main hidden state. Allocate stable receive buffers so CUDA graphs can
+        # replay without changing their addresses.
+        for layer_id in self.aux_hidden_state_layers:
+            if layer_id <= self.start_layer:
+                tensors[f"{_AUX_HIDDEN_STATE_PREFIX}{layer_id}"] = torch.zeros(
+                    (batch_size, self.aux_hidden_state_size),
                     dtype=dtype,
                     device=device,
-                ),
-            }
-        )
+                )
+        return IntermediateTensors(tensors)
 
     def forward(
         self,
@@ -1105,7 +1149,12 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             input_ids = input_ids.to(torch.int64)
 
         residual, post_mix, res_mix = None, None, None
-        aux_hidden_states: list[torch.Tensor] = []
+        aux_hidden_states = {
+            layer_id: intermediate_tensors[f"{_AUX_HIDDEN_STATE_PREFIX}{layer_id}"]
+            for layer_id in self.aux_hidden_state_layers
+            if intermediate_tensors is not None
+            and f"{_AUX_HIDDEN_STATE_PREFIX}{layer_id}" in intermediate_tensors.tensors
+        }
         final_aux_recon: torch.Tensor | None = None
         for idx, layer in enumerate(
             islice(self.layers, self.start_layer, self.end_layer),
@@ -1131,7 +1180,10 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                     post_mix,
                     res_mix,
                 )
-                aux_hidden_states.append(aux_recon.mean(dim=1))
+                aux_hidden_states[idx + 1] = _format_aux_hidden_state(
+                    aux_recon,
+                    self.preserve_aux_mhc_streams,
+                )
                 final_aux_recon = aux_recon
         if layer is not None:
             if self.end_layer in self.aux_hidden_state_layers:
@@ -1146,7 +1198,15 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
                 hidden_states = mhc_post(hidden_states, residual, post_mix, res_mix)
 
         if not get_pp_group().is_last_rank:
-            return IntermediateTensors({"hidden_states": hidden_states})
+            tensors = {"hidden_states": hidden_states}
+            tensors.update(
+                {
+                    f"{_AUX_HIDDEN_STATE_PREFIX}{layer_id}": aux_hidden_states[layer_id]
+                    for layer_id in self.aux_hidden_state_layers
+                    if layer_id in aux_hidden_states
+                }
+            )
+            return IntermediateTensors(tensors)
 
         # Stash pre-hc_head residual for the MTP draft (captured copy_).
         num_tokens = hidden_states.shape[0]
@@ -1166,8 +1226,18 @@ class DeepseekV4Model(nn.Module, EagleModelMixin):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
-        if aux_hidden_states:
-            return hidden_states, aux_hidden_states
+        if self.aux_hidden_state_layers:
+            missing_layers = (
+                set(self.aux_hidden_state_layers) - aux_hidden_states.keys()
+            )
+            if missing_layers:
+                raise RuntimeError(
+                    "Missing DeepSeek V4 auxiliary hidden states for layers "
+                    f"{sorted(missing_layers)}"
+                )
+            return hidden_states, [
+                aux_hidden_states[layer_id] for layer_id in self.aux_hidden_state_layers
+            ]
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

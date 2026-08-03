@@ -93,8 +93,18 @@ def update_dflash(config_dict: dict, pre_trained_config: dict) -> None:
     """
     pre_trained_config["architectures"] = ["DFlashDraftModel"]
     pre_trained_config["draft_vocab_size"] = config_dict.get("draft_vocab_size")
-    if config_dict.get("target_hidden_size") is not None:
-        pre_trained_config["target_hidden_size"] = config_dict["target_hidden_size"]
+    target_hidden_size = config_dict.get("target_hidden_size")
+    if target_hidden_size is None:
+        # Multi-stream targets such as DeepSeek V4 expose hc_mult hidden
+        # streams per selected layer. Older speculators checkpoints leave
+        # target_hidden_size unset even though the DFlash projection was
+        # trained against their concatenated width.
+        hidden_size = pre_trained_config.get("hidden_size")
+        hc_mult = pre_trained_config.get("hc_mult", 1)
+        if hidden_size is not None:
+            target_hidden_size = hidden_size * hc_mult
+    if target_hidden_size is not None:
+        pre_trained_config["target_hidden_size"] = target_hidden_size
 
     aux_layer_ids = config_dict["aux_hidden_state_layer_ids"]
     pre_trained_config["eagle_aux_hidden_state_layer_ids"] = aux_layer_ids

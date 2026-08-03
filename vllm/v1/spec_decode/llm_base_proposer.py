@@ -26,10 +26,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.model_loader import get_model
 from vllm.model_executor.models import supports_multimodal
-from vllm.model_executor.models.deepseek_eagle3 import Eagle3DeepseekV2ForCausalLM
 from vllm.model_executor.models.interfaces import SupportsMultiModal
-from vllm.model_executor.models.llama_eagle3 import Eagle3LlamaForCausalLM
-from vllm.model_executor.models.qwen3_dflash import DFlashQwen3ForCausalLM
 from vllm.multimodal import MULTIMODAL_REGISTRY
 from vllm.platforms import current_platform
 from vllm.utils.platform_utils import is_pin_memory_available
@@ -879,17 +876,13 @@ class SpecDecodeBaseProposer:
             # Its proposer override projects them while preparing context KV.
             assert target_hidden_states.shape[-1] == self.hidden_size
         elif method == "eagle3" or _is_dflash_method(method):
-            assert isinstance(
-                self.model,
-                (
-                    Eagle3LlamaForCausalLM,
-                    Eagle3DeepseekV2ForCausalLM,
-                    DFlashQwen3ForCausalLM,
-                ),
-            )
-            target_hidden_states = self.model.combine_hidden_states(
-                target_hidden_states
-            )
+            combine_hidden_states = getattr(self.model, "combine_hidden_states", None)
+            if combine_hidden_states is None:
+                raise TypeError(
+                    f"{type(self.model).__name__} does not support auxiliary "
+                    "hidden-state combination"
+                )
+            target_hidden_states = combine_hidden_states(target_hidden_states)
             assert target_hidden_states.shape[-1] == self.hidden_size
 
         num_tokens, token_indices_to_sample, common_attn_metadata = (

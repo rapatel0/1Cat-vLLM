@@ -895,7 +895,9 @@ class SpeculativeConfig:
                     SpeculativeConfig.create_draft_parallel_config(
                         self.target_parallel_config,
                         self.draft_tensor_parallel_size,
-                        pipeline_parallel_size=(1 if self.use_dspark() else None),
+                        pipeline_parallel_size=(
+                            1 if self.use_dspark() or self.use_dflash() else None
+                        ),
                     )
                 )
         return self

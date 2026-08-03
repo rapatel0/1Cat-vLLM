@@ -138,6 +138,15 @@ class DFlashProposer(SpecDecodeBaseProposer):
         base = super()._create_draft_vllm_config()
         return replace(
             base,
+            # DFlash uses ordinary non-MLA attention even when the target uses
+            # a model-specific MLA cache format such as fp8_ds_mla. Draft KV
+            # is small, and keeping it in the model dtype lets the independently
+            # selected non-causal backend operate on every platform.
+            cache_config=replace(
+                base.cache_config,
+                cache_dtype="auto",
+                kv_cache_dtype_skip_layers=[],
+            ),
             attention_config=replace(
                 base.attention_config,
                 use_non_causal=not self.dflash_causal,

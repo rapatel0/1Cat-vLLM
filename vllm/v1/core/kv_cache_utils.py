@@ -20,6 +20,7 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     ChunkedLocalAttentionSpec,
     FullAttentionSpec,
     HiddenStateCacheSpec,
@@ -905,6 +906,21 @@ def may_override_num_blocks(vllm_config: VllmConfig, num_blocks: int) -> int:
     return num_blocks
 
 
+def _get_deepseek_v4_page_sizes(
+    kv_cache_groups: list[KVCacheGroupSpec],
+) -> list[int]:
+    """Return every physical page bucket in a DeepSeek V4 shared layout."""
+    return sorted(
+        {
+            page_size
+            for group in kv_cache_groups
+            for page_size in cast(
+                UniformTypeKVCacheSpecs, group.kv_cache_spec
+            ).get_page_sizes()
+        }
+    )
+
+
 def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
     """
     Bytes consumed by one block in the worker's shared KV cache pool, mirroring
@@ -920,8 +936,7 @@ def _pool_bytes_per_block(kv_cache_groups: list[KVCacheGroupSpec]) -> int:
         isinstance(g.kv_cache_spec, UniformTypeKVCacheSpecs) for g in kv_cache_groups
     ):
         # DeepseekV4: shared layout sized by the largest per-page-size bucket.
-        full_mla_spec = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
-        layer_tuple_page_bytes = sum(full_mla_spec.get_page_sizes())
+        layer_tuple_page_bytes = sum(_get_deepseek_v4_page_sizes(kv_cache_groups))
         num_layer_tuples = max(
             cast(UniformTypeKVCacheSpecs, g.kv_cache_spec).get_num_layer_tuples()
             for g in kv_cache_groups
@@ -1183,10 +1198,11 @@ def _get_kv_cache_config_deepseek_v4(
 ) -> tuple[int, list[KVCacheTensor]]:
     """DeepseekV4 KV cache tensor layout planning.
 
-    Precondition: kv_cache_groups[0] is the full-MLA group; its page sizes
-    define the canonical bucket set. Non-full-MLA groups must have been
-    page_size-padded upstream (see _get_kv_cache_groups_uniform_groups) so
-    every layer's page_size matches one of the full-MLA bucket sizes.
+    Precondition: kv_cache_groups[0] is the full-MLA group. Non-full-MLA
+    groups must have been page_size-padded upstream (see
+    _get_kv_cache_groups_uniform_groups) so pages that fit target buckets can
+    share them. Larger independently cached drafter pages retain a dedicated
+    bucket.
 
     For each group, bucket its layers by page_size_bytes and place each
     layer at tuple_idx = position-within-bucket. Emit one KVCacheTensor
@@ -1195,7 +1211,7 @@ def _get_kv_cache_config_deepseek_v4(
     """
     full_mla_spec = kv_cache_groups[0].kv_cache_spec
     assert isinstance(full_mla_spec, UniformTypeKVCacheSpecs)
-    page_sizes = sorted(full_mla_spec.get_page_sizes())
+    page_sizes = _get_deepseek_v4_page_sizes(kv_cache_groups)
     layer_tuple_page_bytes = sum(page_sizes)
 
     # Pre-bucket each group's layers by page_size (registration order within
@@ -1430,29 +1446,49 @@ def group_and_unify_kv_cache_specs(
         return None
 
     mla_specs: dict[str, KVCacheSpec] = {}
-    grouped_swa_mla_specs: dict[tuple[int, int], dict[str, KVCacheSpec]] = defaultdict(
-        dict
-    )
+    grouped_windowed_specs: dict[
+        tuple[type[KVCacheSpec], int, int | None, int | None],
+        dict[str, KVCacheSpec],
+    ] = defaultdict(dict)
     # NOTE: Here we group SWA layers by (block_size, sliding_window), which separates
     # SWA layers, C4I+C4A layers, and C128A layers into three different groups. It can
     # be fragile with only block_size and sliding_window as keys, but fine for now.
     for name, spec in kv_cache_spec.items():
         if isinstance(spec, SlidingWindowMLASpec):
-            grouped_swa_mla_specs[(spec.block_size, spec.sliding_window)][name] = spec
+            grouped_windowed_specs[
+                (type(spec), spec.block_size, spec.sliding_window, None)
+            ][name] = spec
         elif isinstance(spec, MLAAttentionSpec):
             mla_specs[name] = spec
+        elif isinstance(spec, AttentionSpec):
+            # An independently cached speculative drafter can use ordinary
+            # attention alongside DeepSeek V4's MLA target layers. Keep these
+            # layers in the specialized layout instead of silently dropping
+            # them. Group only specs with identical token-slot semantics.
+            grouped_windowed_specs[
+                (
+                    type(spec),
+                    spec.block_size,
+                    getattr(spec, "sliding_window", None),
+                    getattr(spec, "attention_chunk_size", None),
+                )
+            ][name] = spec
+        else:
+            # Let the general hybrid-cache path reject or handle cache types
+            # that cannot participate in the DeepSeek V4 tensor layout.
+            return None
 
     assert len(mla_specs) > 0
     mla_uniform_spec = UniformTypeKVCacheSpecs.from_specs(mla_specs)
     assert mla_uniform_spec is not None
 
-    swa_uniform_specs: list[UniformTypeKVCacheSpecs] = []
-    for spec_dict in grouped_swa_mla_specs.values():
+    windowed_uniform_specs: list[UniformTypeKVCacheSpecs] = []
+    for spec_dict in grouped_windowed_specs.values():
         uniform_spec = UniformTypeKVCacheSpecs.from_specs(spec_dict)
         assert uniform_spec is not None
-        swa_uniform_specs.append(uniform_spec)
+        windowed_uniform_specs.append(uniform_spec)
 
-    return [mla_uniform_spec, *swa_uniform_specs]
+    return [mla_uniform_spec, *windowed_uniform_specs]
 
 
 def _approximate_gcd(values: Sequence[int], *, lower_bound: int | None = None) -> int:
@@ -1530,10 +1566,10 @@ def _get_kv_cache_groups_uniform_groups(
         round_up(x, num_layer_tuples) for x in num_layer_tuples_per_group
     ]
 
-    swa_mla_specs = grouped_specs[1:]
+    windowed_specs = grouped_specs[1:]
     assert all(
-        isinstance(spec, SlidingWindowMLASpec)
-        for group in swa_mla_specs
+        isinstance(spec, AttentionSpec)
+        for group in windowed_specs
         for spec in group.kv_cache_specs.values()
     )
 
@@ -1541,12 +1577,22 @@ def _get_kv_cache_groups_uniform_groups(
     # Possibly padding layer tuples for this.
     # Additionally, we also pad KV blocks in each SWA layer, to align the page size
     # with the corresponding layer in the full-MLA group.
-    all_page_sizes = full_mla_spec.get_page_sizes()
-    swa_mla_groups = []
-    for sm_spec in swa_mla_specs:
+    full_mla_page_sizes = full_mla_spec.get_page_sizes()
+    max_full_mla_page_size = max(full_mla_page_sizes)
+    # Ordinary-attention drafter pages may be larger than every target MLA
+    # bucket. Such pages cannot share a target tensor, so retain their size as
+    # an additional bucket in the DeepSeek V4 shared layout.
+    extra_page_sizes = {
+        page_size
+        for group in windowed_specs
+        for page_size in group.get_page_sizes()
+        if page_size > max_full_mla_page_size
+    }
+    all_page_sizes = sorted(set(full_mla_page_sizes) | extra_page_sizes)
+    windowed_groups = []
+    for sm_spec in windowed_specs:
         sm_page_sizes = sm_spec.get_page_sizes()
         layers_per_size: dict[int, list[str]] = defaultdict(list)
-        assert max(sm_page_sizes) <= max(all_page_sizes)
 
         # Unify page size by padding layers' page_size to the nearest larger page_size.
         # Compute candidate (nearest larger page_size) for each unique page size.
@@ -1581,14 +1627,14 @@ def _get_kv_cache_groups_uniform_groups(
             }
             sub_sm_spec = UniformTypeKVCacheSpecs.from_specs(group_layer_specs)
             assert sub_sm_spec is not None
-            swa_mla_groups.append(
+            windowed_groups.append(
                 KVCacheGroupSpec(
                     layer_names=group_layer_names,
                     kv_cache_spec=sub_sm_spec,
                 )
             )
 
-    return [full_mla_group, *swa_mla_groups]
+    return [full_mla_group, *windowed_groups]
 
 
 def _annotate_eagle_groups_deepseek_v4(
@@ -1770,8 +1816,7 @@ def _max_memory_usage_bytes_from_groups(
         # They must already be page_size aligned and share a common padded
         # layer-tuple layout. Even groups with fewer actual tuples still reserve
         # the global number of tuple slots in the shared tensor layout.
-        full_mla_spec = cast(UniformTypeKVCacheSpecs, kv_cache_groups[0].kv_cache_spec)
-        layer_tuple_bytes = sum(full_mla_spec.get_page_sizes())
+        layer_tuple_bytes = sum(_get_deepseek_v4_page_sizes(kv_cache_groups))
         num_layer_tuples = max(
             cast(UniformTypeKVCacheSpecs, group.kv_cache_spec).get_num_layer_tuples()
             for group in kv_cache_groups

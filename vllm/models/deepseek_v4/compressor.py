@@ -290,8 +290,13 @@ class DeepseekCompressor(nn.Module):
             CompressorMetadata, attn_metadata[self.state_cache.prefix]
         )
         token_to_req_indices = state_metadata.token_to_req_indices
+        assert token_to_req_indices is not None
         slot_mapping = state_metadata.slot_mapping
-        num_actual = slot_mapping.shape[0]
+        # CUDA-graph padding can make the state-cache slot mapping longer than
+        # metadata for the compressed K cache. token_to_req_indices is built
+        # from the real query lengths, so it is the common unpadded extent for
+        # positions, state slots, and K-cache slots.
+        num_actual = token_to_req_indices.shape[0]
         block_table = state_metadata.block_table
         block_size = state_metadata.block_size
 

@@ -672,7 +672,7 @@ class DFlashQwen3Model(nn.Module):
                 if i == max(debug_direct_refs):
                     self._debug_context_kv_dumped = True
             if _debug_sync_context_kv_enabled():
-                torch.cuda.synchronize(all_k_final.device)
+                torch.accelerator.synchronize(device=all_k_final.device)
 
     def forward(
         self,
@@ -773,9 +773,11 @@ class DFlashQwen3ForCausalLM(Qwen3ForCausalLM):
         self.config = vllm_config.speculative_config.draft_model_config.hf_config
         if getattr(self.config, "draft_vocab_size", None) is None:
             self.config.draft_vocab_size = getattr(self.config, "vocab_size", None)
-        target_layer_num = vllm_config.model_config.get_num_layers(
-            vllm_config.parallel_config
-        )
+        # Draft layers live beside the target layers in the global static
+        # forward context. Use the target's global layer count so their names
+        # remain unique under pipeline parallelism; get_num_layers() returns
+        # only the local PP partition.
+        target_layer_num = vllm_config.model_config.get_total_num_hidden_layers()
         self.model = DFlashQwen3Model(
             vllm_config=vllm_config,
             prefix=maybe_prefix(prefix, "model"),

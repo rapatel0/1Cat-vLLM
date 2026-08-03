@@ -596,8 +596,9 @@ class Attention(nn.Module, AttentionLayerBase):
         assert self.attn_type == AttentionType.DECODER
         quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
         if self.sliding_window is not None:
-            assert not vllm_config.model_config.use_mla, (
-                "MLA is not supported for slidingwindow"
+            assert self.kv_cache_dtype != "fp8_ds_mla", (
+                "The MLA-specific KV cache dtype is not supported for "
+                "sliding-window attention"
             )
             return SlidingWindowSpec(
                 block_size=block_size,
