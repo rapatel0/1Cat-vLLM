@@ -136,6 +136,12 @@ class DFlashProposer(SpecDecodeBaseProposer):
     @override
     def _create_draft_vllm_config(self) -> VllmConfig:
         base = super()._create_draft_vllm_config()
+        if self.speculative_config.use_dspark():
+            # DSpark reuses DeepSeek V4 MLA in its draft layers, so it must
+            # retain model-specific target cache formats such as fp8_ds_mla.
+            # Only DFlash uses ordinary non-MLA attention and needs a separate
+            # model-dtype draft cache.
+            return base
         return replace(
             base,
             # DFlash uses ordinary non-MLA attention even when the target uses
