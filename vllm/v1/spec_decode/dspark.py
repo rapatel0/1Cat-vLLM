@@ -31,6 +31,50 @@ def _spec_bool(spec_config: Any, attr: str, env_name: str) -> bool:
     )
 
 
+def mask_dspark_confidence_prefix_(
+    draft_token_ids: torch.Tensor,
+    confidence_logits: torch.Tensor,
+    threshold: float,
+) -> torch.Tensor:
+    """Mask the low-confidence suffix of each request with ``-1`` in place."""
+    if threshold <= 0.0:
+        return draft_token_ids
+    if confidence_logits.shape != draft_token_ids.shape:
+        raise ValueError(
+            "DSpark confidence logits and draft tokens must have identical "
+            f"shapes, got {confidence_logits.shape} and {draft_token_ids.shape}"
+        )
+    token_offsets = torch.arange(
+        draft_token_ids.shape[1],
+        device=draft_token_ids.device,
+        dtype=torch.int64,
+    )
+    below_threshold = confidence_logits.sigmoid() < threshold
+    prefix_lengths = torch.where(
+        below_threshold,
+        token_offsets,
+        draft_token_ids.shape[1],
+    ).amin(dim=1)
+    draft_token_ids.masked_fill_(
+        token_offsets.unsqueeze(0) >= prefix_lengths.unsqueeze(1), -1
+    )
+    return draft_token_ids
+
+
+def trim_dspark_confidence_drafts(
+    draft_token_ids: list[list[int]],
+) -> list[list[int]]:
+    """Remove the confidence-masked suffix before scheduler handoff."""
+    trimmed: list[list[int]] = []
+    for token_ids in draft_token_ids:
+        try:
+            prefix_length = token_ids.index(-1)
+        except ValueError:
+            prefix_length = len(token_ids)
+        trimmed.append(token_ids[:prefix_length])
+    return trimmed
+
+
 class _DSparkForwardCUDAGraph:
     """Opt-in fixed-shape graph wrapper for the DSpark draft forward.
 
@@ -227,12 +271,10 @@ class _DSparkForwardCUDAGraph:
 
 
 class DSparkProposer(DFlashProposer):
-    """Fixed-block DSpark proposer.
+    """Parallel DSpark proposer with optional confidence prefix scheduling.
 
     This MVP reuses DFlash's parallel-drafting input layout, then replaces the
     independent block sampler with DSpark's sequential Markov-head correction.
-    Confidence-scheduled variable-prefix verification is deliberately out of
-    scope for this first pass.
     """
 
     def __init__(
@@ -280,6 +322,9 @@ class DSparkProposer(DFlashProposer):
         self.use_fused_markov_sampler = bool(
             getattr(spec_config, "dspark_fused_markov_sampler", False)
         )
+        self.confidence_threshold = float(
+            getattr(spec_config, "dspark_confidence_threshold", 0.0)
+        )
         self.use_forward_cudagraph = _spec_bool(
             spec_config,
             "dspark_forward_cudagraph",
@@ -295,6 +340,14 @@ class DSparkProposer(DFlashProposer):
         self._dspark_forward_graph_main_positions: torch.Tensor | None = None
         self._dspark_dummy_query_start_loc = torch.empty(
             (2,), dtype=torch.int32, device=device
+        )
+        logger.info(
+            "DSpark runtime initialized: local_argmax=%s forward_cudagraph=%s "
+            "draft_method=%s confidence_threshold=%.3f",
+            self.use_local_argmax_reduction,
+            self.use_forward_cudagraph,
+            spec_config.draft_sample_method,
+            self.confidence_threshold,
         )
 
     @override
@@ -497,6 +550,9 @@ class DSparkProposer(DFlashProposer):
         if self._dspark_main_hidden is None:
             raise RuntimeError("DSpark target hidden states were not initialized")
         context_main_x = None
+        context_kv_start = self._sm70_mtp_profile_start(
+            getattr(self, "_active_sm70_profile_events", None)
+        )
         if (
             self._dspark_context_hidden_states is not None
             and self._dspark_context_positions is not None
@@ -509,6 +565,11 @@ class DSparkProposer(DFlashProposer):
                 batch_size=self._dspark_batch_size,
                 num_rejected_tokens=self._dspark_num_rejected_tokens,
             )
+        self._sm70_mtp_profile_finish(
+            getattr(self, "_active_sm70_profile_events", None),
+            "dspark_context_kv",
+            context_kv_start,
+        )
         model_kwargs = dict(
             input_ids=self.input_ids[:num_input_tokens],
             positions=self._get_positions(num_input_tokens),
@@ -588,8 +649,17 @@ class DSparkProposer(DFlashProposer):
             self.speculative_config.draft_sample_method == "greedy"
             or sampling_metadata.all_greedy
         )
+        profile_events = getattr(self, "_active_sm70_profile_events", None)
         if logits is None:
+            base_logits_start = self._sm70_mtp_profile_start(
+                getattr(self, "_active_sm70_profile_events", None)
+            )
             logits = self._compute_logits_for_step(hidden_states, spec_step_idx)
+            self._sm70_mtp_profile_finish(
+                getattr(self, "_active_sm70_profile_events", None),
+                "dspark_base_logits",
+                base_logits_start,
+            )
         if logits.shape[0] % self.num_speculative_tokens != 0:
             raise ValueError(
                 "DSpark logits rows must be request-major blocks: "
@@ -609,6 +679,25 @@ class DSparkProposer(DFlashProposer):
                 "DSpark draft model must implement apply_dspark_markov_bias("
                 "base_logits, prev_token_ids, step_idx)"
             )
+
+        sampled_model_apply = model_apply
+        if profile_events is not None:
+
+            def profiled_model_apply(
+                step_base_logits: torch.Tensor,
+                prev_token_ids: torch.Tensor,
+                step_idx: int,
+            ) -> torch.Tensor:
+                markov_step_start = self._sm70_mtp_profile_start(profile_events)
+                output = model_apply(step_base_logits, prev_token_ids, step_idx)
+                self._sm70_mtp_profile_finish(
+                    profile_events,
+                    "dspark_markov_bias",
+                    markov_step_start,
+                )
+                return output
+
+            sampled_model_apply = profiled_model_apply
 
         return_probs = self._enable_probabilistic_draft_probs and not greedy_draft
         tokens_out = self._dspark_tokens_out[:batch_size, : self.num_speculative_tokens]
@@ -630,25 +719,60 @@ class DSparkProposer(DFlashProposer):
             draft_probs_out = self._dspark_draft_probs_out
 
         if self.use_fused_markov_sampler and return_probs:
-            return sample_dspark_markov_block_fused(
+            output = sample_dspark_markov_block_fused(
                 base_logits,
                 self._dspark_first_prev_token_ids[:batch_size],
-                model_apply,
+                sampled_model_apply,
                 sampling_metadata,
                 use_fp64_gumbel=self.use_fp64_gumbel,
                 tokens_out=tokens_out,
                 draft_probs_out=draft_probs_out,
                 valid_vocab_size=self.valid_vocab_size,
             )
+        else:
+            markov_sample_start = self._sm70_mtp_profile_start(profile_events)
+            output = sample_dspark_markov_block(
+                base_logits,
+                self._dspark_first_prev_token_ids[:batch_size],
+                sampled_model_apply,
+                sampling_metadata,
+                return_probs=return_probs,
+                use_fp64_gumbel=self.use_fp64_gumbel,
+                tokens_out=tokens_out,
+                draft_probs_out=draft_probs_out,
+                valid_vocab_size=self.valid_vocab_size,
+            )
+            self._sm70_mtp_profile_finish(
+                profile_events,
+                "dspark_markov_sample",
+                markov_sample_start,
+            )
 
-        return sample_dspark_markov_block(
-            base_logits,
-            self._dspark_first_prev_token_ids[:batch_size],
-            model_apply,
-            sampling_metadata,
-            return_probs=return_probs,
-            use_fp64_gumbel=self.use_fp64_gumbel,
-            tokens_out=tokens_out,
-            draft_probs_out=draft_probs_out,
-            valid_vocab_size=self.valid_vocab_size,
-        )
+        if self.confidence_threshold > 0.0:
+            predict_confidence = getattr(self.model, "predict_dspark_confidence", None)
+            if predict_confidence is None:
+                raise NotImplementedError(
+                    "DSpark confidence scheduling requires the draft model to "
+                    "implement predict_dspark_confidence(hidden_states, "
+                    "prev_token_ids)"
+                )
+            sampled_token_ids, _ = output
+            proposal_hidden = hidden_states.view(
+                batch_size, self.num_speculative_tokens, -1
+            )
+            prev_token_ids = torch.cat(
+                (
+                    self._dspark_first_prev_token_ids[:batch_size, None],
+                    sampled_token_ids[:, :-1],
+                ),
+                dim=1,
+            )
+            confidence_logits = predict_confidence(
+                proposal_hidden, prev_token_ids
+            ).squeeze(-1)
+            mask_dspark_confidence_prefix_(
+                sampled_token_ids,
+                confidence_logits,
+                self.confidence_threshold,
+            )
+        return output

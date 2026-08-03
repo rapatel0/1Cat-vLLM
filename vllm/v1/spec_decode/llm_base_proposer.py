@@ -606,7 +606,7 @@ class SpecDecodeBaseProposer:
     def _sm70_mtp_profile_enabled(self) -> bool:
         device_type = self.device.type if hasattr(self.device, "type") else self.device
         return (
-            self.method == "mtp"
+            self.method in ("mtp", "dspark")
             and device_type == "cuda"
             and _sm70_mtp_profile_env_enabled()
         )
@@ -867,6 +867,11 @@ class SpecDecodeBaseProposer:
         profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None = (
             ([]) if self._sm70_mtp_profile_enabled() else None
         )
+        # DSpark's parallel proposer has method-specific work in its input
+        # preparation and sampler overrides. Expose the current event list so
+        # those hooks can contribute phase timings to the same report without
+        # enabling any synchronization in normal serving.
+        self._active_sm70_profile_events = profile_events
         profile_cpu_ms: dict[str, float] = {}
         profile_wall_start = time.perf_counter() if profile_events is not None else 0.0
         profile_total_start = self._sm70_mtp_profile_start(profile_events)

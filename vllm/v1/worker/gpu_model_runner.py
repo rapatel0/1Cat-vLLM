@@ -196,7 +196,10 @@ from vllm.v1.spec_decode.draft_prob_alignment import (
     clone_draft_prob_token_ids,
     get_aligned_draft_probs,
 )
-from vllm.v1.spec_decode.dspark import DSparkProposer
+from vllm.v1.spec_decode.dspark import (
+    DSparkProposer,
+    trim_dspark_confidence_drafts,
+)
 from vllm.v1.spec_decode.eagle import EagleProposer
 from vllm.v1.spec_decode.extract_hidden_states import ExtractHiddenStatesProposer
 from vllm.v1.spec_decode.gemma4 import Gemma4Proposer
@@ -6775,7 +6778,15 @@ class GPUModelRunner(
             self.draft_token_ids_event,
             "GPUModelRunner.draft_token_ids_event.synchronize",
         )
-        return self.draft_token_ids_cpu[: len(req_ids)].tolist(), req_ids
+        draft_token_ids = self.draft_token_ids_cpu[: len(req_ids)].tolist()
+        spec_config = self.speculative_config
+        if (
+            spec_config is not None
+            and spec_config.use_dspark()
+            and spec_config.dspark_confidence_threshold > 0.0
+        ):
+            draft_token_ids = trim_dspark_confidence_drafts(draft_token_ids)
+        return draft_token_ids, req_ids
 
     def _copy_valid_sampled_token_count(
         self, next_token_ids: torch.Tensor, valid_sampled_tokens_count: torch.Tensor

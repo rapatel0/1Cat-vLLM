@@ -18,11 +18,54 @@ from vllm.models.deepseek_v4.nvidia.dspark_triton import (
     dspark_triton_attention,
 )
 from vllm.platforms import current_platform
+from vllm.v1.spec_decode.dspark import (
+    mask_dspark_confidence_prefix_,
+    trim_dspark_confidence_drafts,
+)
 
 pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda() or not current_platform.is_device_capability(70),
     reason="requires CUDA SM70",
 )
+
+
+def test_dspark_confidence_prefix_mask_and_trim() -> None:
+    draft_token_ids = torch.tensor(
+        [[10, 11, 12, 13], [20, 21, 22, 23], [30, 31, 32, 33]]
+    )
+    confidence_logits = torch.tensor(
+        [
+            [3.0, 2.0, -3.0, 4.0],
+            [-3.0, 4.0, 4.0, 4.0],
+            [4.0, 4.0, 4.0, 4.0],
+        ]
+    )
+
+    masked = mask_dspark_confidence_prefix_(
+        draft_token_ids, confidence_logits, threshold=0.5
+    )
+
+    assert masked.tolist() == [
+        [10, 11, -1, -1],
+        [-1, -1, -1, -1],
+        [30, 31, 32, 33],
+    ]
+    assert trim_dspark_confidence_drafts(masked.tolist()) == [
+        [10, 11],
+        [],
+        [30, 31, 32, 33],
+    ]
+
+
+def test_dspark_zero_confidence_threshold_preserves_block() -> None:
+    draft_token_ids = torch.tensor([[10, 11, 12]])
+    confidence_logits = torch.full((1, 3), -100.0)
+
+    masked = mask_dspark_confidence_prefix_(
+        draft_token_ids, confidence_logits, threshold=0.0
+    )
+
+    assert masked.tolist() == [[10, 11, 12]]
 
 
 def test_dspark_runtime_block_size_uses_speculative_token_count() -> None:

@@ -1031,6 +1031,23 @@ class DeepSeekV4DSpark(nn.Module):
             return markov_bias
         return base_logits + markov_bias
 
+    def predict_dspark_confidence(
+        self,
+        hidden_states: torch.Tensor,
+        prev_token_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        """Predict acceptance logits for a DSpark proposal block.
+
+        The released checkpoint trains the confidence projection on each
+        proposal hidden state concatenated with that position's Markov
+        predecessor embedding. The projection is intentionally float32.
+        """
+        markov_embed = self._markov_w1_embedding(prev_token_ids)
+        features = torch.cat(
+            (hidden_states, markov_embed.to(hidden_states.dtype)), dim=-1
+        )
+        return _linear_output(self.confidence_head(features.float())).float()
+
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
             ("gate_up_proj", "w1", 0),

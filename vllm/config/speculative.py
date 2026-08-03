@@ -299,6 +299,9 @@ class SpeculativeConfig:
     """Use fused DSpark output-projection activation quantization."""
     dspark_fused_shared_experts_quant: bool = True
     """Use fused DSpark shared-expert activation quantization."""
+    dspark_confidence_threshold: float = Field(default=0.0, ge=0.0, le=1.0)
+    """Stop each DSpark draft at the first token whose predicted acceptance
+    probability is below this threshold. ``0.0`` keeps the full fixed block."""
 
     def compute_hash(self) -> str:
         """
