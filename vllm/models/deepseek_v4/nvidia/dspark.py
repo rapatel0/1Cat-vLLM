@@ -1046,14 +1046,16 @@ class DeepSeekV4DSpark(nn.Module):
                 ],
                 dim=0,
             )
-            assert confidence_hidden is not None
-            confidence_hidden = torch.cat(
-                [
-                    confidence_hidden,
-                    confidence_hidden.new_zeros(pad_rows, confidence_hidden.shape[1]),
-                ],
-                dim=0,
-            )
+            if confidence_hidden is not None:
+                confidence_hidden = torch.cat(
+                    [
+                        confidence_hidden,
+                        confidence_hidden.new_zeros(
+                            pad_rows, confidence_hidden.shape[1]
+                        ),
+                    ],
+                    dim=0,
+                )
         logits_hidden = x[:num_input_rows]
         if self.use_confidence_scheduling:
             assert confidence_hidden is not None
