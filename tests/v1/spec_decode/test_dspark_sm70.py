@@ -9,6 +9,7 @@ import torch
 from vllm.models.deepseek_v4.nvidia.dspark import (
     _apply_rope_gptj_last,
     _dspark_query_block_size,
+    _hc_head_fp32_for_confidence,
     _rmsnorm_no_weight,
 )
 from vllm.models.deepseek_v4.nvidia.dspark_triton import (
@@ -66,6 +67,32 @@ def test_dspark_zero_confidence_threshold_preserves_block() -> None:
     )
 
     assert masked.tolist() == [[10, 11, 12]]
+
+
+def test_dspark_confidence_hc_head_avoids_fp16_overflow() -> None:
+    tokens, hc_mult, hidden_size = 2, 4, 16
+    x = torch.full(
+        (tokens, hc_mult, hidden_size),
+        40_000.0,
+        device="cuda",
+        dtype=torch.float16,
+    )
+    fn = torch.zeros(
+        (hc_mult, hc_mult * hidden_size), device="cuda", dtype=torch.float32
+    )
+    scale = torch.ones(1, device="cuda", dtype=torch.float32)
+    base = torch.zeros(hc_mult, device="cuda", dtype=torch.float32)
+
+    confidence_hidden = _hc_head_fp32_for_confidence(
+        x, fn, scale, base, rms_eps=1e-6, hc_eps=0.0
+    )
+
+    assert confidence_hidden.dtype is torch.float32
+    assert torch.isfinite(confidence_hidden).all()
+    torch.testing.assert_close(
+        confidence_hidden,
+        torch.full_like(confidence_hidden, 80_000.0),
+    )
 
 
 def test_dspark_runtime_block_size_uses_speculative_token_count() -> None:

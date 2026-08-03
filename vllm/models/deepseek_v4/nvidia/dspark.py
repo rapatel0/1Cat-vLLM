@@ -107,6 +107,26 @@ def _rmsnorm_no_weight(x: torch.Tensor, eps: float) -> torch.Tensor:
     return x_float.mul(torch.rsqrt(x_float.square().mean(-1, keepdim=True) + eps))
 
 
+def _hc_head_fp32_for_confidence(
+    x: torch.Tensor,
+    fn: torch.Tensor,
+    hc_scale: torch.Tensor,
+    hc_base: torch.Tensor,
+    rms_eps: float,
+    hc_eps: float,
+) -> torch.Tensor:
+    """Compute the pre-head-RMSNorm DSpark state without FP16 overflow."""
+    hc_mult = x.shape[-2]
+    hidden_size = x.shape[-1]
+    x_flat = x.flatten(-2).float()
+    x_normed = _rmsnorm_no_weight(x_flat, rms_eps)
+    pre_mix = torch.sigmoid(x_normed @ fn.t() * hc_scale + hc_base) + hc_eps
+    return torch.sum(
+        pre_mix.unsqueeze(-1) * x.view(-1, hc_mult, hidden_size).float(),
+        dim=-2,
+    )
+
+
 def _apply_rope_gptj_last(
     x: torch.Tensor,
     positions: torch.Tensor,
@@ -994,6 +1014,20 @@ class DeepSeekV4DSpark(nn.Module):
             if self.use_sm70_reference_kernels
             else hc_head_fused_kernel_tilelang
         )
+        confidence_hidden = None
+        if self.use_confidence_scheduling:
+            # V100 serving uses FP16 while the released DSpark path uses BF16.
+            # Preserve the trained pre-RMSNorm feature in FP32 so the four-way
+            # hyper-connection reduction cannot overflow before confidence
+            # projection.
+            confidence_hidden = _hc_head_fp32_for_confidence(
+                x,
+                self.hc_head_fn,
+                self.hc_head_scale,
+                self.hc_head_base,
+                self.rms_norm_eps,
+                self.hc_eps,
+            )
         x = hc_head(
             x,
             self.hc_head_fn,
@@ -1002,11 +1036,6 @@ class DeepSeekV4DSpark(nn.Module):
             self.rms_norm_eps,
             self.hc_eps,
         )
-        # The released implementation trains the confidence projection on the
-        # pre-head-RMSNorm state, while draft logits consume the normalized
-        # state below. Return both as graph outputs so the confidence state is
-        # updated correctly during CUDA graph replay.
-        confidence_hidden = x
         x = self.norm(x)
         if x.shape[0] < num_input_rows:
             pad_rows = num_input_rows - x.shape[0]
@@ -1017,6 +1046,7 @@ class DeepSeekV4DSpark(nn.Module):
                 ],
                 dim=0,
             )
+            assert confidence_hidden is not None
             confidence_hidden = torch.cat(
                 [
                     confidence_hidden,
@@ -1026,6 +1056,7 @@ class DeepSeekV4DSpark(nn.Module):
             )
         logits_hidden = x[:num_input_rows]
         if self.use_confidence_scheduling:
+            assert confidence_hidden is not None
             return logits_hidden, confidence_hidden[:num_input_rows]
         return logits_hidden
 
