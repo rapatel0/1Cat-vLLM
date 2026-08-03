@@ -1,11 +1,14 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from types import SimpleNamespace
+
 import pytest
 import torch
 
 from vllm.models.deepseek_v4.nvidia.dspark import (
     _apply_rope_gptj_last,
+    _dspark_query_block_size,
     _rmsnorm_no_weight,
 )
 from vllm.models.deepseek_v4.nvidia.dspark_triton import (
@@ -20,6 +23,14 @@ pytestmark = pytest.mark.skipif(
     not current_platform.is_cuda() or not current_platform.is_device_capability(70),
     reason="requires CUDA SM70",
 )
+
+
+def test_dspark_runtime_block_size_uses_speculative_token_count() -> None:
+    vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(num_speculative_tokens=7)
+    )
+
+    assert _dspark_query_block_size(vllm_config) == 7
 
 
 def _cos_sin_cache(max_position: int, rope_dim: int) -> torch.Tensor:

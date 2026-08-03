@@ -82,6 +82,15 @@ logger = init_logger(__name__)
 _EXPERT_SCALE_RE = re.compile(r"\.experts\.\d+\.w[123]\.scale$")
 
 
+def _dspark_query_block_size(vllm_config: VllmConfig) -> int:
+    speculative_config = vllm_config.speculative_config
+    assert speculative_config is not None
+    block_size = int(speculative_config.num_speculative_tokens)
+    if block_size <= 0:
+        raise ValueError("DSpark requires num_speculative_tokens > 0")
+    return block_size
+
+
 def _spec_bool(vllm_config: VllmConfig, attr: str, default: bool = True) -> bool:
     spec_config = vllm_config.speculative_config
     return bool(getattr(spec_config, attr, default))
@@ -154,7 +163,10 @@ class DeepSeekV4DSparkLayer(nn.Module):
         self.hc_sinkhorn_iters = config.hc_sinkhorn_iters
         self.hc_eps = config.hc_eps
         self.hc_post_alpha = 2.0
-        self.block_size = int(getattr(config, "dspark_block_size", 0))
+        # The checkpoint's dspark_block_size is a training/model attribute and
+        # is not the runtime query width. The model card requests seven draft
+        # tokens while the 0731 checkpoint stores dspark_block_size=5.
+        self.block_size = _dspark_query_block_size(vllm_config)
         runtime_layer_idx = config.num_hidden_layers + dspark_layer_idx
         runtime_prefix = (
             f"{prefix}.layers.{runtime_layer_idx}"
@@ -734,10 +746,8 @@ class DeepSeekV4DSpark(nn.Module):
         config = vllm_config.speculative_config.draft_model_config.hf_config
         self.config = config
         self.use_sm70_reference_kernels = _use_sm70_reference_kernels()
-        self.block_size = int(getattr(config, "dspark_block_size", 0))
+        self.block_size = _dspark_query_block_size(vllm_config)
         self.target_layer_ids = tuple(getattr(config, "dspark_target_layer_ids", ()))
-        if self.block_size <= 0:
-            raise ValueError("DSpark requires dspark_block_size > 0")
         if not self.target_layer_ids:
             raise ValueError("DSpark requires dspark_target_layer_ids")
 
