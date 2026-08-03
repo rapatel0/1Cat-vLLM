@@ -574,7 +574,6 @@ def prepare_moe_mxfp4_layer_for_marlin(
 
     # WEIGHT: Repack weights to marlin format
     def repack_weight(weight: torch.Tensor, name: str) -> torch.Tensor:
-        tensor_list = []
         if "w13" in name:
             size_n, size_k = n * 2, k
         else:
@@ -582,6 +581,7 @@ def prepare_moe_mxfp4_layer_for_marlin(
 
         assert weight.shape == (e, size_n, size_k // 2)
 
+        repacked: torch.Tensor | None = None
         for i in range(e):
             qweight = weight[i].view(torch.int32).T.contiguous()
             marlin_qweight = ops.gptq_marlin_repack(
@@ -592,8 +592,15 @@ def prepare_moe_mxfp4_layer_for_marlin(
                 num_bits=4,
                 is_a_8bit=is_a_8bit,
             )
-            tensor_list.append(marlin_qweight)
-        return torch.cat([x.unsqueeze(0) for x in tensor_list], 0)
+            if repacked is None:
+                repacked = torch.empty(
+                    (e, *marlin_qweight.shape),
+                    dtype=marlin_qweight.dtype,
+                    device=marlin_qweight.device,
+                )
+            repacked[i].copy_(marlin_qweight)
+        assert repacked is not None
+        return repacked
 
     w13 = repack_weight(w13, "w13")
     w2 = repack_weight(w2, "w2")

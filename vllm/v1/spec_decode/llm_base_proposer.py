@@ -75,7 +75,7 @@ def _sm70_mtp_profile_interval() -> int:
 
 
 def _is_dflash_method(method: str | None) -> bool:
-    return method in ("dflash", "dflash_ddtree")
+    return method in ("dflash", "dflash_ddtree", "dspark")
 
 
 def _spec_debug_corruption_enabled(method: str) -> bool:
@@ -126,10 +126,7 @@ def _clone_drafter_mutable_metadata(
 
 
 def _get_initialized_tp_group() -> Any | None:
-    if (
-        not torch.distributed.is_available()
-        or not torch.distributed.is_initialized()
-    ):
+    if not torch.distributed.is_available() or not torch.distributed.is_initialized():
         return None
     return get_tp_group()
 
@@ -199,8 +196,7 @@ class SpecDecodeBaseProposer:
         )
         self.net_num_new_slots_per_request = self.extra_slots_per_request - (
             1
-            if (self.pass_hidden_states_to_model
-                and not _is_dflash_method(self.method))
+            if (self.pass_hidden_states_to_model and not _is_dflash_method(self.method))
             else 0
         )
         self.needs_extra_input_slots = self.net_num_new_slots_per_request > 0
@@ -428,6 +424,8 @@ class SpecDecodeBaseProposer:
         dflash_config = getattr(model_hf_config, "dflash_config", None)
         if dflash_config and "mask_token_id" in dflash_config:
             self.parallel_drafting_token_id = dflash_config["mask_token_id"]
+        elif hasattr(model_hf_config, "dspark_noise_token_id"):
+            self.parallel_drafting_token_id = model_hf_config.dspark_noise_token_id
         elif hasattr(model_hf_config, "pard_token"):
             self.parallel_drafting_token_id = model_hf_config.pard_token
         elif hasattr(model_hf_config, "ptd_token_id"):
@@ -550,9 +548,7 @@ class SpecDecodeBaseProposer:
         spec_step_idx: int,
     ) -> torch.Tensor:
         if self._uses_spec_step_idx():
-            return self.model.compute_logits(
-                hidden_states, spec_step_idx=spec_step_idx
-            )
+            return self.model.compute_logits(hidden_states, spec_step_idx=spec_step_idx)
         return self.model.compute_logits(hidden_states)
 
     def _get_top_tokens_for_step(
@@ -561,9 +557,7 @@ class SpecDecodeBaseProposer:
         spec_step_idx: int,
     ) -> torch.Tensor:
         if self._uses_spec_step_idx():
-            return self.model.get_top_tokens(
-                hidden_states, spec_step_idx=spec_step_idx
-            )
+            return self.model.get_top_tokens(hidden_states, spec_step_idx=spec_step_idx)
         return self.model.get_top_tokens(hidden_states)
 
     def _greedy_sample(
@@ -869,18 +863,22 @@ class SpecDecodeBaseProposer:
         | None = None,
     ) -> torch.Tensor:
         self._last_draft_probs = None
+        method = self.method
+        assert method is not None
         batch_size = common_attn_metadata.batch_size()
         common_attn_metadata = _clone_drafter_mutable_metadata(common_attn_metadata)
-        profile_events = (
-            [] if self._sm70_mtp_profile_enabled() else None
+        profile_events: list[tuple[str, torch.cuda.Event, torch.cuda.Event]] | None = (
+            ([]) if self._sm70_mtp_profile_enabled() else None
         )
         profile_cpu_ms: dict[str, float] = {}
-        profile_wall_start = (
-            time.perf_counter() if profile_events is not None else 0.0
-        )
+        profile_wall_start = time.perf_counter() if profile_events is not None else 0.0
         profile_total_start = self._sm70_mtp_profile_start(profile_events)
 
-        if self.method == "eagle3" or _is_dflash_method(self.method):
+        if method == "dspark":
+            # DSpark consumes its concatenated target-layer streams directly.
+            # Its proposer override projects them while preparing context KV.
+            assert target_hidden_states.shape[-1] == self.hidden_size
+        elif method == "eagle3" or _is_dflash_method(method):
             assert isinstance(
                 self.model,
                 (
@@ -915,9 +913,7 @@ class SpecDecodeBaseProposer:
             num_input_tokens,
             num_tokens_across_dp,
             batch_descriptor,
-        ) = (
-            self._determine_batch_execution_and_padding(num_tokens)
-        )
+        ) = self._determine_batch_execution_and_padding(num_tokens)
 
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
             num_tokens, num_input_tokens, mm_embed_inputs
@@ -954,10 +950,9 @@ class SpecDecodeBaseProposer:
         sample_hidden_states = last_hidden_states[token_indices_to_sample]
         debug_logits = None
         debug_summary: dict[str, Any] | None = None
-        should_collect_draft_logits = (
-            _spec_debug_corruption_enabled(self.method)
-            or _spec_dump_draft_logits_enabled(self.method)
-        )
+        should_collect_draft_logits = _spec_debug_corruption_enabled(
+            method
+        ) or _spec_dump_draft_logits_enabled(method)
         if should_collect_draft_logits:
             debug_logits = self._compute_logits_for_step(sample_hidden_states, 0)
             topk = min(5, debug_logits.shape[-1])
@@ -994,26 +989,21 @@ class SpecDecodeBaseProposer:
                 "logits_topk_vals": topk_vals.detach().cpu(),
                 "first_pass": getattr(self, "_debug_last_first_pass", None),
             }
-            if _spec_dump_draft_logits_enabled(self.method):
+            if _spec_dump_draft_logits_enabled(method):
                 debug_summary["sample_hidden_states"] = (
                     sample_hidden_states.detach().to(torch.float16).cpu()
                 )
                 debug_summary["logits"] = debug_logits.detach().to(torch.float16).cpu()
             self._debug_last_propose_summary = debug_summary
-            if (
-                not getattr(self, "_spec_corruption_dumped", False)
-                and (
-                    int(nan_counts.sum().item()) > 0
-                    or int(nonfinite_counts.sum().item()) > 0
-                )
+            if not getattr(self, "_spec_corruption_dumped", False) and (
+                int(nan_counts.sum().item()) > 0
+                or int(nonfinite_counts.sum().item()) > 0
             ):
-                dump_path = _dump_spec_debug(
-                    debug_summary, self.method, "draft_corruption"
-                )
+                dump_path = _dump_spec_debug(debug_summary, method, "draft_corruption")
                 self._spec_corruption_dumped = True
                 logger.warning(
                     "Saved %s draft corruption debug to %s",
-                    self.method,
+                    method,
                     dump_path,
                 )
 
@@ -1034,7 +1024,7 @@ class SpecDecodeBaseProposer:
                     -1, self.num_speculative_tokens, draft_probs.shape[-1]
                 ).contiguous()
             if (
-                _spec_dump_draft_logits_enabled(self.method)
+                _spec_dump_draft_logits_enabled(method)
                 and not getattr(self, "_spec_logits_dumped", False)
                 and debug_summary is not None
             ):
@@ -1043,13 +1033,9 @@ class SpecDecodeBaseProposer:
                     debug_summary["draft_probs"] = (
                         draft_probs.detach().to(torch.float16).cpu()
                     )
-                dump_path = _dump_spec_debug(
-                    debug_summary, self.method, "draft_logits"
-                )
+                dump_path = _dump_spec_debug(debug_summary, method, "draft_logits")
                 self._spec_logits_dumped = True
-                logger.warning(
-                    "Saved %s draft logits debug to %s", self.method, dump_path
-                )
+                logger.warning("Saved %s draft logits debug to %s", method, dump_path)
             self._sm70_mtp_profile_finish(
                 profile_events, "total_gpu", profile_total_start
             )
@@ -1085,16 +1071,14 @@ class SpecDecodeBaseProposer:
         )
         draft_probs_list = None if draft_probs is None else [draft_probs]
         if (
-            _spec_dump_draft_logits_enabled(self.method)
+            _spec_dump_draft_logits_enabled(method)
             and not getattr(self, "_spec_logits_dumped", False)
             and debug_summary is not None
         ):
             debug_summary["draft_token_ids"] = draft_token_ids.detach().cpu()
-            dump_path = _dump_spec_debug(debug_summary, self.method, "draft_logits")
+            dump_path = _dump_spec_debug(debug_summary, method, "draft_logits")
             self._spec_logits_dumped = True
-            logger.warning(
-                "Saved %s draft logits debug to %s", self.method, dump_path
-            )
+            logger.warning("Saved %s draft logits debug to %s", method, dump_path)
 
         if self.allowed_attn_types is not None:
             for group_md in per_group_attn_metadata:
@@ -1114,9 +1098,7 @@ class SpecDecodeBaseProposer:
             input_batch_size,
             batch_size_across_dp,
             batch_descriptor,
-        ) = (
-            self._determine_batch_execution_and_padding(batch_size)
-        )
+        ) = self._determine_batch_execution_and_padding(batch_size)
 
         common_attn_metadata.num_actual_tokens = batch_size
         common_attn_metadata.max_query_len = 1
@@ -1146,9 +1128,7 @@ class SpecDecodeBaseProposer:
         assert block_size > 0, "block_size has not been initialized."
         for token_index in range(self.num_speculative_tokens - 1):
             spec_step_idx = token_index + 1
-            loop_cpu_start = (
-                time.perf_counter() if profile_events is not None else 0.0
-            )
+            loop_cpu_start = time.perf_counter() if profile_events is not None else 0.0
             # Update the inputs.
             # cast to int32 is crucial when eagle model is compiled.
             # tensor.argmax() returns int64 by default.
@@ -1201,9 +1181,10 @@ class SpecDecodeBaseProposer:
                 self._sm70_mtp_profile_add_cpu_ms(
                     profile_cpu_ms, metadata_name, loop_cpu_start
                 )
-                profile_cpu_ms["loop_metadata_cpu"] = profile_cpu_ms.get(
-                    "loop_metadata_cpu", 0.0
-                ) + profile_cpu_ms[metadata_name]
+                profile_cpu_ms["loop_metadata_cpu"] = (
+                    profile_cpu_ms.get("loop_metadata_cpu", 0.0)
+                    + profile_cpu_ms[metadata_name]
+                )
 
             loop_forward_start = self._sm70_mtp_profile_start(profile_events)
             with set_forward_context(
@@ -1246,9 +1227,7 @@ class SpecDecodeBaseProposer:
         draft_token_ids = torch.stack(draft_token_ids_list, dim=1)
         if draft_probs_list is not None:
             self._last_draft_probs = torch.stack(draft_probs_list, dim=1).contiguous()
-        self._sm70_mtp_profile_finish(
-            profile_events, "total_gpu", profile_total_start
-        )
+        self._sm70_mtp_profile_finish(profile_events, "total_gpu", profile_total_start)
         self._sm70_mtp_profile_add_cpu_ms(
             profile_cpu_ms, "total_wall_cpu", profile_wall_start
         )
@@ -1490,7 +1469,13 @@ class SpecDecodeBaseProposer:
         return per_group_attn_metadata, per_layer_attn_metadata
 
     def model_returns_tuple(self) -> bool:
-        return self.method not in ("mtp", "draft_model", "dflash", "dflash_ddtree")
+        return self.method not in (
+            "mtp",
+            "draft_model",
+            "dflash",
+            "dflash_ddtree",
+            "dspark",
+        )
 
     def prepare_next_token_ids_cpu(
         self,
@@ -1911,6 +1896,9 @@ class SpecDecodeBaseProposer:
         we share the target model's embedding layers with the draft model to save
         memory.
         """
+        if self.method == "dspark":
+            return
+
         if get_pp_group().world_size == 1:
             inner_model = getattr(target_language_model, "model", None)
             if inner_model is None:
@@ -1979,6 +1967,9 @@ class SpecDecodeBaseProposer:
         duplicate copy of the target model's LM head. In these cases, we share
         the target model's LM head with the draft model to save memory.
         """
+        if self.method == "dspark":
+            return
+
         share_lm_head = False
         if hasattr(self.model, "has_own_lm_head"):
             # EAGLE model
@@ -2105,10 +2096,8 @@ class SpecDecodeBaseProposer:
                 num_input_tokens,
                 num_tokens_across_dp,
                 batch_descriptor,
-            ) = (
-                self._determine_batch_execution_and_padding(
-                    num_tokens, use_cudagraphs=use_cudagraphs
-                )
+            ) = self._determine_batch_execution_and_padding(
+                num_tokens, use_cudagraphs=use_cudagraphs
             )
             batch_descriptor = self._batch_descriptor_for_spec_step(
                 batch_descriptor, fwd_idx

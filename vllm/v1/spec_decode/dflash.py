@@ -37,7 +37,9 @@ def _ddtree_debug_enabled() -> bool:
 
 def _ddtree_debug_log(message: str, *args: object) -> None:
     if _ddtree_debug_enabled():
-        logger.info("DFlash DDTree proposer debug: " + message, *args)
+        if args:
+            message = message % args
+        logger.info("DFlash DDTree proposer debug: %s", message)
 
 
 class DFlashProposer(SpecDecodeBaseProposer):
@@ -48,7 +50,10 @@ class DFlashProposer(SpecDecodeBaseProposer):
         runner=None,
     ):
         assert vllm_config.speculative_config is not None
-        assert vllm_config.speculative_config.use_dflash()
+        assert (
+            vllm_config.speculative_config.use_dflash()
+            or vllm_config.speculative_config.use_dspark()
+        )
         super().__init__(
             vllm_config=vllm_config,
             device=device,
@@ -155,9 +160,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         self._context_slot_mapping_buffers_by_gid = {}
         for idx, gid in enumerate(self._draft_kv_cache_group_ids()):
             if idx == 0:
-                self._query_slot_mapping_buffers_by_gid[gid] = (
-                    self._slot_mapping_buffer
-                )
+                self._query_slot_mapping_buffers_by_gid[gid] = self._slot_mapping_buffer
                 self._context_slot_mapping_buffers_by_gid[gid] = (
                     self._context_slot_mapping_buffer
                 )
@@ -248,8 +251,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         if self._last_ddtree_payloads:
             first_payload = self._last_ddtree_payloads[0]
             _ddtree_debug_log(
-                "built payloads batch=%s flat_len=%s tree_len=%s "
-                "has_extra_nodes=%s",
+                "built payloads batch=%s flat_len=%s tree_len=%s has_extra_nodes=%s",
                 len(self._last_ddtree_payloads),
                 len(first_payload.flat_draft_token_ids),
                 len(first_payload.tree_token_ids),
@@ -293,13 +295,11 @@ class DFlashProposer(SpecDecodeBaseProposer):
             ):
                 self.kv_cache_gid = gid
 
-        attention_groups: dict[tuple[int, str], AttentionGroup] = {}
+        attention_groups: dict[tuple[int, tuple[str, str]], AttentionGroup] = {}
         for layer_name in self._draft_attn_layer_names:
             kv_cache_gid = layer_to_gid[layer_name]
             self.draft_layer_to_kv_cache_gid[layer_name] = kv_cache_gid
-            kv_cache_spec = kv_cache_config.kv_cache_groups[
-                kv_cache_gid
-            ].kv_cache_spec
+            kv_cache_spec = kv_cache_config.kv_cache_groups[kv_cache_gid].kv_cache_spec
             layer_kv_cache_spec = kv_cache_spec
             if isinstance(layer_kv_cache_spec, UniformTypeKVCacheSpecs):
                 layer_kv_cache_spec = layer_kv_cache_spec.kv_cache_specs[layer_name]
@@ -375,9 +375,9 @@ class DFlashProposer(SpecDecodeBaseProposer):
             return
         self.input_ids[num_query_tokens:num_input_tokens].zero_()
         self.positions[num_query_tokens:num_input_tokens].zero_()
-        buffers = self._query_slot_mapping_buffers_by_gid.values()
+        buffers = tuple(self._query_slot_mapping_buffers_by_gid.values())
         if not self._query_slot_mapping_buffers_by_gid:
-            buffers = [self._slot_mapping_buffer]
+            buffers = (self._slot_mapping_buffer,)
         for buffer in buffers:
             buffer[num_query_tokens:num_input_tokens].fill_(PADDING_SLOT_ID)
 
@@ -413,9 +413,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
                 "context_positions": self._context_positions_buffer[:num_context]
                 .detach()
                 .cpu(),
-                "context_slot_mapping": self._context_slot_mapping_buffer[
-                    :num_context
-                ]
+                "context_slot_mapping": self._context_slot_mapping_buffer[:num_context]
                 .detach()
                 .cpu(),
                 "query_positions": self.positions[:num_query_total].detach().cpu(),
@@ -502,9 +500,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
         new_cad_by_gid: dict[int, CommonAttentionMetadata] = {}
         for gid in self._draft_kv_cache_group_ids():
             group_cad = common_metadata_by_gid.get(gid, cad)
-            context_slot_mapping_buffer = self._context_slot_mapping_buffer_for_gid(
-                gid
-            )
+            context_slot_mapping_buffer = self._context_slot_mapping_buffer_for_gid(gid)
             query_slot_mapping_buffer = self._query_slot_mapping_buffer_for_gid(gid)
             block_size = self._dflash_block_size_by_gid.get(gid, self.block_size)
             copy_and_expand_dflash_inputs_kernel[grid](
@@ -613,10 +609,8 @@ class DFlashProposer(SpecDecodeBaseProposer):
             num_input_tokens,
             num_tokens_across_dp,
             batch_descriptor,
-        ) = (
-            self._determine_batch_execution_and_padding(
-                num_query_tokens, use_cudagraphs=use_cudagraphs
-            )
+        ) = self._determine_batch_execution_and_padding(
+            num_query_tokens, use_cudagraphs=use_cudagraphs
         )
 
         # Slot mapping sized to num_input_tokens (query only), matching
@@ -704,9 +698,7 @@ class DFlashProposer(SpecDecodeBaseProposer):
             self._dflash_hidden_states,  # Shape is already [num_context, hidden_size]
             self._context_positions_buffer[:num_context],
             {
-                layer_name: self._context_slot_mapping_buffer_for_gid(gid)[
-                    :num_context
-                ]
+                layer_name: self._context_slot_mapping_buffer_for_gid(gid)[:num_context]
                 for layer_name, gid in self.draft_layer_to_kv_cache_gid.items()
             },
         )

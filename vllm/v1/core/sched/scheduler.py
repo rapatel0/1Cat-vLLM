@@ -55,6 +55,7 @@ from vllm.v1.metrics.perf import ModelMetrics, PerfStats
 from vllm.v1.metrics.stats import PrefixCacheStats, SchedulerStats
 from vllm.v1.outputs import DraftTokenIds, KVConnectorOutput, ModelRunnerOutput
 from vllm.v1.request import Request, RequestStatus, StreamingUpdate
+from vllm.v1.spec_decode.ddtree_payload import DDTreeDraftPayload
 from vllm.v1.spec_decode.metrics import SpecDecodingStats
 from vllm.v1.structured_output import StructuredOutputManager
 from vllm.v1.utils import record_function_or_nullcontext
@@ -68,7 +69,9 @@ def _ddtree_debug_enabled() -> bool:
 
 def _ddtree_debug_log(message: str, *args: object) -> None:
     if _ddtree_debug_enabled():
-        logger.info("DFlash DDTree debug: " + message, *args)
+        if args:
+            message = message % args
+        logger.info("DFlash DDTree debug: %s", message)
 
 
 class Scheduler(SchedulerInterface):
@@ -165,7 +168,7 @@ class Scheduler(SchedulerInterface):
         self.requests: dict[str, Request] = {}
         speculative_config = vllm_config.speculative_config
         # req_id -> latest DDTree payload returned by a dflash_ddtree drafter.
-        self.ddtree_payloads_by_req_id: dict[str, object] = {}
+        self.ddtree_payloads_by_req_id: dict[str, DDTreeDraftPayload] = {}
         self.dflash_ddtree_tree_verify = (
             speculative_config is not None
             and speculative_config.use_dflash_ddtree()
@@ -251,6 +254,8 @@ class Scheduler(SchedulerInterface):
             self.num_spec_tokens = speculative_config.num_speculative_tokens
             if speculative_config.use_eagle():
                 self.use_eagle = True
+                self.num_lookahead_tokens = self.num_spec_tokens
+            if speculative_config.use_dspark():
                 self.num_lookahead_tokens = self.num_spec_tokens
             if speculative_config.uses_draft_model():
                 self.num_lookahead_tokens = self.num_spec_tokens
@@ -340,7 +345,7 @@ class Scheduler(SchedulerInterface):
     def _ddtree_payload_for_tree_schedule(
         self,
         request: Request,
-    ) -> object | None:
+    ) -> DDTreeDraftPayload | None:
         if not self.dflash_ddtree_tree_verify or not request.spec_token_ids:
             _ddtree_debug_log(
                 "payload unavailable req=%s tree_verify=%s spec_len=%d",
@@ -466,7 +471,7 @@ class Scheduler(SchedulerInterface):
         encoder_compute_budget = self.max_num_encoder_input_tokens
         # Spec decode-related.
         scheduled_spec_decode_tokens: dict[str, list[int]] = {}
-        scheduled_ddtree_payloads: dict[str, object] = {}
+        scheduled_ddtree_payloads: dict[str, DDTreeDraftPayload] = {}
 
         # For logging.
         scheduled_timestamp = time.monotonic()
@@ -499,8 +504,8 @@ class Scheduler(SchedulerInterface):
                 + request.num_output_placeholders
                 - request.num_computed_tokens
             )
-            ddtree_payload_for_tree_schedule = (
-                self._ddtree_payload_for_tree_schedule(request)
+            ddtree_payload_for_tree_schedule = self._ddtree_payload_for_tree_schedule(
+                request
             )
             if ddtree_payload_for_tree_schedule is not None:
                 flat_len = len(request.spec_token_ids)
@@ -684,9 +689,8 @@ class Scheduler(SchedulerInterface):
                         if ddtree_payload is not None
                         else ()
                     )
-                    if (
-                        ddtree_payload is not None
-                        and num_scheduled_spec_tokens == len(ddtree_tree_token_ids)
+                    if ddtree_payload is not None and num_scheduled_spec_tokens == len(
+                        ddtree_tree_token_ids
                     ):
                         spec_token_ids = list(ddtree_tree_token_ids)
                         scheduled_ddtree_payloads[request_id] = ddtree_payload
@@ -706,10 +710,8 @@ class Scheduler(SchedulerInterface):
                             len(ddtree_tree_token_ids),
                         )
                     scheduled_spec_decode_tokens[request.request_id] = spec_token_ids
-                    if (
-                        ddtree_payload is not None
-                        and tuple(spec_token_ids)
-                        == getattr(ddtree_payload, "flat_draft_token_ids", ())
+                    if ddtree_payload is not None and tuple(spec_token_ids) == getattr(
+                        ddtree_payload, "flat_draft_token_ids", ()
                     ):
                         scheduled_ddtree_payloads[request_id] = ddtree_payload
 
@@ -1987,11 +1989,9 @@ class Scheduler(SchedulerInterface):
                 if sched_ddtree_payloads is not None
                 else None
             )
-            if (
-                scheduled_ddtree_payload is not None
-                and tuple(placeholder_spec_tokens)
-                == getattr(scheduled_ddtree_payload, "tree_token_ids", ())
-            ):
+            if scheduled_ddtree_payload is not None and tuple(
+                placeholder_spec_tokens
+            ) == getattr(scheduled_ddtree_payload, "tree_token_ids", ()):
                 # A branched DDTree verifier schedules more tree tokens than
                 # the flat DFlash draft row returned by the proposer. Keep the
                 # scheduled tree placeholders intact; replacing them with the

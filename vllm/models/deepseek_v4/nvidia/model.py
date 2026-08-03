@@ -47,7 +47,11 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     VocabParallelEmbedding,
 )
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
-from vllm.model_executor.models.interfaces import SupportsPP
+from vllm.model_executor.models.interfaces import (
+    EagleModelMixin,
+    SupportsEagle3,
+    SupportsPP,
+)
 from vllm.model_executor.models.utils import (
     AutoWeightsLoader,
     PPMissingLayer,
@@ -960,7 +964,7 @@ class DeepseekV4DecoderLayer(nn.Module):
         return x, residual, post_mix, res_mix
 
 
-class DeepseekV4Model(nn.Module):
+class DeepseekV4Model(nn.Module, EagleModelMixin):
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
         super().__init__()
 
@@ -1055,6 +1059,7 @@ class DeepseekV4Model(nn.Module):
             )
         else:
             self._mtp_hidden_buffer = None
+        self.aux_hidden_state_layers: tuple[int, ...] = ()
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.embed_tokens(input_ids)
@@ -1100,7 +1105,12 @@ class DeepseekV4Model(nn.Module):
             input_ids = input_ids.to(torch.int64)
 
         residual, post_mix, res_mix = None, None, None
-        for layer in islice(self.layers, self.start_layer, self.end_layer):
+        aux_hidden_states: list[torch.Tensor] = []
+        final_aux_recon: torch.Tensor | None = None
+        for idx, layer in enumerate(
+            islice(self.layers, self.start_layer, self.end_layer),
+            start=self.start_layer,
+        ):
             hidden_states, residual, post_mix, res_mix = layer(
                 hidden_states,
                 positions,
@@ -1109,11 +1119,31 @@ class DeepseekV4Model(nn.Module):
                 res_mix,
                 residual,
             )
+            if idx + 1 in self.aux_hidden_state_layers:
+                mhc_post = (
+                    mhc_post_torch
+                    if self.use_sm70_reference_kernels
+                    else mhc_post_tilelang
+                )
+                aux_recon = mhc_post(
+                    hidden_states,
+                    residual,
+                    post_mix,
+                    res_mix,
+                )
+                aux_hidden_states.append(aux_recon.mean(dim=1))
+                final_aux_recon = aux_recon
         if layer is not None:
-            mhc_post = (
-                mhc_post_torch if self.use_sm70_reference_kernels else mhc_post_tilelang
-            )
-            hidden_states = mhc_post(hidden_states, residual, post_mix, res_mix)
+            if self.end_layer in self.aux_hidden_state_layers:
+                assert final_aux_recon is not None
+                hidden_states = final_aux_recon
+            else:
+                mhc_post = (
+                    mhc_post_torch
+                    if self.use_sm70_reference_kernels
+                    else mhc_post_tilelang
+                )
+                hidden_states = mhc_post(hidden_states, residual, post_mix, res_mix)
 
         if not get_pp_group().is_last_rank:
             return IntermediateTensors({"hidden_states": hidden_states})
@@ -1136,6 +1166,8 @@ class DeepseekV4Model(nn.Module):
             self.hc_eps,
         )
         hidden_states = self.norm(hidden_states)
+        if aux_hidden_states:
+            return hidden_states, aux_hidden_states
         return hidden_states
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
@@ -1294,7 +1326,7 @@ def _make_deepseek_v4_weights_mapper(expert_dtype: str) -> WeightsMapper:
     )
 
 
-class DeepseekV4ForCausalLM(nn.Module, SupportsPP):
+class DeepseekV4ForCausalLM(nn.Module, SupportsPP, SupportsEagle3):
     model_cls = DeepseekV4Model
 
     # Default mapper assumes the original FP4-expert checkpoint layout.

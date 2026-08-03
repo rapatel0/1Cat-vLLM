@@ -53,8 +53,14 @@ MTPModelTypes = Literal[
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash", "dflash_ddtree"]
+DSparkModelTypes = Literal["dspark"]
 EagleModelTypes = Literal[
-    "eagle", "eagle3", "extract_hidden_states", MTPModelTypes, DFlashModelTypes
+    "eagle",
+    "eagle3",
+    "extract_hidden_states",
+    MTPModelTypes,
+    DFlashModelTypes,
+    DSparkModelTypes,
 ]
 SpeculativeMethod = Literal[
     "ngram",
@@ -273,6 +279,27 @@ class SpeculativeConfig:
     during rejection sampling. This comes at the cost of additional GPU memory
     usage."""
 
+    dspark_materialized_attention: bool = True
+    """Use DSpark's materialized local attention path."""
+    dspark_triton_attention: bool = True
+    """Use DSpark's Triton materialized attention path."""
+    dspark_triton_qkv_postprocess: bool = True
+    """Use fused DSpark QKV postprocessing."""
+    dspark_triton_context_kv_store: bool = True
+    """Use Triton DSpark context KV stores."""
+    dspark_markov_inplace_add: bool = True
+    """Use in-place DSpark Markov residual adds."""
+    dspark_fused_markov_sampler: bool = False
+    """Use fused probabilistic Markov sampling for DSpark."""
+    dspark_forward_cudagraph: bool = False
+    """Capture the DSpark draft forward in a dedicated CUDA graph."""
+    dspark_forward_cudagraph_allow_tp: bool = False
+    """Allow the DSpark draft forward graph under tensor parallelism."""
+    dspark_fused_o_proj_quant: bool = True
+    """Use fused DSpark output-projection activation quantization."""
+    dspark_fused_shared_experts_quant: bool = True
+    """Use fused DSpark shared-expert activation quantization."""
+
     def compute_hash(self) -> str:
         """
         WARNING: Whenever a new field is added to this config,
@@ -288,10 +315,15 @@ class SpeculativeConfig:
         factors: list[Any] = []
         # Eagle3 and extract_hidden_states affect the computation graph because
         # they return intermediate hidden states in addition to the final hidden state.
-        uses_aux_hidden_states = self.method in (
-            "eagle3",
-            "extract_hidden_states",
-        ) or self.use_dflash()
+        uses_aux_hidden_states = (
+            self.method
+            in (
+                "eagle3",
+                "extract_hidden_states",
+            )
+            or self.use_dflash()
+            or self.use_dspark()
+        )
         factors.append(uses_aux_hidden_states)
 
         # The specific layers used also affect the computation graph
@@ -301,6 +333,12 @@ class SpeculativeConfig:
                 "eagle_aux_hidden_state_layer_ids",
                 None,
             )
+            if layer_ids is None:
+                layer_ids = getattr(
+                    self.draft_model_config.hf_config,
+                    "dspark_target_layer_ids",
+                    None,
+                )
             if layer_ids is not None:
                 # Convert to tuple to make it hashable
                 factors.append(tuple(layer_ids))
@@ -575,10 +613,14 @@ class SpeculativeConfig:
             self.method = "mtp"
 
         if self.model is None and self.num_speculative_tokens is not None:
-            if self.method == "mtp":
+            if self.method in ("mtp", "dspark"):
                 if self.target_model_config is None:
                     raise ValueError("target_model_config must be present for mtp")
-                if self.target_model_config.hf_text_config.model_type == "deepseek_v32":
+                if (
+                    self.method == "mtp"
+                    and self.target_model_config.hf_text_config.model_type
+                    == "deepseek_v32"
+                ):
                     # FIXME(luccafong): cudagraph with v32 MTP is not supported,
                     # remove this when the issue is fixed.
                     self.enforce_eager = True
@@ -715,7 +757,11 @@ class SpeculativeConfig:
                 )
 
                 # Automatically detect the method
-                if self.method in ("eagle", "eagle3") or self.use_dflash():
+                if (
+                    self.method in ("eagle", "eagle3")
+                    or self.use_dflash()
+                    or self.use_dspark()
+                ):
                     pass
                 # examples:
                 # yuhuili/EAGLE-LLaMA3-Instruct-8B
@@ -727,6 +773,12 @@ class SpeculativeConfig:
                     self.method = "eagle3"
                 elif "dflash" in self.draft_model_config.model.lower():
                     self.method = "dflash"
+                elif "dspark" in self.draft_model_config.model.lower() or getattr(
+                    self.draft_model_config.hf_config,
+                    "dspark_block_size",
+                    False,
+                ):
+                    self.method = "dspark"
                 elif self.draft_model_config.hf_config.model_type == "medusa":
                     self.method = "medusa"
                 elif self.draft_model_config.hf_config.model_type == "mlp_speculator":
@@ -774,7 +826,20 @@ class SpeculativeConfig:
                         self.draft_model_config.hf_config = eagle_config
                         self.update_arch_()
 
-                if self.use_dflash():
+                if self.use_dspark():
+                    self.parallel_drafting = True
+                    if self.num_speculative_tokens is None:
+                        self.num_speculative_tokens = getattr(
+                            self.draft_model_config.hf_config,
+                            "dspark_block_size",
+                            None,
+                        )
+                    self.draft_model_config.hf_config.model_type = "deepseek_v4"
+                    self.draft_model_config.hf_config.architectures = [
+                        "DeepSeekV4DSparkModel"
+                    ]
+                    self.update_arch_()
+                elif self.use_dflash():
                     self.parallel_drafting = True
 
                 if self.num_speculative_tokens is not None and hasattr(
@@ -828,7 +893,9 @@ class SpeculativeConfig:
 
                 self.draft_parallel_config = (
                     SpeculativeConfig.create_draft_parallel_config(
-                        self.target_parallel_config, self.draft_tensor_parallel_size
+                        self.target_parallel_config,
+                        self.draft_tensor_parallel_size,
+                        pipeline_parallel_size=(1 if self.use_dspark() else None),
                     )
                 )
         return self
@@ -971,13 +1038,18 @@ class SpeculativeConfig:
     def create_draft_parallel_config(
         target_parallel_config: ParallelConfig,
         speculative_draft_tensor_parallel_size: int,
+        pipeline_parallel_size: int | None = None,
     ) -> ParallelConfig:
         """Create a parallel config for use by the draft worker.
 
         This is mostly a copy of the target parallel config, except the tp_size.
         """
         draft_parallel_config = ParallelConfig(
-            pipeline_parallel_size=target_parallel_config.pipeline_parallel_size,
+            pipeline_parallel_size=(
+                target_parallel_config.pipeline_parallel_size
+                if pipeline_parallel_size is None
+                else pipeline_parallel_size
+            ),
             tensor_parallel_size=speculative_draft_tensor_parallel_size,
             distributed_executor_backend=target_parallel_config.distributed_executor_backend,
             max_parallel_loading_workers=target_parallel_config.max_parallel_loading_workers,
@@ -1111,6 +1183,9 @@ class SpeculativeConfig:
 
     def use_dflash_ddtree(self) -> bool:
         return self.method == "dflash_ddtree"
+
+    def use_dspark(self) -> bool:
+        return self.method == "dspark"
 
     def num_speculative_state_tokens(self) -> int:
         num_spec_tokens = self.num_speculative_tokens or 0

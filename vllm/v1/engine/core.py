@@ -189,6 +189,28 @@ class EngineCore:
         # schedule and execute batches, and is required by pipeline parallelism
         # to eliminate pipeline bubbles.
         self.batch_queue_size = self.model_executor.max_concurrent_batches
+        spec_config = vllm_config.speculative_config
+        self.serialize_parallel_drafting = (
+            self.batch_queue_size > 1
+            and spec_config is not None
+            and (spec_config.use_dflash() or spec_config.use_dspark())
+        )
+        if self.serialize_parallel_drafting:
+            assert spec_config is not None
+            # Parallel-drafting proposers produce the draft block for the next
+            # target iteration while sampling the current one. The PP batch
+            # queue otherwise schedules that next iteration before rejected
+            # tokens have rolled back request.num_computed_tokens. This can
+            # advertise a full draft block with only one scheduled target row,
+            # yielding negative hidden-state indices in the proposer.
+            #
+            # Keep the PP queue execution path (including its CUDA graph
+            # metadata lifecycle), but drain each speculative target result
+            # before scheduling the dependent draft block.
+            logger.info(
+                "Serializing dependent PP batches for %s speculative decoding.",
+                spec_config.method,
+            )
         self.batch_queue: (
             deque[tuple[Future[ModelRunnerOutput], SchedulerOutput, Future[Any]]] | None
         ) = None
@@ -525,13 +547,13 @@ class EngineCore:
 
         model_executed = False
         deferred_scheduler_output = None
-        if self.scheduler.has_requests():
+        if self.scheduler.has_requests() and not (
+            self.serialize_parallel_drafting and batch_queue
+        ):
             trace_schedule_t0 = time.perf_counter() if trace_log else 0.0
             scheduler_output = self.scheduler.schedule()
             if trace_log:
-                trace_schedule_ms = (
-                    time.perf_counter() - trace_schedule_t0
-                ) * 1000.0
+                trace_schedule_ms = (time.perf_counter() - trace_schedule_t0) * 1000.0
                 trace_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
             with self.log_error_detail(scheduler_output):
                 trace_execute_t0 = time.perf_counter() if trace_log else 0.0
