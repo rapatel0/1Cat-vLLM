@@ -560,8 +560,10 @@ class GGUFLinearMethod(LinearMethodBase):
         shard_id = layer.qweight.shard_id
 
         if shard_id:
-            # dequantize shard weights respectively
-            shard_id = ["q", "k", "v"] if "q" in shard_id else shard_id
+            # GGUF tensor iteration is file-ordered, which need not match a
+            # fused layer's output order. Reconstruct numeric shard order
+            # explicitly; QKV uses its named canonical order.
+            shard_id = ["q", "k", "v"] if "q" in shard_id else sorted(shard_id)
             qweight = layer.qweight
             result = []
             for idx in shard_id:

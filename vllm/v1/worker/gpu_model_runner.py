@@ -2085,7 +2085,10 @@ class GPUModelRunner(
             req_state.num_computed_tokens = num_computed_tokens
 
             if not is_last_rank:
-                if not req_data.new_token_ids:
+                if (
+                    not req_data.new_token_ids
+                    or not req_data.new_token_ids[i]
+                ):
                     # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
                     new_token_ids: list[int] = []
                 else:
@@ -2949,6 +2952,16 @@ class GPUModelRunner(
         if not spec_flattened_indices:
             return
 
+        if (
+            self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and get_pp_group().world_size > 1
+            and not get_pp_group().is_last_rank
+        ):
+            self._pp_materialize_mtp_draft_token_ids(
+                scheduled_spec_tokens, prev_positions, num_reqs
+            )
+
         if self._draft_token_ids is None:
             raise RuntimeError(
                 "Speculative decode scheduled draft input slots, but the "
@@ -3705,7 +3718,10 @@ class GPUModelRunner(
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
-            if self.speculative_config and spec_decode_common_attn_metadata is None:
+            if (
+                hasattr(self, "drafter")
+                and spec_decode_common_attn_metadata is None
+            ):
                 if isinstance(
                     self.drafter,
                     (
@@ -3720,15 +3736,15 @@ class GPUModelRunner(
                 else:
                     spec_decode_common_attn_metadata = cm
             # Capture per-group block tables for multi-group proposers.
-            if self.speculative_config and isinstance(self.drafter, Step3p5MTPProposer):
+            if isinstance(getattr(self, "drafter", None), Step3p5MTPProposer):
                 self.drafter.set_per_group_attn_metadata(
                     kv_cache_gid, cm.block_table_tensor, cm.slot_mapping
                 )
-            elif self.speculative_config and isinstance(self.drafter, Gemma4Proposer):
+            elif isinstance(getattr(self, "drafter", None), Gemma4Proposer):
                 self.drafter.set_per_group_block_table(
                     kv_cache_gid, cm.block_table_tensor
                 )
-            elif self.speculative_config and isinstance(self.drafter, DFlashProposer):
+            elif isinstance(getattr(self, "drafter", None), DFlashProposer):
                 dflash_gids = set(self.drafter.draft_layer_to_kv_cache_gid.values())
                 if not dflash_gids and self.drafter.kv_cache_gid >= 0:
                     dflash_gids.add(self.drafter.kv_cache_gid)
@@ -6328,9 +6344,13 @@ class GPUModelRunner(
             # PP outputs have been broadcasted to all ranks at logits computation.
             # Therefore, here is no need to send sampled token ids again in this case.
             if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
-                self._pp_broadcast_prev_sampled_token_ids(
-                    sampler_output.sampled_token_ids
-                )
+                sampled_token_ids = sampler_output.sampled_token_ids
+                # MTP verification returns [num_reqs, num_spec_tokens + 1].
+                # Earlier PP stages need only the committed target token here;
+                # scheduled draft tokens are materialized separately below.
+                if self.speculative_config and self.speculative_config.method == "mtp":
+                    sampled_token_ids = sampled_token_ids[:, :1].contiguous()
+                self._pp_broadcast_prev_sampled_token_ids(sampled_token_ids)
 
         self._draft_token_ids = None
         self._draft_probs = None
@@ -6639,6 +6659,50 @@ class GPUModelRunner(
             torch.distributed.broadcast(
                 sampled_token_ids, src=pp.rank, group=pp.device_group
             )
+
+    def _pp_materialize_mtp_draft_token_ids(
+        self,
+        scheduled_spec_tokens: Mapping[str, Sequence[int]],
+        prev_positions: np.ndarray,
+        num_reqs: int,
+    ) -> None:
+        """Materialize scheduler-provided MTP tokens on a non-final PP stage.
+
+        Native MTP executes only on the final pipeline stage, but every stage
+        must verify the scheduler's draft slots on the next iteration. The
+        scheduler already broadcasts those exact token IDs to all workers;
+        rebuilding the small local tensor here avoids introducing a collective
+        into the asynchronous PP execution path.
+        """
+        assert self.num_spec_tokens is not None
+        max_prev_index = max(
+            (int(prev_positions[index]) for index in range(num_reqs)), default=-1
+        )
+        if max_prev_index < 0:
+            return
+
+        draft_token_ids = torch.zeros(
+            (max_prev_index + 1, self.num_spec_tokens),
+            dtype=torch.int64,
+            pin_memory=self.pin_memory,
+        )
+        for current_index in range(num_reqs):
+            previous_index = int(prev_positions[current_index])
+            if previous_index < 0:
+                continue
+            token_ids = scheduled_spec_tokens.get(
+                self.input_batch.req_ids[current_index], ()
+            )
+            if len(token_ids) > self.num_spec_tokens:
+                raise RuntimeError(
+                    "Scheduler supplied more native-MTP draft tokens than "
+                    f"configured: {len(token_ids)} > {self.num_spec_tokens}."
+                )
+            if token_ids:
+                draft_token_ids[previous_index, : len(token_ids)] = torch.tensor(
+                    token_ids, dtype=torch.int64
+                )
+        self._draft_token_ids = draft_token_ids.to(self.device, non_blocking=True)
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
@@ -8061,7 +8125,7 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
+            if get_pp_group().is_last_rank and self.speculative_config and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
@@ -8133,12 +8197,18 @@ class GPUModelRunner(
         logit_indices_device = torch.from_numpy(logit_indices).to(
             self.device, non_blocking=True
         )
+        if isinstance(hidden_states, IntermediateTensors):
+            hidden_shape = tuple(hidden_states["hidden_states"].shape)
+            last_hidden_states = hidden_states
+        else:
+            hidden_shape = tuple(hidden_states.shape)
+            last_hidden_states = hidden_states[logit_indices_device]
         _sm70_profile_trace(
             "_dummy_run return hidden_shape=%s sampled_count=%s",
-            tuple(hidden_states.shape),
+            hidden_shape,
             len(logit_indices),
         )
-        return hidden_states, hidden_states[logit_indices_device]
+        return hidden_states, last_hidden_states
 
     @torch.inference_mode()
     def _dummy_sampler_run(
@@ -8408,10 +8478,20 @@ class GPUModelRunner(
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
         )
+        hidden_shape = (
+            tuple(hidden_states["hidden_states"].shape)
+            if isinstance(hidden_states, IntermediateTensors)
+            else tuple(hidden_states.shape)
+        )
+        last_hidden_shape = (
+            tuple(last_hidden_states["hidden_states"].shape)
+            if isinstance(last_hidden_states, IntermediateTensors)
+            else tuple(last_hidden_states.shape)
+        )
         _sm70_profile_trace(
             "profile_run dummy_run exit hidden_shape=%s last_hidden_shape=%s",
-            tuple(hidden_states.shape),
-            tuple(last_hidden_states.shape),
+            hidden_shape,
+            last_hidden_shape,
         )
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
@@ -9024,7 +9104,7 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
+        if hasattr(self, "drafter") and self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
@@ -9077,7 +9157,7 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
+        if hasattr(self, "drafter") and self.speculative_config and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_extract_hidden_states()
         ):

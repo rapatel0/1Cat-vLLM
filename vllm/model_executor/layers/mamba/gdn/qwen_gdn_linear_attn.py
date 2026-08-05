@@ -255,6 +255,32 @@ def _sm70_flashqla_decode_warmup_enabled() -> bool:
     return raw.strip().lower() not in ("0", "false", "no", "off", "")
 
 
+def _expand_noninterleaved_qwen_gqa_heads(
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand Qwen3.5 q/k heads to its tiled value-head ordering.
+
+    Qwen3.5's non-interleaved checkpoint maps value head ``h`` to q/k head
+    ``h % num_q_heads``. This differs from the contiguous grouped-GQA layout
+    used by FLA's generic kernels. Materializing the tiled q/k tensors keeps
+    the recurrent kernels generic while preserving the GGUF reference order.
+    """
+    if query.shape[-2] == value.shape[-2]:
+        return query, key
+    if query.shape[-2] != key.shape[-2] or value.shape[-2] % query.shape[-2]:
+        raise ValueError(
+            "Qwen3.5 GDN value-head count must be a multiple of its "
+            "query/key-head count."
+        )
+    repeat_factor = value.shape[-2] // query.shape[-2]
+    return (
+        torch.cat([query] * repeat_factor, dim=-2),
+        torch.cat([key] * repeat_factor, dim=-2),
+    )
+
+
 def _sm70_mixed_qkv_decode_layout(mixed_qkv: torch.Tensor) -> str:
     if mixed_qkv.dim() != 2 or mixed_qkv.stride(1) != 1:
         return "unsupported"
@@ -2580,6 +2606,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         key = k_contig.view(1, seq_len, -1, self.head_k_dim)
         value = v_contig.view(1, seq_len, -1, self.head_v_dim)
 
+        # Qwen3.5 uses tiled q/k GQA; Qwen3-Next already has the layout FLA
+        # expects and must retain its native head count.
+        if not self.gqa_interleaved_layout and query.shape[2] != value.shape[2]:
+            query, key = _expand_noninterleaved_qwen_gqa_heads(query, key, value)
+
         return query, key, value
 
     def _forward_ddtree_gdn_pure_spec(
@@ -2640,6 +2671,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 num_accepted_tokens=spec_state_slot_selectors,
                 ddtree_parent_ids=ddtree_parent_ids,
                 use_qk_l2norm_in_kernel=True,
+                gqa_tiled=not self.gqa_interleaved_layout,
             )
             _sm70_gdn_prefill_profile_end(
                 layer_name,
@@ -4453,6 +4485,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                         :num_non_spec_tokens
                     ],
                     use_qk_l2norm_in_kernel=True,
+                    gqa_tiled=not self.gqa_interleaved_layout,
                 )
             )
             if compare_mixed_qkv:
@@ -4568,6 +4601,14 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     apply_l2norm=True,
                     output_g_exp=prefill_gate_is_exp,
                 )
+                if not self.gqa_interleaved_layout:
+                    query_non_spec, key_non_spec = (
+                        _expand_noninterleaved_qwen_gqa_heads(
+                            query_non_spec,
+                            key_non_spec,
+                            value_non_spec,
+                        )
+                    )
                 query_non_spec = query_non_spec.unsqueeze(0)
                 key_non_spec = key_non_spec.unsqueeze(0)
                 value_non_spec = value_non_spec.unsqueeze(0)
@@ -5138,6 +5179,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             cu_seqlens=cu_seqlens,
             ssm_state_indices=state_indices,  # type: ignore[arg-type]
             use_qk_l2norm_in_kernel=True,
+            gqa_tiled=not self.gqa_interleaved_layout,
         )
         _sm70_gdn_graph_buffer_copy("recurrent_out", layer_name, out_buf, "core")
         _sm70_gdn_graph_buffer_copy_state_slice(
@@ -5198,6 +5240,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 cu_seqlens=local_cu_seqlens,
                 ssm_state_indices=local_indices,
                 use_qk_l2norm_in_kernel=True,
+                gqa_tiled=not self.gqa_interleaved_layout,
             )
             ref_out, ref_state = fused_sigmoid_gating_delta_rule_update_mixed_qkv(
                 A_log=self.A_log,
@@ -5214,6 +5257,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 cu_seqlens=local_cu_seqlens,
                 ssm_state_indices=local_indices,
                 use_qk_l2norm_in_kernel=True,
+                gqa_tiled=not self.gqa_interleaved_layout,
             )
             _sm70_save_gdn_packed_compare_report(
                 report_path,

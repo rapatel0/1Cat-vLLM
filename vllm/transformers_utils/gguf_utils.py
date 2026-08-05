@@ -19,6 +19,37 @@ from .repo_utils import list_filtered_repo_files
 logger = init_logger(__name__)
 
 
+# Prism's Bonsai Q2_0 is a private GGUF extension. Its on-disk type value is
+# stable, but older gguf-py releases do not know the enum member and reject a
+# model before vLLM's Q2_0 loader can dispatch it.
+BONSAI_Q2_0_TYPE = 42
+BONSAI_Q2_0_BLOCK_SIZE = 128
+BONSAI_Q2_0_TYPE_SIZE = 34
+
+
+def ensure_bonsai_q2_0_gguf_compat() -> GGMLQuantizationType:
+    """Register Prism's Q2_0 GGUF extension with older gguf-py releases."""
+    quant_type = GGMLQuantizationType
+    q2_0 = quant_type._value2member_map_.get(BONSAI_Q2_0_TYPE)
+    if q2_0 is None:
+        q2_0 = int.__new__(quant_type, BONSAI_Q2_0_TYPE)
+        q2_0._name_ = "Q2_0"
+        q2_0._value_ = BONSAI_Q2_0_TYPE
+        quant_type._value2member_map_[BONSAI_Q2_0_TYPE] = q2_0
+        quant_type._member_map_["Q2_0"] = q2_0
+        quant_type._member_names_.append("Q2_0")
+        type.__setattr__(quant_type, "Q2_0", q2_0)
+
+    gguf.GGML_QUANT_SIZES.setdefault(
+        q2_0,
+        (BONSAI_Q2_0_BLOCK_SIZE, BONSAI_Q2_0_TYPE_SIZE),
+    )
+    return q2_0
+
+
+ensure_bonsai_q2_0_gguf_compat()
+
+
 @cache
 def check_gguf_file(model: str | PathLike) -> bool:
     """Check if the file is a GGUF model."""
@@ -291,6 +322,15 @@ def maybe_patch_hf_config_from_gguf(
                 architectures=["Gemma3ForConditionalGeneration"],
             )
             hf_config = new_hf_config
+    elif hf_config.model_type == "qwen3_5":
+        # Text-only Qwen3.5 GGUFs reuse the public VLM config but carry no
+        # projector tensors. Select the causal backbone so the loader neither
+        # constructs a random vision tower nor requires its absent weights.
+        hf_config.architectures = ["Qwen3_5ForCausalLM"]
+        logger.info_once(
+            "Detected text-only Qwen3.5 GGUF without mmproj; "
+            "selecting Qwen3_5ForCausalLM."
+        )
 
     return hf_config
 

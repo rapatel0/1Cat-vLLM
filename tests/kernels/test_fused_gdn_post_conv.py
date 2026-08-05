@@ -13,6 +13,25 @@ import torch.nn.functional as F
 from vllm.model_executor.layers.fla.ops.fused_gdn_prefill_post_conv import (
     fused_post_conv_prep,
 )
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    _expand_noninterleaved_qwen_gqa_heads,
+)
+
+
+def test_qwen35_noninterleaved_gqa_expands_in_tiled_head_order():
+    """Qwen3.5 maps value head h to q/k head h % num_qk_heads."""
+    query = torch.arange(2 * 16 * 2, dtype=torch.float32).view(2, 16, 2)
+    key = query + 1000
+    value = torch.empty(2, 48, 2)
+
+    expanded_query, expanded_key = _expand_noninterleaved_qwen_gqa_heads(
+        query, key, value
+    )
+
+    expected_query = torch.cat([query, query, query], dim=1)
+    expected_key = torch.cat([key, key, key], dim=1)
+    assert torch.equal(expanded_query, expected_query)
+    assert torch.equal(expanded_key, expected_key)
 
 
 def reference_post_conv(

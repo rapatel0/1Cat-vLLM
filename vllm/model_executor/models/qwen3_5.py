@@ -32,13 +32,13 @@ from torch import nn
 
 import vllm.envs as envs
 from vllm.compilation.decorators import support_torch_compile
-from vllm.config import VllmConfig
+from vllm.config import CacheConfig, ModelConfig, VllmConfig
 from vllm.distributed import (
     get_pp_group,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import (
-    GemmaRMSNorm as Qwen3_5RMSNorm,
+    RMSNorm as Qwen3_5RMSNorm,
 )
 from vllm.model_executor.layers.linear import MergedColumnParallelLinear
 from vllm.model_executor.layers.logits_processor import LogitsProcessor
@@ -323,6 +323,33 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         self._output_projection(core_attn_out, z, output, num_tokens)
 
 
+class Qwen3_5Attention(Qwen3NextAttention):
+    """Qwen3.5 full attention with ordinary RMS normalization.
+
+    Qwen3Next uses Gemma's ``1 + weight`` variant. Qwen3.5 GGUF checkpoints
+    store the already-effective RMS weights, so use the standard operation for
+    Q/K normalization instead.
+    """
+
+    def __init__(
+        self,
+        config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig,
+        model_config: ModelConfig | None = None,
+        cache_config: CacheConfig | None = None,
+        quant_config: QuantizationConfig | None = None,
+        prefix: str = "",
+    ) -> None:
+        super().__init__(
+            config,
+            model_config=model_config,
+            cache_config=cache_config,
+            quant_config=quant_config,
+            prefix=prefix,
+        )
+        self.q_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+        self.k_norm = Qwen3_5RMSNorm(self.head_dim, eps=config.rms_norm_eps)
+
+
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
     def __init__(
         self,
@@ -348,7 +375,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                 gqa_interleaved_layout=False,
             )
         elif self.layer_type == "full_attention":
-            self.self_attn = Qwen3NextAttention(
+            self.self_attn = Qwen3_5Attention(
                 config,
                 model_config=model_config,
                 cache_config=cache_config,

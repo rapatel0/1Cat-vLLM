@@ -70,7 +70,10 @@ def _select_fused_sigmoid_schedule(
     if _SM70_FUSED_SIGMOID_BV_OVERRIDE is not None:
         BV = min(v_pow2, triton.next_power_of_2(_SM70_FUSED_SIGMOID_BV_OVERRIDE))
     else:
-        BV = min(v_pow2, 32)
+        # The Bonsai Qwen3.5 decode shape is V=128.  The V100 sweep shows a
+        # 64-wide value tile wins there, while preserving the established
+        # 32-wide tile for smaller value heads.
+        BV = min(v_pow2, 64 if V >= 128 else 32)
     num_warps = (
         _round_num_warps(_SM70_FUSED_SIGMOID_WARPS_OVERRIDE)
         if _SM70_FUSED_SIGMOID_WARPS_OVERRIDE is not None
@@ -141,10 +144,11 @@ def fused_sigmoid_gating_delta_rule_update_kernel(
     IS_DDTREE: tl.constexpr,
     IS_KDA: tl.constexpr,
     MIXED_QKV: tl.constexpr,
+    GQA_TILED: tl.constexpr,
 ):
     i_k, i_v, i_nh = tl.program_id(0), tl.program_id(1), tl.program_id(2)
     i_n, i_hv = i_nh // HV, i_nh % HV
-    i_h = i_hv // (HV // H)
+    i_h = i_hv % H if GQA_TILED else i_hv // (HV // H)
     if IS_VARLEN:
         bos, eos = (
             tl.load(cu_seqlens + i_n).to(tl.int64),
@@ -409,6 +413,7 @@ def fused_sigmoid_gating_delta_rule_update(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=is_kda,
         MIXED_QKV=False,
+        GQA_TILED=False,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -436,6 +441,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
     num_accepted_tokens: torch.Tensor | None = None,
     ddtree_parent_ids: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    gqa_tiled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Fused update that reads q/k/v directly from a packed mixed-qkv row."""
     if mixed_qkv.ndim != 2:
@@ -540,6 +546,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=False,
         MIXED_QKV=True,
+        GQA_TILED=gqa_tiled,
         num_warps=num_warps,
         num_stages=num_stages,
     )
@@ -564,6 +571,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
     cu_seqlens: torch.Tensor | None = None,
     ssm_state_indices: torch.Tensor | None = None,
     use_qk_l2norm_in_kernel: bool = False,
+    gqa_tiled: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor]:
     """Mixed-QKV fused update that writes into a caller-provided decode output."""
     if mixed_qkv.ndim != 2:
@@ -657,6 +665,7 @@ def fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
         USE_QK_L2NORM_IN_KERNEL=use_qk_l2norm_in_kernel,
         IS_KDA=False,
         MIXED_QKV=True,
+        GQA_TILED=gqa_tiled,
         num_warps=num_warps,
         num_stages=num_stages,
     )

@@ -105,6 +105,106 @@ class GGUFModelLoader(BaseModelLoader):
             logger.info("Discovered %d GGUF shard files", len(files))
         return files if files else [model_path]
 
+    @staticmethod
+    def _get_qwen35_text_only_weights_map(
+        num_hidden_layers: int,
+        layer_types: list[str],
+        hf_prefix: str,
+    ) -> dict[str, str]:
+        """Map a text-only Qwen3.5 GGUF using its public VLM config.
+
+        Qwen3.5 GGUFs are commonly paired with the public multimodal config,
+        while the GGUF itself contains no projector. Older Transformers
+        releases do not provide a Qwen3.5 AutoModel, so a synthetic mapping is
+        more reliable than constructing a dummy Transformers model.
+        """
+        weights_map = {
+            "token_embd.weight": f"{hf_prefix}.embed_tokens.weight",
+            "output_norm.weight": f"{hf_prefix}.norm.weight",
+            "output.weight": "lm_head.weight",
+        }
+
+        for idx in range(num_hidden_layers):
+            layer_prefix = f"{hf_prefix}.layers.{idx}"
+            gguf_prefix = f"blk.{idx}"
+            weights_map.update(
+                {
+                    f"{gguf_prefix}.attn_norm.weight": (
+                        f"{layer_prefix}.input_layernorm.weight"
+                    ),
+                    f"{gguf_prefix}.post_attention_norm.weight": (
+                        f"{layer_prefix}.post_attention_layernorm.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_gate.weight": (
+                        f"{layer_prefix}.mlp.gate_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_up.weight": (
+                        f"{layer_prefix}.mlp.up_proj.weight"
+                    ),
+                    f"{gguf_prefix}.ffn_down.weight": (
+                        f"{layer_prefix}.mlp.down_proj.weight"
+                    ),
+                }
+            )
+
+            if layer_types[idx] == "linear_attention":
+                weights_map.update(
+                    {
+                        f"{gguf_prefix}.attn_qkv.weight": (
+                            f"{layer_prefix}.linear_attn.in_proj_qkv.weight"
+                        ),
+                        f"{gguf_prefix}.attn_gate.weight": (
+                            f"{layer_prefix}.linear_attn.in_proj_z.weight"
+                        ),
+                        f"{gguf_prefix}.ssm_alpha.weight": (
+                            f"{layer_prefix}.linear_attn.in_proj_a.weight"
+                        ),
+                        f"{gguf_prefix}.ssm_beta.weight": (
+                            f"{layer_prefix}.linear_attn.in_proj_b.weight"
+                        ),
+                        f"{gguf_prefix}.ssm_conv1d.weight": (
+                            f"{layer_prefix}.linear_attn.conv1d.weight"
+                        ),
+                        f"{gguf_prefix}.ssm_dt.bias": (
+                            f"{layer_prefix}.linear_attn.dt_bias"
+                        ),
+                        f"{gguf_prefix}.ssm_a": (
+                            f"{layer_prefix}.linear_attn.A_log"
+                        ),
+                        f"{gguf_prefix}.ssm_norm.weight": (
+                            f"{layer_prefix}.linear_attn.norm.weight"
+                        ),
+                        f"{gguf_prefix}.ssm_out.weight": (
+                            f"{layer_prefix}.linear_attn.out_proj.weight"
+                        ),
+                    }
+                )
+            else:
+                weights_map.update(
+                    {
+                        f"{gguf_prefix}.attn_q.weight": (
+                            f"{layer_prefix}.self_attn.q_proj.weight"
+                        ),
+                        f"{gguf_prefix}.attn_k.weight": (
+                            f"{layer_prefix}.self_attn.k_proj.weight"
+                        ),
+                        f"{gguf_prefix}.attn_v.weight": (
+                            f"{layer_prefix}.self_attn.v_proj.weight"
+                        ),
+                        f"{gguf_prefix}.attn_output.weight": (
+                            f"{layer_prefix}.self_attn.o_proj.weight"
+                        ),
+                        f"{gguf_prefix}.attn_q_norm.weight": (
+                            f"{layer_prefix}.self_attn.q_norm.weight"
+                        ),
+                        f"{gguf_prefix}.attn_k_norm.weight": (
+                            f"{layer_prefix}.self_attn.k_norm.weight"
+                        ),
+                    }
+                )
+
+        return weights_map
+
     def _get_gguf_weights_map(self, model_config: ModelConfig):
         """
         GGUF uses this naming convention for their tensors from HF checkpoint:
@@ -136,9 +236,9 @@ class GGUFModelLoader(BaseModelLoader):
         # Some model families publish text-only GGUFs while their HuggingFace
         # config remains multimodal. Do not require an absent mmproj file or
         # its visual tensors in that case.
-        is_text_only_multimodal = is_multimodal and (
-            detect_gguf_multimodal(model_config.model) is None
-        )
+        mmproj_path = detect_gguf_multimodal(model_config.model)
+        is_text_only_multimodal = is_multimodal and mmproj_path is None
+        is_text_only_qwen35 = model_type == "qwen3_5" and mmproj_path is None
         gguf_to_hf_name_map = {}
         sideload_params: list[re.Pattern] = []
         # hack: ggufs have a different name than transformers
@@ -252,6 +352,13 @@ class GGUFModelLoader(BaseModelLoader):
             vision_name_map = gguf.get_tensor_name_map(mm_proj_arch, vision_num_layers)
         else:
             vision_name_map = None
+
+        if model_type == "qwen35" and is_text_only_qwen35:
+            return self._get_qwen35_text_only_weights_map(
+                text_num_layers,
+                text_config.layer_types,
+                "model" if is_qwen35_causal else "model.language_model",
+            )
 
         # Create dummy model to extract parameter names
         # For multimodal: use AutoModelForImageTextToText to get
