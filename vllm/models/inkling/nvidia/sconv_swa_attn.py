@@ -193,8 +193,19 @@ class InklingConvState(nn.Module, AttentionLayerBase):
         )
         vllm_config = get_current_vllm_config()
         self._dtype = vllm_config.model_config.dtype
-        assert self._dtype == torch.bfloat16, (
-            f"sconv SWA cache supports bfloat16 only, got {self._dtype}"
+        # Upstream pins this to bfloat16, which makes the model unloadable on
+        # Volta -- there is no BF16 arithmetic below capability 8.0, so vLLM
+        # serves Inkling as float16.
+        #
+        # The restriction is conservatism rather than a kernel requirement:
+        # self._dtype is only used to allocate the conv-state cache, and the
+        # sconv kernels are dtype-generic (they load with .to(tl.float32),
+        # accumulate in fp32 and store via out_ptr.dtype.element_ty). Neither
+        # ops/sconv.py, short_conv.py nor ops/qkvr_prep.py names a dtype.
+        # Accumulating in fp32 also keeps the conv numerically well-behaved in
+        # the narrower format.
+        assert self._dtype in (torch.bfloat16, torch.float16), (
+            f"sconv SWA cache supports bfloat16 and float16, got {self._dtype}"
         )
         # Register in the forward context so the runner enumerates this owner as
         # an attention-like layer (get_kv_cache_spec / get_attn_backend).
