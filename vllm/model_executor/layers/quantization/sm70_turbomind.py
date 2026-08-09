@@ -93,6 +93,23 @@ def unpack_compressed_weight(weight_packed: torch.Tensor) -> torch.Tensor:
     return weight.t().contiguous()
 
 
+def unpack_compressed_zeros(zeros_packed: torch.Tensor) -> torch.Tensor:
+    """Unpack compressed-tensors packed int4 zero points into FP16 values.
+
+    Nibble order matches `unpack_compressed_weight`, and the trailing packed
+    dim expands to the full group-count dimension so the result lines up
+    elementwise with the corresponding scale tensor.
+
+    Unlike `unpack_gptq_zeros` there is deliberately **no +1 offset**: GPTQ
+    stores zero points biased by one, compressed-tensors stores them directly.
+    Applying the GPTQ bias here would shift every dequantized weight by one
+    quantization step -- a silent accuracy loss, not a load failure.
+    """
+    xs = _get_u4_slices(zeros_packed, torch.uint8)
+    zeros = torch.stack(xs, dim=-1).reshape(*zeros_packed.shape[:-1], -1)
+    return zeros.to(torch.float16).contiguous()
+
+
 def unpack_compressed_zeros(weight_zero_point: torch.Tensor) -> torch.Tensor:
     xs = _get_u4_slices(weight_zero_point, torch.uint8)
     zeros = torch.stack(xs, dim=1).reshape(-1, weight_zero_point.size(-1))

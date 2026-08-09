@@ -1,12 +1,17 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
-"""SM70 TurboMind route for symmetric compressed-tensors W4A16 MoE.
+"""SM70 TurboMind route for groupwise compressed-tensors W4A16 MoE.
 
 The Laguna checkpoint stores packed uint4 values in compressed-tensors layout.
 The SM70 TurboMind grouped-MoE runner accepts the same numerical format once
 each expert has been converted by ``uint4_sm70_prepare``.  This keeps the
 checkpoint loader and routing behaviour shared with the established Marlin
 implementation while using the TurboMind execution path after loading.
+
+Both symmetric and asymmetric checkpoints are supported. TurboMind
+dequantizes as ``(q - zero) * scale`` over raw uint4 values, so a symmetric
+checkpoint is just the special case ``zero == 8``; asymmetric checkpoints
+(Inkling-Small) carry real per-group zero points packed alongside the weights.
 """
 
 import os
@@ -61,11 +66,12 @@ def _active_group_experiment_enabled() -> bool:
 
 
 class CompressedTensorsWNA16TurboMindMoEMethod(CompressedTensorsWNA16MarlinMoEMethod):
-    """TurboMind MoE executor for symmetric groupwise compressed W4 weights.
+    """TurboMind MoE executor for groupwise compressed W4 weights.
 
     Weight construction intentionally uses the Marlin compressed-tensors
-    loader layout.  It is a faithful transpose of the checkpoint layout and
-    avoids treating symmetric compressed-tensors values as AWQ zero-points.
+    loader layout.  It is a faithful transpose of the checkpoint layout, and
+    keeps compressed-tensors zero points in their own convention rather than
+    reinterpreting them as AWQ zero-points (which carry a +1 bias).
     """
 
     def __init__(
@@ -78,13 +84,12 @@ class CompressedTensorsWNA16TurboMindMoEMethod(CompressedTensorsWNA16MarlinMoEMe
         if (
             weight_quant.num_bits != 4
             or weight_quant.group_size not in sm70_tm.COMPRESSED_UINT4_GROUP_SIZES
-            or not weight_quant.symmetric
             or weight_quant.actorder
             or moe.has_bias
         ):
             raise ValueError(
-                "SM70 TurboMind compressed-tensors MoE requires symmetric "
-                "groupwise W4 weights without actorder or bias."
+                "SM70 TurboMind compressed-tensors MoE requires groupwise W4 "
+                "weights without actorder or bias."
             )
         super().__init__(weight_quant, input_quant, moe, layer_name)
         # The inherited weight loader has a Marlin and a FlashInfer layout.
@@ -229,12 +234,30 @@ class CompressedTensorsWNA16TurboMindMoEMethod(CompressedTensorsWNA16MarlinMoEMe
         w2_tm_scales: list[torch.Tensor] = []
         w2_meta: list[torch.Tensor] = []
 
+        # TurboMind dequantizes as (q - zero) * scale over raw uint4 values, so
+        # a symmetric int4 checkpoint has zero == 8 (the midpoint of [0, 15]).
+        # Asymmetric checkpoints carry real per-group zero points, packed the
+        # same way as the weights.
+        symmetric = bool(self.weight_quant.symmetric)
+
+        def _zeros_for(expert_id: int, packed_zp_name: str, scales: torch.Tensor):
+            if symmetric:
+                return sm70_tm.symmetric_int4_zeros_like(scales)
+            zeros = sm70_tm.unpack_compressed_zeros(
+                getattr(layer, packed_zp_name)[expert_id]
+            )
+            assert zeros.shape == scales.shape, (
+                f"{packed_zp_name} unpacked to {tuple(zeros.shape)}, expected "
+                f"{tuple(scales.shape)} to match the scale grid"
+            )
+            return zeros.contiguous()
+
         for expert_id in range(num_experts):
             w13_scales = layer.w13_weight_scale[expert_id].to(torch.float16)
             r13 = sm70_ops.uint4_sm70_prepare(
                 sm70_tm.unpack_gptq_weight(layer.w13_weight_packed[expert_id]),
                 w13_scales.contiguous(),
-                sm70_tm.symmetric_int4_zeros_like(w13_scales),
+                _zeros_for(expert_id, "w13_weight_zero_point", w13_scales),
                 self.group_size,
                 w13_interleaved,
             )
@@ -246,7 +269,7 @@ class CompressedTensorsWNA16TurboMindMoEMethod(CompressedTensorsWNA16MarlinMoEMe
             r2 = sm70_ops.uint4_sm70_prepare(
                 sm70_tm.unpack_gptq_weight(layer.w2_weight_packed[expert_id]),
                 w2_scales.contiguous(),
-                sm70_tm.symmetric_int4_zeros_like(w2_scales),
+                _zeros_for(expert_id, "w2_weight_zero_point", w2_scales),
                 self.group_size,
                 False,
             )
