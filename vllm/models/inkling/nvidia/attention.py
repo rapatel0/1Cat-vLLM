@@ -13,6 +13,7 @@ from vllm.distributed import get_tensor_model_parallel_world_size
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
+    ColumnParallelLinear,
     MergedColumnParallelLinear,
     RowParallelLinear,
 )
@@ -107,17 +108,41 @@ class InklingAttention(nn.Module, AttentionLayerBase):
         # tp_size heads so each rank gets at least one (GQA replication).
         kv_total_for_sizing = max(self.num_total_kv_heads, tp_size)
 
-        self.qkvr = MergedColumnParallelLinear(
+        # Upstream fuses q/k/v/r into one MergedColumnParallelLinear. That
+        # cannot represent the served checkpoint: it quantizes wq_du/wk_dv/
+        # wv_dv to INT4 on 40 of 42 layers but keeps wr_du in BF16 on *all*
+        # 42 (it is in the quantization ignore list), and one linear carries a
+        # single quant method for all its shards.
+        #
+        # So split off the relative branch, as toncao/vllm's
+        # inkling-w4a16-mixed-precision does. q/k/v stay fused -- they always
+        # share a precision -- and wr_du becomes its own unquantized
+        # projection. forward() re-concatenates them into the [q, k, v, r]
+        # layout fused_qkvr_prep expects; per-rank that ordering is preserved
+        # because each shard is sharded along the same output axis.
+        self.qkv = MergedColumnParallelLinear(
             input_size=config.hidden_size,
             output_sizes=[
                 head_dim * self.num_total_heads,
                 head_dim * kv_total_for_sizing,
                 head_dim * kv_total_for_sizing,
-                self.d_rel * self.num_total_heads,
             ],
             bias=config.q_bias,
             quant_config=quant_config,
-            prefix=f"{prefix}.qkvr",
+            prefix=f"{prefix}.qkv",
+        )
+        # quant_config is deliberately omitted rather than relying on the
+        # checkpoint's ignore list matching: the ignore entries are spelled in
+        # checkpoint naming (model.llm.layers.N.attn.wr_du) while this layer's
+        # runtime prefix is model.layers.N.attn.wr_du. The checkpoint carries
+        # 42 plain wr_du weights and zero quantized ones, so unquantized is
+        # not a guess.
+        self.wr_du = ColumnParallelLinear(
+            input_size=config.hidden_size,
+            output_size=self.d_rel * self.num_total_heads,
+            bias=config.q_bias,
+            quant_config=None,
+            prefix=f"{prefix}.wr_du",
         )
         self.wo_ud = RowParallelLinear(
             input_size=head_dim * self.num_total_heads,
@@ -232,7 +257,12 @@ class InklingAttention(nn.Module, AttentionLayerBase):
         log_scaling: torch.Tensor | None = None,
     ) -> torch.Tensor:
         num_tokens = hidden_states.shape[0]
-        qkvr, _ = self.qkvr(hidden_states)
+        # Rebuild the fused [q, k, v, r] activation the prep kernel consumes.
+        # Both projections shard along the output axis, so each rank's local
+        # concatenation is the same ordering the fused linear would produce.
+        qkv, _ = self.qkv(hidden_states)
+        r, _ = self.wr_du(hidden_states)
+        qkvr = torch.cat((qkv, r), dim=-1)
 
         attn_metadata = get_forward_context().attn_metadata
         attn_output = torch.empty(

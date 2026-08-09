@@ -376,10 +376,12 @@ class _TmlForCausalLMBase(nn.Module, SupportsPP, SupportsLoRA):
             ".w2_md": ".down_proj",
         },
         orig_to_new_stacked={
-            ".attn.wq_du.": (".attn.qkvr.", 0),
-            ".attn.wk_dv.": (".attn.qkvr.", 1),
-            ".attn.wv_dv.": (".attn.qkvr.", 2),
-            ".attn.wr_du.": (".attn.qkvr.", 3),
+            # Only q/k/v are stacked. wr_du is BF16 on every layer while
+            # q/k/v are INT4 on 40 of 42, so it is its own unquantized
+            # projection -- see InklingAttention.__init__.
+            ".attn.wq_du.": (".attn.qkv.", 0),
+            ".attn.wk_dv.": (".attn.qkv.", 1),
+            ".attn.wv_dv.": (".attn.qkv.", 2),
         },
         orig_to_new_prefix={
             "model.llm.layers.": "model.layers.",
@@ -408,7 +410,7 @@ class _TmlForCausalLMBase(nn.Module, SupportsPP, SupportsLoRA):
         },
     )
     packed_modules_mapping = {
-        "qkvr": ["wq_du", "wk_dv", "wv_dv", "wr_du"],
+        "qkv": ["wq_du", "wk_dv", "wv_dv"],
         "w13": ["w1", "w3"],
     }
     embedding_modules = {
@@ -663,7 +665,7 @@ def _load_inkling_weights(
             # Replicate K/V conv-free GQA heads when tp_size > num_kv_heads.
             if (
                 shard_id in (1, 2)
-                and name.endswith(".attn.qkvr.weight")
+                and name.endswith(".attn.qkv.weight")
                 and weight.shape[0] > 0
             ):
                 lid = _layer_id(name)

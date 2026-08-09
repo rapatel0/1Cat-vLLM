@@ -42,14 +42,18 @@ from .layernorm import InklingRMSNorm
 from .model import InklingDecoderLayer, InklingReplicatedEmbedding
 from .ops.norm import embed_dual_rmsnorm_cat, embed_rmsnorm
 
-# Checkpoint attention projections (wq_du/wk_dv/wv_dv/wr_du) -> fused qkvr.
-# Mirrors the backbone's hf_to_vllm_mapper.orig_to_new_stacked; kept as a
-# local (pname, wname, shard) list since the MTP loader remaps by hand.
+# Checkpoint attention projections -> module params. Mirrors the backbone's
+# hf_to_vllm_mapper.orig_to_new_stacked; kept as a local (pname, wname, shard)
+# list since the MTP loader remaps by hand.
+#
+# The MTP block reuses InklingDecoderLayer, so it inherits the q/k/v vs wr_du
+# split: wr_du stays BF16 while q/k/v are INT4, which one fused linear cannot
+# express. wr_du therefore maps to itself with no shard id.
 _ATTENTION_PARAMS_MAPPING = [
-    ("qkvr", "wq_du", 0),
-    ("qkvr", "wk_dv", 1),
-    ("qkvr", "wv_dv", 2),
-    ("qkvr", "wr_du", 3),
+    ("qkv", "wq_du", 0),
+    ("qkv", "wk_dv", 1),
+    ("qkv", "wv_dv", 2),
+    ("wr_du", "wr_du", None),
 ]
 
 
@@ -401,7 +405,7 @@ def _load_inkling_mtp_weights(
                 "chain_hidden_post_norm is disabled."
             )
 
-        # Fused attention qkvr (wq_du/wk_dv/wv_dv/wr_du -> qkvr).
+        # Attention projections: q/k/v -> fused qkv, wr_du separate.
         matched = False
         for pname, wname, shard in _ATTENTION_PARAMS_MAPPING:
             if f".attn.{wname}." in name:
