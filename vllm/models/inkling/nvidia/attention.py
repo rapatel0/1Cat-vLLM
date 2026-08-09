@@ -43,6 +43,7 @@ from .ops.fa4_warmup import InklingFA4WarmupConfig, register_fa4_warmup
 from .ops.qkvr_prep import fused_qkvr_prep
 from .sconv_swa_attn import _K, _V, InklingConvState, InklingSconvMetadata
 from .short_conv import InklingShortConv
+from .sm70 import inkling_sm70_rel_attention, use_sm70_rel_attention
 
 
 def compute_log_scaling_tau(
@@ -301,6 +302,26 @@ class InklingAttention(nn.Module, AttentionLayerBase):
         nt = md.num_actual_tokens
         key_cache, value_cache = self._split_kv_cache()
         max_seqlen_q = bucket_max_seqlen_q(md.max_query_len)
+
+        if use_sm70_rel_attention():
+            # Volta: no FA4/CuTe. Same signature, single-pass Triton scan.
+            inkling_sm70_rel_attention(
+                q[:nt],
+                key_cache,
+                value_cache,
+                block_table=md.block_table,
+                cache_seqlens=md.seq_lens,
+                cu_seqlens_q=md.query_start_loc,
+                max_seqlen_q=max_seqlen_q,
+                softmax_scale=self.scaling,
+                causal=True,
+                window_size=self.window_size,
+                rel_extent=self.rel_extent,
+                rel_logits=rel_logits[:nt],
+                out=output[:nt],
+            )
+            return
+
         num_splits = inkling_fa4_num_splits(
             is_local=self.is_local,
             batch_size=md.seq_lens.shape[0],

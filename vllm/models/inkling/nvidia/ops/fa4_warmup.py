@@ -150,5 +150,13 @@ _PROVIDER = _WarmupProvider()
 
 
 def register_fa4_warmup(config: InklingFA4WarmupConfig) -> None:
+    # On pre-SM90 the model runs the Triton relative-attention kernel in
+    # ``..sm70``, so there are no CuTe-DSL units to precompile -- and calling
+    # _compile() there would try to import cutlass. Triton JIT-compiles on
+    # first use instead, so skipping this only costs a one-off warmup.
+    from ..sm70 import use_sm70_rel_attention
+
+    if use_sm70_rel_attention():
+        return
     _PROVIDER.configs.add(config)
     register_cutedsl_warmup_provider(_PROVIDER)
