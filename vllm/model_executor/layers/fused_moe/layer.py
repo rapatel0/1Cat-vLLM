@@ -1419,3 +1419,58 @@ def fused_moe_make_expert_params_mapping(
 # Mark the FusedMoE weight_loader as supporting MoE-specific parameters
 # to avoid expensive runtime reflection in model loading code
 FusedMoE.weight_loader.supports_moe_loading = True  # type: ignore[attr-defined]
+
+
+class _RoutedExpertsWrapper(torch.nn.Module):
+    """Upstream-shaped MoE pipeline over this fork's ``FusedMoE``.
+
+    Upstream's ``FusedMoEFactory`` returns a ``MoERunner`` that owns a
+    ``RoutedExperts`` child, so expert parameters are named
+    ``<prefix>.routed_experts.w13_weight``. In this fork ``FusedMoE`` is both
+    the runner owner and the weight holder, which would name them
+    ``<prefix>.w13_weight``.
+
+    Vendored model code (Inkling) reaches for ``.routed_experts`` and emits
+    checkpoint-mapping names in the upstream layout, so register the FusedMoE
+    under that attribute. ``named_parameters()`` then yields the upstream
+    names and the vendored loader resolves without edits.
+
+    Note the FusedMoE still receives the *unwrapped* prefix as its
+    ``layer_name``: that key is what goes into
+    ``compilation_config.static_forward_context`` and what the attention/MoE
+    metadata plumbing looks up, and upstream registers the runner (not the
+    experts child) under it. Only the parameter names gain the extra segment.
+    """
+
+    def __init__(self, routed_experts: FusedMoE):
+        super().__init__()
+        self.routed_experts = routed_experts
+
+    @property
+    def moe_config(self):
+        return self.routed_experts.moe_config
+
+    @property
+    def quant_method(self):
+        return self.routed_experts.quant_method
+
+    def forward(self, *args, **kwargs) -> torch.Tensor:
+        return self.routed_experts(*args, **kwargs)
+
+
+def FusedMoEFactory(*args, **kwargs) -> _RoutedExpertsWrapper:
+    """Upstream-compatible constructor for an MoE execution pipeline.
+
+    Upstream builds router + RoutedExperts + MoERunner here. This fork's
+    ``FusedMoE.__init__`` already does all of that internally, so the factory
+    reduces to construction plus the naming wrapper above.
+
+    Kwargs are passed through untouched; the fork's ``FusedMoE`` accepts the
+    subset the vendored models use (``num_experts``, ``top_k``,
+    ``hidden_size``, ``intermediate_size``, ``renormalize``, ``quant_config``,
+    ``prefix``, ``custom_routing_function``, ``router_logits_dtype``,
+    ``activation``, plus the gate/shared-expert hooks). A caller passing an
+    upstream-only kwarg (``runner_cls``, ``routed_experts_args``, ...) gets a
+    TypeError from ``FusedMoE`` rather than silently losing the argument.
+    """
+    return _RoutedExpertsWrapper(FusedMoE(*args, **kwargs))

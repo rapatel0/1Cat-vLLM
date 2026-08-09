@@ -1297,6 +1297,13 @@ class FusedMoEConfig:
     # cannot silently select one and drop the clamp.
     swiglu_limit: float | None = None
 
+    # Return the per-rank partial sum from the runner instead of all-reducing
+    # it. Set by models that fold the MoE reduction into a larger collective
+    # they drive themselves -- Inkling reduce-scatters the MoE delta into the
+    # sconv stream (RS -> shard sconv -> AG), so an all-reduce here would
+    # double-count the routed contribution.
+    skip_final_all_reduce: bool = False
+
     def __post_init__(self):
         if self.dp_size > 1:
             logger.debug_once(

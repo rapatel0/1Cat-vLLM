@@ -20,6 +20,7 @@ from vllm.model_executor.layers.fused_moe.fused_moe_method_base import (
 )
 from vllm.model_executor.layers.fused_moe.layer import (
     FusedMoE,
+    FusedMoEFactory,
     FusedMoeWeightScaleSupported,
     fused_moe_make_expert_params_mapping,
 )
@@ -62,6 +63,7 @@ def get_config() -> dict[str, Any] | None:
 
 __all__ = [
     "FusedMoE",
+    "FusedMoEFactory",
     "FusedMoERouter",
     "FusedMoEConfig",
     "FusedMoEQuantConfig",

@@ -579,11 +579,22 @@ class MoERunner(MoERunnerInterface):
         here. Skipped when sequence-parallel is active (SP handles its
         own reduction) or when the early path already reduced both outputs.
         """
+        # skip_final_all_reduce must not coexist with a pre-reduced fused
+        # output: the caller asked for a per-rank partial, so a combine kernel
+        # that already reduced would hand back a full sum and the model's own
+        # collective would double-count it.
+        if self.moe_config.skip_final_all_reduce:
+            assert not self._fused_output_is_reduced, (
+                "skip_final_all_reduce requires an un-reduced fused output"
+            )
+
         # We don't need to reduce the final output if:
         # - We are not running with TP or DP
         # - The MK already reduced the fused output itself.
+        # - The model reduces the MoE delta itself (skip_final_all_reduce).
         if (
             not self.moe_config.is_sequence_parallel
+            and not self.moe_config.skip_final_all_reduce
             and (self.moe_config.tp_size > 1 or self.moe_config.ep_size > 1)
             and not self._fused_output_is_reduced
         ):
@@ -601,6 +612,10 @@ class MoERunner(MoERunnerInterface):
         if not current_platform.is_cuda():
             return False
         if self.moe_config.is_sequence_parallel:
+            return False
+        # The fused sum2 collective is still an all-reduce; models that drive
+        # their own reduction must not get one behind their back.
+        if self.moe_config.skip_final_all_reduce:
             return False
         if self._fused_output_is_reduced:
             return False

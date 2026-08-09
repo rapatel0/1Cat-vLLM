@@ -92,7 +92,27 @@ _language_model_by_module = dict[nn.Module, VllmModel]()
 
 
 @runtime_checkable
-class SupportsMultiModal(Protocol):
+class SupportsMultiModalEmbeddings(Protocol):
+    """The interface for models that can merge external multimodal embeddings.
+
+    Split out of `SupportsMultiModal` upstream so that draft/MTP heads -- which
+    merge encoder embeddings but are not themselves multi-modal models -- can
+    declare just this narrower capability.
+    """
+
+    supports_multimodal_embeddings: ClassVar[Literal[True]] = True
+
+    def embed_input_ids(
+        self,
+        input_ids: Tensor,
+        multimodal_embeddings: "MultiModalEmbeddings | None" = None,
+        *,
+        is_multimodal: Tensor | None = None,
+    ) -> Tensor: ...
+
+
+@runtime_checkable
+class SupportsMultiModal(SupportsMultiModalEmbeddings, Protocol):
     """The interface required for all multi-modal models."""
 
     supports_multimodal: ClassVar[Literal[True]] = True
