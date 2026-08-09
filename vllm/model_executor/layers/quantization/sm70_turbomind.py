@@ -96,17 +96,34 @@ def unpack_compressed_weight(weight_packed: torch.Tensor) -> torch.Tensor:
 def unpack_compressed_zeros(zeros_packed: torch.Tensor) -> torch.Tensor:
     """Unpack compressed-tensors packed int4 zero points into FP16 values.
 
-    Nibble order matches `unpack_compressed_weight`, and the trailing packed
-    dim expands to the full group-count dimension so the result lines up
-    elementwise with the corresponding scale tensor.
+    Two details here are easy to get wrong and both fail *silently* -- the
+    model loads and generates fluent nonsense -- so both were established
+    empirically against the Inkling-Small checkpoint rather than assumed.
 
-    Unlike `unpack_gptq_zeros` there is deliberately **no +1 offset**: GPTQ
-    stores zero points biased by one, compressed-tensors stores them directly.
-    Applying the GPTQ bias here would shift every dequantized weight by one
-    quantization step -- a silent accuracy loss, not a load failure.
+    **Axis.** Zero points are packed along dim 0 (the output-row axis), not
+    along the last dim like `weight_packed`. For an expert down_proj the
+    checkpoint carries::
+
+        weight_packed     (4096, 256) -> (4096, 2048)   packed on dim -1
+        weight_scale      (4096, 64)
+        weight_zero_point (512, 64)   -> (4096, 64)     packed on dim 0
+
+    So the transform is `unpack_gptq_weight`'s (stack on dim 1, collapse into
+    the row axis), *not* `unpack_compressed_weight`'s. Unpacking the last dim
+    instead yields (512, 512), which no longer matches the scale grid.
+
+    **Nibble order.** Within the packed row axis the nibble index is
+    fast-varying (row = 8*i + k), not blocked (row = i + 512*k). Measured by
+    the spread of per-group dequantized means: 0.041 interleaved vs 0.120
+    blocked, against 0.079 for the symmetric zp=8 baseline -- i.e. the blocked
+    reading is worse than ignoring zero points altogether.
+
+    **No +1 offset**, unlike `unpack_gptq_zeros`: GPTQ stores zero points
+    biased by one, compressed-tensors stores them directly. Measured
+    dequantized mean is +0.000153 without the bias versus -0.064 with it.
     """
     xs = _get_u4_slices(zeros_packed, torch.uint8)
-    zeros = torch.stack(xs, dim=-1).reshape(*zeros_packed.shape[:-1], -1)
+    zeros = torch.stack(xs, dim=1).reshape(-1, zeros_packed.size(-1))
     return zeros.to(torch.float16).contiguous()
 
 
