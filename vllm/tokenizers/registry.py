@@ -45,6 +45,10 @@ _VLLM_TOKENIZERS = {
     "deepseek_v4": ("deepseek_v4", "DeepseekV4Tokenizer"),
     "grok2": ("grok2", "Grok2Tokenizer"),
     "hf": ("hf", "CachedHfTokenizer"),
+    # Inkling uses the plain HF tokenizer for token operations; the "inkling"
+    # mode exists to select the InklingRenderer, which renders chat to token
+    # ids natively (Inkling has no Jinja chat template).
+    "inkling": ("hf", "CachedHfTokenizer"),
     "kimi_audio": ("kimi_audio", "KimiAudioTokenizer"),
     "mistral": ("mistral", "MistralTokenizer"),
     "qwen_vl": ("qwen_vl", "QwenVLTokenizer"),

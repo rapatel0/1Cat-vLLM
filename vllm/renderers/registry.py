@@ -24,6 +24,7 @@ _VLLM_RENDERERS = {
     "deepseek_v4": ("deepseek_v4", "DeepseekV4Renderer"),
     "grok2": ("grok2", "Grok2Renderer"),
     "hf": ("hf", "HfRenderer"),
+    "inkling": ("inkling", "InklingRenderer"),
     "kimi_audio": ("hf", "HfRenderer"),
     "mistral": ("mistral", "MistralRenderer"),
     "qwen_vl": ("hf", "HfRenderer"),
