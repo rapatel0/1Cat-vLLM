@@ -19,6 +19,7 @@ translated to the standard per-expert loads in
 from __future__ import annotations
 
 import math
+import re
 from typing import TYPE_CHECKING
 
 import torch
@@ -406,6 +407,17 @@ class InklingSinkExpertsLinear(nn.Module):
         return output
 
 
+# `experts.<expert_id>.<gate|up|down>_proj.<suffix>` -- the per-expert module
+# layout llm-compressor emits, as opposed to the reference release's tensors
+# stacked over the expert dimension.
+_PER_EXPERT_RE = re.compile(
+    r"^experts\.(?P<eid>\d+)\.(?P<proj>gate|up|down)_proj\.(?P<suffix>.+)$"
+)
+
+# vLLM's fused expert slab is [w1(gate); w3(up)] with w2 the down projection.
+_CKPT_PROJ_TO_SHARD = {"gate": "w1", "up": "w3", "down": "w2"}
+
+
 class InklingMoE(nn.Module):
     def __init__(
         self,
@@ -556,6 +568,21 @@ class InklingMoE(nn.Module):
                 f"sink_experts.{p}" for p in self.sink_experts.load_weight(key, weight)
             ]
 
+        # Two routed-expert checkpoint layouts exist in the wild. The code
+        # below this branch expects the reference release's *stacked* tensors
+        # (`experts.w13_weight_packed` indexed by expert id). llm-compressor
+        # builds -- including the served cyankiwi W4A16 one -- instead emit one
+        # module per expert (`experts.<id>.gate_proj.weight_packed`). Route
+        # those through vLLM's standard FusedMoE expert loader.
+        per_expert = _PER_EXPERT_RE.match(name)
+        if per_expert is not None:
+            return self._load_per_expert_weight(
+                int(per_expert.group("eid")),
+                per_expert.group("proj"),
+                per_expert.group("suffix"),
+                weight,
+            )
+
         experts: RoutedExperts = self.experts.routed_experts
         key = name.split(".", 1)[1]
 
@@ -615,6 +642,44 @@ class InklingMoE(nn.Module):
             for gid, lid in slots.items():
                 param.data[lid].copy_(weight[gid].narrow(1, tp_rank * shard, shard))
         return [f"experts.routed_experts.{key}"]
+
+    def _load_per_expert_weight(
+        self, expert_id: int, proj: str, suffix: str, weight: torch.Tensor
+    ) -> list[str]:
+        """Load a single `experts.<id>.<proj>_proj.<suffix>` checkpoint tensor.
+
+        Delegates to `FusedMoE.weight_loader`, which is the path every other
+        per-expert compressed-tensors MoE in this fork uses (Laguna included).
+        It already knows how to place a gate/up half into the fused w13 slab
+        and how to shard each projection for the current TP rank, including
+        the packed/scale/zero-point companions -- none of which is worth
+        re-deriving here.
+
+        Returns the loaded param name so the caller can mark it seen, or an
+        empty list when the expert does not live on this rank (the loader
+        reports that via `return_success`).
+        """
+        routed: RoutedExperts = self.experts.routed_experts
+        shard_id = _CKPT_PROJ_TO_SHARD[proj]
+        stem = "w2_" if shard_id == "w2" else "w13_"
+        attr = f"{stem}{suffix}"
+
+        param = getattr(routed, attr, None)
+        if param is None:
+            # The quant method did not create this companion (for example a
+            # symmetric checkpoint has no zero points, and weight_shape is
+            # only used by some backends). Nothing to load.
+            return []
+
+        success = routed.weight_loader(
+            param,
+            weight,
+            f"experts.{attr}",
+            shard_id=shard_id,
+            expert_id=expert_id,
+            return_success=True,
+        )
+        return [f"experts.routed_experts.{attr}"] if success else []
 
     def finalize_load(self) -> list[str]:
         """Post-load fixups for zeroed padding experts."""
