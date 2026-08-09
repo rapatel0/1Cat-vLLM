@@ -3,6 +3,7 @@
 
 import itertools
 from abc import abstractmethod
+from collections.abc import Iterable
 
 import torch
 from torch.nn.parameter import Parameter, UninitializedParameter
@@ -1214,6 +1215,37 @@ class MergedColumnParallelLinear(ColumnParallelLinear):
             tp_rank=self.tp_rank,
         )
 
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[str]:
+        """Module-level loader that honours a shard id stashed on the tensor.
+
+        `WeightsMapper.orig_to_new_stacked` records which shard of this fused
+        parameter a checkpoint tensor feeds by setting `loaded_weight.shard_id`
+        (models that do not use stacked maps never set it). AutoWeightsLoader
+        delegates to this hook when a submodule defines it, which is the only
+        point where that id can still be recovered and passed on.
+
+        Without it the shard id is dropped, `weight_loader` sees
+        `loaded_shard_id=None` and takes the "checkpoint holds one pre-fused
+        tensor, split it across my output_sizes" path -- which then tries to
+        narrow a single constituent tensor to the full fused width and fails
+        with a shape error.
+        """
+        for name, loaded_weight in weights:
+            shard_id = getattr(loaded_weight, "shard_id", None)
+            self.validate_shard_id(shard_id)
+            param: Parameter
+            if "." in name:
+                submodule, _, attr = name.rpartition(".")
+                param = getattr(self.get_submodule(submodule), attr, self)
+            else:
+                param = getattr(self, name, self)
+            if param is None and name == "bias":
+                continue
+            param.weight_loader(param, loaded_weight, shard_id)
+            yield name
+
 
 class QKVParallelLinear(ColumnParallelLinear):
     """Linear layers for the attention's QKV transformation.
@@ -1628,6 +1660,25 @@ class QKVParallelLinear(ColumnParallelLinear):
 
         assert param_data.shape == loaded_weight.shape
         param_data.copy_(loaded_weight)
+
+    def load_weights(
+        self, weights: Iterable[tuple[str, torch.Tensor]]
+    ) -> Iterable[str]:
+        """See `MergedColumnParallelLinear.load_weights`; shard ids here are
+        the "q"/"k"/"v" strings rather than indices."""
+        for name, loaded_weight in weights:
+            shard_id = getattr(loaded_weight, "shard_id", None)
+            self.validate_shard_id(shard_id)
+            param: Parameter
+            if "." in name:
+                submodule, _, attr = name.rpartition(".")
+                param = getattr(self.get_submodule(submodule), attr, self)
+            else:
+                param = getattr(self, name, self)
+            if param is None and name == "bias":
+                continue
+            param.weight_loader(param, loaded_weight, shard_id)
+            yield name
 
 
 # --8<-- [start:row_parallel_linear]
