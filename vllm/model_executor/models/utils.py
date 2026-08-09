@@ -4,8 +4,8 @@
 import itertools
 from collections.abc import Callable, Iterable, Mapping
 from contextlib import contextmanager
-from dataclasses import dataclass, field
-from typing import Any, Literal, Protocol, overload
+from dataclasses import dataclass, field, replace
+from typing import Any, Literal, Protocol, TypeAlias, overload
 
 import regex as re
 import torch
@@ -38,6 +38,10 @@ from vllm.utils.torch_utils import (
 logger = init_logger(__name__)
 
 
+# Identifies which shard of a stacked parameter a checkpoint weight feeds.
+ShardId: TypeAlias = str | int | tuple[int, ...]
+
+
 @dataclass
 class WeightsMapper:
     """Maps the name of each weight if they match the following patterns.
@@ -46,6 +50,9 @@ class WeightsMapper:
 
     orig_to_new_regex: Mapping[re.Pattern, str | None] = field(default_factory=dict)
     orig_to_new_substr: Mapping[str, str | None] = field(default_factory=dict)
+    orig_to_new_stacked: Mapping[str, tuple[str, ShardId]] = field(
+        default_factory=dict
+    )
     orig_to_new_prefix: Mapping[str, str | None] = field(default_factory=dict)
     orig_to_new_suffix: Mapping[str, str | None] = field(default_factory=dict)
 
@@ -53,11 +60,26 @@ class WeightsMapper:
         """Combine two `WeightsMapper`s by merging their mappings."""
         return WeightsMapper(
             orig_to_new_substr={**self.orig_to_new_substr, **other.orig_to_new_substr},
+            orig_to_new_stacked={
+                **self.orig_to_new_stacked,
+                **other.orig_to_new_stacked,
+            },
             orig_to_new_prefix={**self.orig_to_new_prefix, **other.orig_to_new_prefix},
             orig_to_new_suffix={**self.orig_to_new_suffix, **other.orig_to_new_suffix},
         )
 
     def _map_name(self, key: str) -> str | None:
+        """Map a weight name, discarding any shard id."""
+        result = self._map_name_with_shard(key)
+        return result[0] if result is not None else None
+
+    def _map_name_with_shard(self, key: str) -> tuple[str, ShardId | None] | None:
+        """Map a weight name and extract any stacked-parameter shard id.
+
+        Returns `(mapped_name, shard_id)` if the weight should be kept, or
+        `None` if it should be dropped. `shard_id` is `None` unless the name
+        matched an `orig_to_new_stacked` entry.
+        """
         for pattern, new_key in self.orig_to_new_regex.items():
             if pattern.search(key):
                 if new_key is None:
@@ -71,6 +93,16 @@ class WeightsMapper:
                     return None
 
                 key = key.replace(substr, new_key, 1)
+
+        # Stacked maps rewrite the name *and* record which shard of the target
+        # parameter the weight feeds -- e.g. Inkling's separate wq_du/wk_dv/
+        # wv_dv/wr_du checkpoint tensors all land in the fused `qkvr` linear
+        # as shards 0-3.
+        shard_id: ShardId | None = None
+        for substr, (new_key, new_shard_id) in self.orig_to_new_stacked.items():
+            if substr in key:
+                key = key.replace(substr, new_key, 1)
+                shard_id = new_shard_id
 
         for prefix, new_key in self.orig_to_new_prefix.items():
             if key.startswith(prefix):
@@ -86,16 +118,22 @@ class WeightsMapper:
 
                 key = new_key.join(key.rsplit(suffix, 1))
 
-        return key
+        return key, shard_id
 
     def apply(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> Iterable[tuple[str, torch.Tensor]]:
-        return (
-            (out_name, data)
-            for name, data in weights
-            if (out_name := self._map_name(name)) is not None
-        )
+        for name, data in weights:
+            result = self._map_name_with_shard(name)
+            if result is None:
+                continue
+            out_name, shard_id = result
+            # Stash the shard id on the tensor so the model's load_weights can
+            # route it to the right slice of a stacked parameter. Only set when
+            # a stacked map matched, so nothing changes for existing models.
+            if shard_id is not None:
+                data.shard_id = shard_id
+            yield out_name, data
 
     def apply_list(self, values: list[str]) -> list[str]:
         return [
@@ -110,6 +148,16 @@ class WeightsMapper:
             for name, value in values.items()
             if (out_name := self._map_name(name)) is not None
         }
+
+    def get_unstacked_mapper(self) -> "WeightsMapper":
+        """Variant that drops stacked maps, keeping all other renames.
+
+        Consumers that reference the checkpoint's *unstacked* module names --
+        LoRA name parsing and the quantization config's layer lists -- need the
+        constituent names (`wq_du`) to survive rather than being rewritten to
+        the stacked vLLM name (`qkvr`).
+        """
+        return replace(self, orig_to_new_stacked={})
 
 
 class AutoWeightsLoader:
