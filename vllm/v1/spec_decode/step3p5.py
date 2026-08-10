@@ -305,9 +305,19 @@ class Step3p5MTPProposer(EagleProposer):
             self.build_per_group_and_layer_attn_metadata(common_attn_metadata)
         )
 
-        cudagraph_runtime_mode, num_input_tokens, num_tokens_across_dp = (
-            self._determine_batch_execution_and_padding(num_tokens)
-        )
+        # _determine_batch_execution_and_padding returns a 4-tuple in this
+        # tree (it also yields the BatchDescriptor); this file still unpacked
+        # the older 3-tuple, so any Step3.5/Inkling MTP draft step raised
+        # "too many values to unpack" on the first request.
+        (
+            cudagraph_runtime_mode,
+            num_input_tokens,
+            num_tokens_across_dp,
+            batch_descriptor,
+        ) = self._determine_batch_execution_and_padding(num_tokens)
+        # Mirror the base proposer, which stamps the descriptor with the draft
+        # step index before the first forward.
+        batch_descriptor = self._batch_descriptor_for_spec_step(batch_descriptor, 0)
 
         model_kwargs, slot_mapping_size = self.build_model_inputs_first_pass(
             num_tokens, num_input_tokens, mm_embed_inputs
@@ -320,6 +330,7 @@ class Step3p5MTPProposer(EagleProposer):
             num_tokens=num_input_tokens,
             num_tokens_across_dp=num_tokens_across_dp,
             cudagraph_runtime_mode=cudagraph_runtime_mode,
+            batch_descriptor=batch_descriptor,
             slot_mapping=self._get_slot_mapping(
                 slot_mapping_size, common_attn_metadata.slot_mapping
             ),
@@ -369,9 +380,12 @@ class Step3p5MTPProposer(EagleProposer):
 
         draft_token_ids_list = [draft_token_ids]
 
-        cudagraph_runtime_mode, input_batch_size, batch_size_across_dp = (
-            self._determine_batch_execution_and_padding(batch_size)
-        )
+        (
+            cudagraph_runtime_mode,
+            input_batch_size,
+            batch_size_across_dp,
+            batch_descriptor,
+        ) = self._determine_batch_execution_and_padding(batch_size)
 
         common_attn_metadata.num_actual_tokens = batch_size
         common_attn_metadata.max_query_len = 1
@@ -433,6 +447,9 @@ class Step3p5MTPProposer(EagleProposer):
                 num_tokens=input_batch_size,
                 num_tokens_across_dp=batch_size_across_dp,
                 cudagraph_runtime_mode=cudagraph_runtime_mode,
+                batch_descriptor=self._batch_descriptor_for_spec_step(
+                    batch_descriptor, spec_step_idx
+                ),
                 slot_mapping=self._get_slot_mapping(input_batch_size),
             ):
                 ret_hidden_states = self.model(**model_kwargs)
