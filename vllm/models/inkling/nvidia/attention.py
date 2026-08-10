@@ -294,6 +294,15 @@ class InklingAttention(nn.Module, AttentionLayerBase):
         # concatenation is the same ordering the fused linear would produce.
         qkv, _ = self.qkv(hidden_states)
         r, _ = self.wr_du(hidden_states)
+        if os.environ.get("INKLING_DEBUG_NAN") == "1":
+            for _tag, _t in (("in", hidden_states), ("qkv", qkv), ("r", r)):
+                logger.info(
+                    "INKLING_QKV %s %s finite=%s absmax=%.4g",
+                    self.prefix,
+                    _tag,
+                    bool(torch.isfinite(_t).all().item()),
+                    _t.abs().max().item(),
+                )
         qkvr = torch.cat((qkv, r), dim=-1)
 
         attn_metadata = get_forward_context().attn_metadata
