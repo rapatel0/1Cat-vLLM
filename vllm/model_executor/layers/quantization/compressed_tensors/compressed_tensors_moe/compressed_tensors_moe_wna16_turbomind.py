@@ -166,6 +166,41 @@ class CompressedTensorsWNA16TurboMindMoEMethod(CompressedTensorsWNA16MarlinMoEMe
         set_weight_attrs(w2_scale, extra_weight_attrs)
         set_weight_attrs(w2_scale, {"load_full_w2": False})
 
+        # Asymmetric checkpoints carry a packed zero point per group. This
+        # route used to be symmetric-only, so these were never created and the
+        # prepare step died on getattr(layer, "w13_weight_zero_point").
+        #
+        # Same transposed layout as the scales, with the output axis packed
+        # four values to an int32 word: (num_groups, N / packed_factor)
+        # unpacks to the (num_groups, N) scale grid.
+        if not self.weight_quant.symmetric:
+            w13_zp = Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w13,
+                    w13_num_shards
+                    * intermediate_size_per_partition
+                    // self.packed_factor,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w13_weight_zero_point", w13_zp)
+            set_weight_attrs(w13_zp, extra_weight_attrs)
+
+            w2_zp = Parameter(
+                torch.empty(
+                    num_experts,
+                    num_groups_w2,
+                    hidden_size // self.packed_factor,
+                    dtype=torch.int32,
+                ),
+                requires_grad=False,
+            )
+            layer.register_parameter("w2_weight_zero_point", w2_zp)
+            set_weight_attrs(w2_zp, extra_weight_attrs)
+            set_weight_attrs(w2_zp, {"load_full_w2": False})
+
         for name, size in (
             ("w2_weight_shape", intermediate_size_per_partition),
             ("w13_weight_shape", hidden_size),
