@@ -398,6 +398,13 @@ class CompressedTensorsWNA16TurboMindMoEMethod(CompressedTensorsWNA16MarlinMoEMe
             "w2_g_idx_sort_indices",
         ):
             delattr(layer, name)
+        # Zero points are baked into tm_weight/tm_scales by uint4_sm70_prepare
+        # and never read at runtime, so drop them too. Leaving them resident
+        # costs ~0.5 GiB per GPU across 40 MoE layers, straight out of the KV
+        # cache budget.
+        for name in ("w13_weight_zero_point", "w2_weight_zero_point"):
+            if hasattr(layer, name):
+                delattr(layer, name)
         logger.info_once(
             "SM70 TurboMind compressed-tensors W4 MoE %s path enabled "
             "(%d experts, group_size=%d).",
