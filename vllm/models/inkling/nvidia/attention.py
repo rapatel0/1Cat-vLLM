@@ -13,7 +13,10 @@ from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
 from vllm.config import VllmConfig, get_current_vllm_config
-from vllm.distributed import get_tensor_model_parallel_world_size
+from vllm.distributed import (
+    get_tensor_model_parallel_rank,
+    get_tensor_model_parallel_world_size,
+)
 from vllm.forward_context import get_forward_context
 from vllm.model_executor.layers.attention_layer_base import AttentionLayerBase
 from vllm.model_executor.layers.linear import (
@@ -52,6 +55,52 @@ from .sm70 import inkling_sm70_rel_attention, use_sm70_rel_attention
 
 
 logger = init_logger(__name__)
+
+_NAN_DUMPED = False
+
+
+def _dump_failing_attention(attn, q, rel_logits, out) -> None:
+    """Save the inputs of a non-finite SM70 attention call, once per process.
+
+    Written for replay: the kernel passes 8/8 on synthetic data but produces
+    NaN here, so the difference is in the real KV cache contents or metadata
+    shapes. Only the pages named by the block table are saved.
+    """
+    global _NAN_DUMPED
+    try:
+        md = cast(
+            FlashAttentionMetadata,
+            get_forward_context().attn_metadata[attn.prefix],
+        )
+        key_cache, value_cache = attn._split_kv_cache()
+        pages = torch.unique(md.block_table.flatten()).to(torch.long)
+        payload = {
+            "prefix": attn.prefix,
+            "is_local": attn.is_local,
+            "window_size": attn.window_size,
+            "rel_extent": attn.rel_extent,
+            "scaling": attn.scaling,
+            "num_actual_tokens": int(md.num_actual_tokens),
+            "max_query_len": int(md.max_query_len),
+            "q": q.detach().cpu(),
+            "rel_logits": rel_logits.detach().cpu(),
+            "out": out.detach().cpu(),
+            "block_table": md.block_table.detach().cpu(),
+            "seq_lens": md.seq_lens.detach().cpu(),
+            "query_start_loc": md.query_start_loc.detach().cpu(),
+            "pages": pages.cpu(),
+            "key_pages": key_cache[pages].detach().cpu(),
+            "value_pages": value_cache[pages].detach().cpu(),
+            "key_cache_shape": tuple(key_cache.shape),
+            "key_cache_stride": tuple(key_cache.stride()),
+        }
+        path = f"/workspace/inkling-nan-{get_tensor_model_parallel_rank()}.pt"
+        torch.save(payload, path)
+        logger.info("INKLING_ATTN dumped failing invocation to %s", path)
+    except Exception:  # noqa: BLE001
+        logger.exception("INKLING_ATTN dump failed")
+    finally:
+        _NAN_DUMPED = True
 
 
 def compute_log_scaling_tau(
@@ -369,12 +418,19 @@ class InklingAttention(nn.Module, AttentionLayerBase):
                     )
             self._attention(q, rel_logits, attn_output)
             if _adbg:
+                _fin = bool(torch.isfinite(attn_output).all().item())
                 logger.info(
                     "INKLING_ATTN kernel_out local=%s finite=%s absmax=%.4g",
                     self.is_local,
-                    bool(torch.isfinite(attn_output).all().item()),
+                    _fin,
                     attn_output.abs().max().item(),
                 )
+                if not _fin and not _NAN_DUMPED:
+                    # Capture the exact failing invocation so it can be
+                    # replayed offline in seconds instead of via a 15-minute
+                    # model reload. Only the referenced KV pages are saved --
+                    # the whole cache is far too large.
+                    _dump_failing_attention(self, q, rel_logits, attn_output)
 
         flat = attn_output.view(num_tokens, -1)
         output, _ = self.wo_ud(flat)
