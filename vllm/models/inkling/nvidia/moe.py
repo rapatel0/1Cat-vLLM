@@ -666,9 +666,23 @@ class InklingMoE(nn.Module):
 
         param = getattr(routed, attr, None)
         if param is None:
-            # The quant method did not create this companion (for example a
-            # symmetric checkpoint has no zero points, and weight_shape is
-            # only used by some backends). Nothing to load.
+            # Some companions are genuinely optional: weight_shape and the
+            # actorder indices are only materialized by certain backends.
+            #
+            # Zero points are not optional on an asymmetric checkpoint, and
+            # skipping them silently is how 30720 of them were quietly dropped
+            # while the load still "succeeded" -- the failure only surfaced
+            # later, in the prepare step. Fail loudly instead.
+            weight_quant = getattr(
+                getattr(routed, "quant_method", None), "weight_quant", None
+            )
+            asymmetric = weight_quant is not None and not weight_quant.symmetric
+            if suffix == "weight_zero_point" and asymmetric:
+                raise RuntimeError(
+                    f"asymmetric checkpoint supplies {attr} but the quant "
+                    f"method did not allocate it; the MoE would silently "
+                    f"dequantize with uninitialized zero points"
+                )
             return []
 
         success = routed.weight_loader(
