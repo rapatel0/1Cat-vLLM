@@ -58,6 +58,13 @@ logger = init_logger(__name__)
 
 _NAN_DUMPED = False
 
+# wo_ud's output is a residual contribution and so carries the model's
+# unnormalised range; measured at 7.2e3 (9x under FP16) on a chat-template
+# prompt, in the same family as the MoE stores that did overflow. wo_ud is
+# linear in its input, so a power-of-two scale on the input scales the output
+# exactly and the unscale is done here in FP32 -- callers see true magnitude.
+_ATTN_OUTPUT_SCALE = 1.0 / 64.0
+
 
 def _snapshot(attn, md):
     """Clone q-adjacent state that the attention call is not supposed to touch."""
@@ -472,9 +479,9 @@ class InklingAttention(nn.Module, AttentionLayerBase):
                         self, q, rel_logits, attn_output, _before, _q_before
                     )
 
-        flat = attn_output.view(num_tokens, -1)
+        flat = attn_output.view(num_tokens, -1).mul(_ATTN_OUTPUT_SCALE)
         output, _ = self.wo_ud(flat)
-        return output
+        return output.float().mul_(1.0 / _ATTN_OUTPUT_SCALE)
 
     @eager_break_during_capture
     def _attention(

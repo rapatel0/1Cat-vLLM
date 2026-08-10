@@ -136,18 +136,27 @@ def _sconv_add_norm(
 
     _p("delta_in", delta)
     _p("shared_delta", shared_delta)
-    # Carry the whole residual-contribution path in FP32, not just the conv.
+    # Every residual contribution reaches here in FP32 already: the routed and
+    # sink MoE partials (moe.py) and wo_ud's output (attention.py) each guard
+    # their own FP16 store with a power-of-two scale and unscale in FP32. The
+    # cast below is therefore a no-op on the current model and is kept so this
+    # function stays correct for any FP16 producer.
     #
-    # Measured peaks over 42 layers (prefill, absmax, FP16 max is 65504):
-    #   residual            6.3e5   already FP32
-    #   after_sconv/ag      1.9e5   FP32 as of the conv fix
-    #   shared_delta        5.1e4   1.3x headroom
-    #   delta_summed        5.1e4   1.3x headroom
-    #   after_rs            2.2e4   3.0x headroom
-    # while every post-rmsnorm tensor sits below 62 (>1000x headroom). The
-    # split is structural rather than incidental: rmsnorm makes its output
-    # O(1), so only the unnormalised accumulator carries the model's dynamic
-    # range, and on Volta that range does not fit in FP16.
+    # Measured peaks on a chat-template prompt, where the residual reaches
+    # 1.26e6 (FP16 max is 65504):
+    #   resid_after_attn  1.26e6    already FP32
+    #   after_sconv/ag    5.95e5    FP32
+    #   after_rs          1.02e5    FP32
+    #   mlp_output[1]     5.10e4    1.3x  -> scaled at the producer
+    #   mlp_output[0]     4.44e4    1.5x  -> OVERFLOWED, scaled at the producer
+    #   attn_output       7.25e3    9.0x  -> scaled at the producer
+    # while every post-rmsnorm tensor stays under 63 (>1000x headroom). The
+    # split is structural: rmsnorm forces its output to O(1), so only the
+    # unnormalised accumulator carries the model's dynamic range, and on Volta
+    # -- which has no BF16 -- that range does not fit in FP16.
+    #
+    # in-place below is safe: both producers hand over freshly allocated
+    # tensors that nothing else holds.
     delta = delta.to(torch.float32)
     if shared_delta is not None:
         delta.add_(shared_delta)

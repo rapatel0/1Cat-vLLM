@@ -277,6 +277,22 @@ def _inkling_moe_ep_size() -> int:
     return world if world > 1 else 1
 
 
+# The sink-expert output is a residual contribution, so it carries the model's
+# unnormalised dynamic range: measured at 5.1e4 over 42 layers, only 1.3x under
+# FP16's 65504. The value is produced by a plain ``h @ w2.T`` whose FP16 store
+# is the narrowing step, so a deeper prompt would land +inf there and no
+# after-the-fact cast could recover it.
+#
+# ``w2`` is linear in ``h``, so scaling ``h`` by a power of two scales the
+# output exactly (exponent shift only, no mantissa loss) and the FP16 store
+# then has 64x headroom. The unscale happens here, in FP32, so callers receive
+# a true-magnitude tensor and there is no cross-module scaling contract to keep
+# in sync -- the same reasoning as the conv-state cache scale in model.py,
+# which does need such a contract because the cache itself holds scaled values.
+_SINK_OUTPUT_SCALE = 1.0 / 64.0
+_ROUTED_OUTPUT_SCALE = 1.0 / 64.0
+
+
 class InklingSinkExperts(nn.Module):
     """Shared "sink" experts with per-token gammas, in bf16.
 
@@ -339,7 +355,10 @@ class InklingSinkExperts(nn.Module):
         h = sink_silu_mul_epilogue(
             raw, self._unit, gammas, self._unit, self.n_experts, x.dtype
         )
-        return h @ self.w2_weight.T  # (T, D)
+        # Scale into the FP16 store, unscale out of it in FP32.
+        h = h.mul_(_SINK_OUTPUT_SCALE)
+        out = h @ self.w2_weight.T  # (T, D)
+        return out.float().mul_(1.0 / _SINK_OUTPUT_SCALE)
 
 
 class InklingSinkExpertsLinear(nn.Module):
@@ -403,8 +422,9 @@ class InklingSinkExpertsLinear(nn.Module):
         gate, up = gate_up.chunk(2, dim=-1)
         hidden_states = torch.nn.functional.silu(gate) * up
         hidden_states = (hidden_states * self._gamma_expand(gammas)).to(x.dtype)
+        hidden_states = hidden_states.mul_(_SINK_OUTPUT_SCALE)
         output, _ = self.w2(hidden_states)
-        return output
+        return output.float().mul_(1.0 / _SINK_OUTPUT_SCALE)
 
 
 # `experts.<expert_id>.<gate|up|down>_proj.<suffix>` -- the per-expert module
@@ -511,7 +531,11 @@ class InklingMoE(nn.Module):
         if cached is not None and cached[0] is gating_output:
             return cached[1], cached[2]
         weights, ids = self.gate.select_experts(gating_output)
-        return weights[:, :topk].contiguous(), ids[:, :topk].contiguous()
+        # Scaled here, unscaled in forward_partials -- see _ROUTED_OUTPUT_SCALE.
+        return (
+            weights[:, :topk].contiguous().mul_(_ROUTED_OUTPUT_SCALE),
+            ids[:, :topk].contiguous(),
+        )
 
     def forward_partials(self, x: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
         router_logits = self.gate.compute_logits(x)
@@ -523,7 +547,7 @@ class InklingMoE(nn.Module):
         weights, ids = self.gate.select_experts(router_logits)
         self._routed_sel = (
             router_logits,
-            weights[:, :k].contiguous(),
+            weights[:, :k].contiguous().mul_(_ROUTED_OUTPUT_SCALE),
             ids[:, :k].contiguous(),
         )
         gammas = weights[:, k:]
@@ -539,11 +563,20 @@ class InklingMoE(nn.Module):
         )
         self._routed_sel = None
 
+        # Both partials leave here at true magnitude in FP32. The routed store
+        # overflowed FP16 on a chat-template prompt (rank 3, +inf at 1.5x
+        # headroom) and the sink store sat at 1.3x, so neither is safe to keep
+        # in FP16 -- these are residual contributions and carry the model's
+        # unnormalised range, which on a BF16-native model FP16 does not have.
+        out = out.float().mul_(1.0 / _ROUTED_OUTPUT_SCALE)
         return out, sink_out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out, sink_out = self.forward_partials(x)
-        return out.add_(sink_out)
+        # sink_out is FP32 (see _SINK_OUTPUT_SCALE); an in-place add of FP32
+        # into FP16 raises, and this sum is a residual contribution, so widen
+        # rather than narrow. Inkling itself takes forward_partials.
+        return sink_out.add_(out)
 
     # -- weight loading ----------------------------------------------------
 
