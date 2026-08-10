@@ -229,15 +229,39 @@ class InklingDecoderLayer(nn.Module):
             attn_in, hidden_states = _sconv_add_norm(
                 pending[0], hidden_states, pending[1], self.attn_norm, positions
             )
+        _dbg = os.environ.get("INKLING_DEBUG_NAN") == "1"
+
+        def _probe(tag: str, t) -> None:
+            if not _dbg:
+                return
+            if isinstance(t, tuple):
+                for i, u in enumerate(t):
+                    _probe(f"{tag}[{i}]", u)
+                return
+            if t is None:
+                return
+            logger.info(
+                "INKLING_PROBE %s dtype=%s finite=%s absmax=%.4g",
+                tag,
+                str(t.dtype).replace("torch.", ""),
+                bool(torch.isfinite(t).all().item()),
+                t.abs().max().item(),
+            )
+
+        _probe("attn_in", attn_in)
         attn_output = self.attn(positions, attn_in, log_scaling)
+        _probe("attn_output", attn_output)
         mlp_in, hidden_states = _sconv_add_norm(
             attn_output, hidden_states, self.attn_sconv, self.mlp_norm, positions
         )
+        _probe("mlp_in", mlp_in)
+        _probe("resid_after_attn", hidden_states)
         mlp_output = (
             self.mlp.forward_partials(mlp_in)
             if isinstance(self.mlp, InklingMoE)
             else self.mlp(mlp_in)
         )
+        _probe("mlp_output", mlp_output)
         if defer_mlp_add:
             # Caller folds mlp_output (pre-reduce, pre-sconv) into the next
             # fused sconv+add+rmsnorm.
