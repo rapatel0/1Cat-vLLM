@@ -50,6 +50,7 @@ MTPModelTypes = Literal[
     "step3p5_mtp",
     "hy_v3_mtp",
     "gemma4_mtp",
+    "inkling_mtp",
 ]
 NgramGPUTypes = Literal["ngram_gpu"]
 DFlashModelTypes = Literal["dflash", "dflash_ddtree"]
@@ -345,6 +346,42 @@ class SpeculativeConfig:
             hf_config.update(
                 {"n_predict": n_predict, "architectures": ["OpenPanguMTPModel"]}
             )
+
+        if hf_config.architectures[0] in (
+            "InklingForCausalLM",
+            "InklingForConditionalGeneration",
+        ):
+            # Inkling keeps the transformer fields in text_config and the draft
+            # spec in a separate top-level mtp_config. InklingMTP reads both off
+            # one flat draft config (see its "promoted onto the draft config"
+            # note), so derive the draft from the text config and copy the
+            # mtp_config fields onto it. local_layer_ids is deliberately
+            # overwritten: text_config's value describes the backbone's
+            # sliding-window layers, mtp_config's describes the draft's.
+            import copy as _copy
+
+            mtp_cfg = getattr(hf_config, "mtp_config", None) or {}
+            if not isinstance(mtp_cfg, dict):
+                mtp_cfg = mtp_cfg.to_dict()
+            n_predict = mtp_cfg.get("num_nextn_predict_layers")
+            if n_predict is None:
+                raise ValueError(
+                    "Inkling MTP requires mtp_config.num_nextn_predict_layers"
+                )
+            draft = _copy.deepcopy(hf_config.get_text_config())
+            draft.model_type = "inkling_mtp"
+            draft.update(
+                {
+                    "architectures": ["InklingMTPModel"],
+                    "n_predict": n_predict,
+                    "num_nextn_predict_layers": n_predict,
+                    "chain_hidden_post_norm": mtp_cfg.get(
+                        "chain_hidden_post_norm", False
+                    ),
+                    "local_layer_ids": mtp_cfg.get("local_layer_ids", []),
+                }
+            )
+            return draft
 
         if hf_config.architectures[0] == "MiMoForCausalLM":
             hf_config.model_type = "mimo_mtp"

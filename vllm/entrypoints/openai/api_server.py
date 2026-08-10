@@ -55,6 +55,7 @@ from vllm.entrypoints.utils import (
     process_lora_modules,
 )
 from vllm.logger import init_logger
+from vllm.parser import ParserManager
 from vllm.reasoning import ReasoningParserManager
 from vllm.tasks import POOLING_TASKS, SupportedTask
 from vllm.tool_parsers import ToolParserManager
@@ -514,20 +515,34 @@ def create_server_unix_socket(path: str) -> socket.socket:
 
 
 def validate_api_server_args(args):
+    # A unified ParserEngine (ParserManager) satisfies either role on its own,
+    # and ParserManager.get_parser prefers it over the split
+    # reasoning/tool parsers. Validating only against the two split registries
+    # rejects such a name here, before get_parser is ever reached -- which is
+    # what made --tool-call-parser inkling fail even though the parser exists
+    # and handles tool calls.
+    unified_parsers = ParserManager.list_registered()
+
     valid_tool_parses = ToolParserManager.list_registered()
-    if args.enable_auto_tool_choice and args.tool_call_parser not in valid_tool_parses:
+    if (
+        args.enable_auto_tool_choice
+        and args.tool_call_parser not in valid_tool_parses
+        and args.tool_call_parser not in unified_parsers
+    ):
         raise KeyError(
             f"invalid tool call parser: {args.tool_call_parser} "
-            f"(chose from {{ {','.join(valid_tool_parses)} }})"
+            f"(chose from {{ {','.join(valid_tool_parses + unified_parsers)} }})"
         )
 
     valid_reasoning_parsers = ReasoningParserManager.list_registered()
     if (
-        reasoning_parser := args.structured_outputs_config.reasoning_parser
-    ) and reasoning_parser not in valid_reasoning_parsers:
+        (reasoning_parser := args.structured_outputs_config.reasoning_parser)
+        and reasoning_parser not in valid_reasoning_parsers
+        and reasoning_parser not in unified_parsers
+    ):
         raise KeyError(
             f"invalid reasoning parser: {reasoning_parser} "
-            f"(chose from {{ {','.join(valid_reasoning_parsers)} }})"
+            f"(chose from {{ {','.join(valid_reasoning_parsers + unified_parsers)} }})"
         )
 
 
