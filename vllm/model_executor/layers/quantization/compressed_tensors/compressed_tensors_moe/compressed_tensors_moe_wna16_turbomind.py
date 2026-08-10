@@ -405,6 +405,14 @@ class CompressedTensorsWNA16TurboMindMoEMethod(CompressedTensorsWNA16MarlinMoEMe
         for name in ("w13_weight_zero_point", "w2_weight_zero_point"):
             if hasattr(layer, name):
                 delattr(layer, name)
+        # Return the freed blocks to the driver. The prepare loop above holds
+        # the original packed weights and the newly built tm_ tensors at the
+        # same time, so the caching allocator's high-water mark is roughly
+        # double the MoE weights for this layer. vLLM sizes the KV cache from
+        # *free device memory*, so blocks the allocator is merely caching count
+        # against the budget -- on this model that is the difference between a
+        # workable cache and "Available KV cache memory: -0.94 GiB".
+        torch.cuda.empty_cache()
         logger.info_once(
             "SM70 TurboMind compressed-tensors W4 MoE %s path enabled "
             "(%d experts, group_size=%d).",
