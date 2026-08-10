@@ -131,6 +131,19 @@ def _sconv_add_norm(
 
     _p("delta_in", delta)
     _p("shared_delta", shared_delta)
+    # Carry the whole residual-contribution path in FP32, not just the conv.
+    #
+    # Measured peaks over 42 layers (prefill, absmax, FP16 max is 65504):
+    #   residual            6.3e5   already FP32
+    #   after_sconv/ag      1.9e5   FP32 as of the conv fix
+    #   shared_delta        5.1e4   1.3x headroom
+    #   delta_summed        5.1e4   1.3x headroom
+    #   after_rs            2.2e4   3.0x headroom
+    # while every post-rmsnorm tensor sits below 62 (>1000x headroom). The
+    # split is structural rather than incidental: rmsnorm makes its output
+    # O(1), so only the unnormalised accumulator carries the model's dynamic
+    # range, and on Volta that range does not fit in FP16.
+    delta = delta.to(torch.float32)
     if shared_delta is not None:
         delta.add_(shared_delta)
     _p("delta_summed", delta)

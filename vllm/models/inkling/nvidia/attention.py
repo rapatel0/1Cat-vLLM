@@ -59,12 +59,26 @@ logger = init_logger(__name__)
 _NAN_DUMPED = False
 
 
-def _dump_failing_attention(attn, q, rel_logits, out) -> None:
-    """Save the inputs of a non-finite SM70 attention call, once per process.
+def _snapshot(attn, md):
+    """Clone q-adjacent state that the attention call is not supposed to touch."""
+    key_cache, value_cache = attn._split_kv_cache()
+    pages = torch.unique(md.block_table.flatten()).to(torch.long)
+    return {
+        "pages": pages.cpu(),
+        "key_pages": key_cache[pages].clone(),
+        "value_pages": value_cache[pages].clone(),
+    }
 
-    Written for replay: the kernel passes 8/8 on synthetic data but produces
-    NaN here, so the difference is in the real KV cache contents or metadata
-    shapes. Only the pages named by the block table are saved.
+
+def _dump_failing_attention(attn, q, rel_logits, out, before, q_before) -> None:
+    """Save a non-finite SM70 attention call, once per process.
+
+    Captures the inputs both *before* and *after* the kernel runs. The probe
+    logged q as finite immediately before the call while the post-call dump
+    showed NaN, and the surviving row's absmax (23.562) was larger than the
+    probe's all-row absmax (23.31) -- impossible for one tensor -- so the two
+    reads disagree and only a paired before/after snapshot settles whether the
+    kernel corrupts state it does not own.
     """
     global _NAN_DUMPED
     try:
@@ -72,8 +86,7 @@ def _dump_failing_attention(attn, q, rel_logits, out) -> None:
             FlashAttentionMetadata,
             get_forward_context().attn_metadata[attn.prefix],
         )
-        key_cache, value_cache = attn._split_kv_cache()
-        pages = torch.unique(md.block_table.flatten()).to(torch.long)
+        after = _snapshot(attn, md)
         payload = {
             "prefix": attn.prefix,
             "is_local": attn.is_local,
@@ -82,17 +95,25 @@ def _dump_failing_attention(attn, q, rel_logits, out) -> None:
             "scaling": attn.scaling,
             "num_actual_tokens": int(md.num_actual_tokens),
             "max_query_len": int(md.max_query_len),
-            "q": q.detach().cpu(),
+            "max_seqlen_q_bucketed": int(bucket_max_seqlen_q(md.max_query_len)),
+            "q_before": q_before.cpu(),
+            "q_after": q.detach().cpu(),
             "rel_logits": rel_logits.detach().cpu(),
             "out": out.detach().cpu(),
             "block_table": md.block_table.detach().cpu(),
             "seq_lens": md.seq_lens.detach().cpu(),
             "query_start_loc": md.query_start_loc.detach().cpu(),
-            "pages": pages.cpu(),
-            "key_pages": key_cache[pages].detach().cpu(),
-            "value_pages": value_cache[pages].detach().cpu(),
-            "key_cache_shape": tuple(key_cache.shape),
-            "key_cache_stride": tuple(key_cache.stride()),
+            "pages": before["pages"],
+            "key_pages_before": before["key_pages"].cpu(),
+            "value_pages_before": before["value_pages"].cpu(),
+            "key_pages_after": after["key_pages"].cpu(),
+            "value_pages_after": after["value_pages"].cpu(),
+            # Aliasing check: if these overlap, "corruption" is just a write.
+            "ptr_q": q.data_ptr(),
+            "ptr_out": out.data_ptr(),
+            "ptr_rel": rel_logits.data_ptr(),
+            "nbytes_q": q.numel() * q.element_size(),
+            "nbytes_out": out.numel() * out.element_size(),
         }
         path = f"/workspace/inkling-nan-{get_tensor_model_parallel_rank()}.pt"
         torch.save(payload, path)
@@ -416,6 +437,23 @@ class InklingAttention(nn.Module, AttentionLayerBase):
                         bool(torch.isfinite(_t).all().item()),
                         _t.abs().max().item(),
                     )
+            if _adbg:
+                _kvw = self._split_kv_cache()
+                _slots = fa_md.slot_mapping[fa_md.slot_mapping >= 0].to(torch.long)
+                _bs = _kvw[0].shape[1]
+                _kw = _kvw[0][_slots // _bs, _slots % _bs]
+                _vw = _kvw[1][_slots // _bs, _slots % _bs]
+                logger.info(
+                    "INKLING_KVW %s k_finite=%s k_absmax=%.4g "
+                    "v_finite=%s v_absmax=%.4g",
+                    self.prefix,
+                    bool(torch.isfinite(_kw).all().item()),
+                    _kw.abs().max().item(),
+                    bool(torch.isfinite(_vw).all().item()),
+                    _vw.abs().max().item(),
+                )
+                _before = _snapshot(self, fa_md)
+                _q_before = q.detach().clone()
             self._attention(q, rel_logits, attn_output)
             if _adbg:
                 _fin = bool(torch.isfinite(attn_output).all().item())
@@ -430,7 +468,9 @@ class InklingAttention(nn.Module, AttentionLayerBase):
                     # replayed offline in seconds instead of via a 15-minute
                     # model reload. Only the referenced KV pages are saved --
                     # the whole cache is far too large.
-                    _dump_failing_attention(self, q, rel_logits, attn_output)
+                    _dump_failing_attention(
+                        self, q, rel_logits, attn_output, _before, _q_before
+                    )
 
         flat = attn_output.view(num_tokens, -1)
         output, _ = self.wo_ud(flat)
