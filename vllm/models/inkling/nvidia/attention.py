@@ -4,7 +4,11 @@ from __future__ import annotations
 
 from typing import cast
 
+import os
+
 import torch
+
+from vllm.logger import init_logger
 from torch import nn
 
 from vllm.compilation.breakable_cudagraph import eager_break_during_capture
@@ -45,6 +49,9 @@ from .ops.qkvr_prep import fused_qkvr_prep
 from .sconv_swa_attn import _K, _V, InklingConvState, InklingSconvMetadata
 from .short_conv import InklingShortConv
 from .sm70 import inkling_sm70_rel_attention, use_sm70_rel_attention
+
+
+logger = init_logger(__name__)
 
 
 def compute_log_scaling_tau(
@@ -337,7 +344,28 @@ class InklingAttention(nn.Module, AttentionLayerBase):
                 log_scaling if not self.is_local else None,
             )
             q = q.view(num_tokens, self.num_heads, self.head_dim)
+            _adbg = os.environ.get("INKLING_DEBUG_NAN") == "1"
+            if _adbg:
+                for _tag, _t in (
+                    ("qkvr", qkvr),
+                    ("q_normed", q),
+                    ("rel_logits", rel_logits),
+                ):
+                    logger.info(
+                        "INKLING_ATTN %s local=%s finite=%s absmax=%.4g",
+                        _tag,
+                        self.is_local,
+                        bool(torch.isfinite(_t).all().item()),
+                        _t.abs().max().item(),
+                    )
             self._attention(q, rel_logits, attn_output)
+            if _adbg:
+                logger.info(
+                    "INKLING_ATTN kernel_out local=%s finite=%s absmax=%.4g",
+                    self.is_local,
+                    bool(torch.isfinite(attn_output).all().item()),
+                    attn_output.abs().max().item(),
+                )
 
         flat = attn_output.view(num_tokens, -1)
         output, _ = self.wo_ud(flat)
