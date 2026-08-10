@@ -117,11 +117,29 @@ def _sconv_add_norm(
         )
 
     # Fallback: NCCL RS -> shard sconv -> AG -> fused add(+rmsnorm).
+    _dbg = os.environ.get("INKLING_DEBUG_NAN") == "1"
+
+    def _p(tag: str, t: torch.Tensor) -> None:
+        if _dbg and t is not None:
+            logger.info(
+                "INKLING_SCONV %s dtype=%s finite=%s absmax=%.4g",
+                tag,
+                str(t.dtype).replace("torch.", ""),
+                bool(torch.isfinite(t).all().item()),
+                t.abs().max().item(),
+            )
+
+    _p("delta_in", delta)
+    _p("shared_delta", shared_delta)
     if shared_delta is not None:
         delta.add_(shared_delta)
+    _p("delta_summed", delta)
     shard = tensor_model_parallel_reduce_scatter(delta, dim=-1)
+    _p("after_rs", shard)
     shard = sconv(shard.contiguous(), positions)
+    _p("after_sconv", shard)
     full = tensor_model_parallel_all_gather(shard, dim=-1)
+    _p("after_ag", full)
     if norm is None:
         return None, hidden + full
     return add_rmsnorm(hidden, full, norm_w, eps)
