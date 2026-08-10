@@ -94,36 +94,32 @@ def unpack_compressed_weight(weight_packed: torch.Tensor) -> torch.Tensor:
 
 
 def unpack_compressed_zeros(zeros_packed: torch.Tensor) -> torch.Tensor:
-    """Unpack compressed-tensors packed int4 zero points into FP16 values.
+    """Unpack a loaded compressed-tensors int4 zero-point param to FP16.
 
-    Two details here are easy to get wrong and both fail *silently* -- the
-    model loads and generates fluent nonsense -- so both were established
-    empirically against the Inkling-Small checkpoint rather than assumed.
+    Takes the **post-load parameter**, not the raw checkpoint tensor. Those
+    are transposes of each other and it matters:
 
-    **Axis.** Zero points are packed along dim 0 (the output-row axis), not
-    along the last dim like `weight_packed`. For an expert down_proj the
-    checkpoint carries::
+        checkpoint w2 zero_point   (hidden/8, num_groups)   packed on dim 0
+        Marlin param w2 zero_point (num_groups, hidden/8)   packed on dim -1
 
-        weight_packed     (4096, 256) -> (4096, 2048)   packed on dim -1
-        weight_scale      (4096, 64)
-        weight_zero_point (512, 64)   -> (4096, 64)     packed on dim 0
-
-    So the transform is `unpack_gptq_weight`'s (stack on dim 1, collapse into
-    the row axis), *not* `unpack_compressed_weight`'s. Unpacking the last dim
-    instead yields (512, 512), which no longer matches the scale grid.
-
-    **Nibble order.** Within the packed row axis the nibble index is
-    fast-varying (row = 8*i + k), not blocked (row = i + 512*k). Measured by
-    the spread of per-group dequantized means: 0.041 interleaved vs 0.120
-    blocked, against 0.079 for the symmetric zp=8 baseline -- i.e. the blocked
-    reading is worse than ignoring zero points altogether.
+    The standard weight loader performs that transpose, so by the time the
+    SM70 TurboMind path sees the param the packed axis is the last one -- the
+    same convention as `unpack_compressed_weight`. Unpacking dim 0 here
+    instead would yield a tensor that no longer matches the scale grid (the
+    caller asserts on exactly that).
 
     **No +1 offset**, unlike `unpack_gptq_zeros`: GPTQ stores zero points
-    biased by one, compressed-tensors stores them directly. Measured
-    dequantized mean is +0.000153 without the bias versus -0.064 with it.
+    biased by one, compressed-tensors stores them directly. Established
+    against the real checkpoint -- dequantized mean +0.000153 without the
+    bias, -0.063960 with it, versus -0.032110 for assuming symmetric zp=8.
+    (That check also pinned the checkpoint-side layout as dim-0 interleaved,
+    by the spread of per-group dequantized means: 0.041 interleaved, 0.120
+    blocked, 0.079 for the symmetric baseline. See
+    manifests/inkling-small-int4-sm70/validate_zero_points.py in the homelab
+    repo. That layout is the loader's concern, not this function's.)
     """
     xs = _get_u4_slices(zeros_packed, torch.uint8)
-    zeros = torch.stack(xs, dim=1).reshape(-1, zeros_packed.size(-1))
+    zeros = torch.stack(xs, dim=-1).reshape(*zeros_packed.shape[:-1], -1)
     return zeros.to(torch.float16).contiguous()
 
 
