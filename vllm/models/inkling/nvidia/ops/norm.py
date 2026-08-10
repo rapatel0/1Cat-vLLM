@@ -157,8 +157,28 @@ def add_rmsnorm(
     assert residual.ndim == 2 and delta.ndim == 2, (residual.shape, delta.shape)
     n_rows, n_cols = residual.shape
     assert weight.shape[0] == n_cols
-    y = torch.empty_like(residual)
-    res_out = torch.empty_like(residual)
+    # The residual stream is kept in FP32 while the normed output stays in the
+    # model dtype.
+    #
+    # Inkling is a BF16 model and its residual grows geometrically with depth
+    # -- measured ~1.55x per layer on this checkpoint, from 59 after layer 0 to
+    # 1544 after layer 9 -- which BF16 absorbs (max ~3.4e38) and FP16 does not
+    # (max 65504). On Volta, where BF16 does not exist, an FP16 residual goes
+    # non-finite partway up the stack; here that happened at layer 10, and
+    # would happen regardless of the exact layer since 42 layers of that growth
+    # lands around 1e9.
+    #
+    # Only the accumulator needs the range: `y` is post-rmsnorm and therefore
+    # O(1), so sublayers still receive the model dtype and the quantized GEMMs
+    # are unaffected. The kernel already loads via .to(tl.float32) and stores
+    # through `dtype.element_ty`, so it needs no change -- only these two
+    # allocations, which previously both aliased the residual's dtype.
+    y = torch.empty(
+        (n_rows, n_cols), dtype=delta.dtype, device=residual.device
+    )
+    res_out = torch.empty(
+        (n_rows, n_cols), dtype=torch.float32, device=residual.device
+    )
     if n_rows == 0:
         return y, res_out
 

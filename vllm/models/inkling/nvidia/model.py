@@ -392,7 +392,11 @@ class InklingModel(nn.Module):
             )[0]
             assert norm_out is not None
             return norm_out
-        return self.norm(hidden_states)
+        # The residual is carried in FP32 (see ops/norm.add_rmsnorm), so bring
+        # the final hidden state back to the model dtype -- the LM head GEMM
+        # takes FP16 weights and would reject a mixed-dtype addmm.
+        out = self.norm(hidden_states)
+        return out.to(self.norm.weight.dtype)
 
 
 class _TmlForCausalLMBase(nn.Module, SupportsPP, SupportsLoRA):
