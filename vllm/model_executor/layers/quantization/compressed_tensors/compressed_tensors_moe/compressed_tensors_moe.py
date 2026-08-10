@@ -103,7 +103,11 @@ class CompressedTensorsMoEMethod(FusedMoEMethodBase):
                 )
                 and weight_quant.num_bits == 4
                 and weight_quant.group_size in sm70_tm.COMPRESSED_UINT4_GROUP_SIZES
-                and weight_quant.symmetric
+                # Asymmetric is supported too: TurboMind dequantizes as
+                # (q - zero) * scale, so symmetric is just the zero == 8 case.
+                # Keeping the old symmetric-only gate here silently routed
+                # asymmetric checkpoints to the Marlin MoE kernel instead,
+                # which on SM70 produces NaN logits.
                 and weight_quant.strategy == QuantizationStrategy.GROUP
                 and not weight_quant.actorder
                 and not layer.moe_config.has_bias

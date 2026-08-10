@@ -243,7 +243,7 @@ class CompressedTensorsWNA16TurboMindMoEMethod(CompressedTensorsWNA16MarlinMoEMe
         def _zeros_for(expert_id: int, packed_zp_name: str, scales: torch.Tensor):
             if symmetric:
                 return sm70_tm.symmetric_int4_zeros_like(scales)
-            zeros = sm70_tm.unpack_compressed_zeros(
+            zeros = sm70_tm.unpack_compressed_moe_zeros(
                 getattr(layer, packed_zp_name)[expert_id]
             )
             assert zeros.shape == scales.shape, (
