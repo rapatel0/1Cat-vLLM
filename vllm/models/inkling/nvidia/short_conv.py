@@ -56,20 +56,28 @@ class InklingShortConv(nn.Module):
             loaded_weight = loaded_weight.narrow(0, self.tp_rank * shard, shard)
         param.data.copy_(loaded_weight)
 
-    def forward(self, x: torch.Tensor, positions: torch.Tensor) -> torch.Tensor:
+    def forward(
+        self,
+        x: torch.Tensor,
+        positions: torch.Tensor,
+        out_dtype: torch.dtype | None = None,
+    ) -> torch.Tensor:
         # x: (num_tokens, dim); positions: (num_tokens,) absolute positions.
+        def _ident(t: torch.Tensor) -> torch.Tensor:
+            return t if out_dtype is None else t.to(out_dtype)
+
         attn_metadata = get_forward_context().attn_metadata
         if not isinstance(attn_metadata, dict):
             # Memory-profiling / no metadata: identity (residual).
-            return x
+            return _ident(x)
         m = attn_metadata.get(self.owner.prefix)
         if m is None:
-            return x
+            return _ident(x)
         assert isinstance(m, InklingSconvMetadata)
         cache = self.owner.kv_cache
         if cache.numel() == 0:
             # Cache not yet bound (profiling before KV alloc): identity.
-            return x
+            return _ident(x)
 
         off_s, ws = self.owner.stream_ranges[self.stream_idx]
         block_size = self.owner.block_size
@@ -90,4 +98,5 @@ class InklingShortConv(nn.Module):
             block_size,
             activation=None,
             use_residual=True,
+            out_dtype=out_dtype,
         )

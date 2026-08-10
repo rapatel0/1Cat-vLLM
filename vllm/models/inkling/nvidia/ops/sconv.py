@@ -163,6 +163,7 @@ def fused_sconv(
     block_size: int,
     activation: str | None = None,
     use_residual: bool = True,
+    out_dtype: torch.dtype | None = None,
 ) -> torch.Tensor:
     """Single-launch insert + depthwise causal conv1d over the paged cache.
 
@@ -171,7 +172,13 @@ def fused_sconv(
     under eager / piecewise / full capture.
     """
     T = x.shape[0]
-    out = torch.empty_like(x)
+    # The accumulator is already FP32; only the store narrows. On FP16 models
+    # that store is the one lossy step, so let the caller widen it.
+    out = (
+        torch.empty_like(x)
+        if out_dtype is None
+        else torch.empty(x.shape, dtype=out_dtype, device=x.device)
+    )
     if T == 0:
         return out
     assert x.is_contiguous()

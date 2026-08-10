@@ -136,7 +136,9 @@ def _sconv_add_norm(
     _p("delta_summed", delta)
     shard = tensor_model_parallel_reduce_scatter(delta, dim=-1)
     _p("after_rs", shard)
-    shard = sconv(shard.contiguous(), positions)
+    # FP32 out: the conv accumulates in FP32 already, but narrowing the store
+    # to FP16 overflows on this checkpoint's outlier channels (see add_rmsnorm).
+    shard = sconv(shard.contiguous(), positions, out_dtype=torch.float32)
     _p("after_sconv", shard)
     full = tensor_model_parallel_all_gather(shard, dim=-1)
     _p("after_ag", full)

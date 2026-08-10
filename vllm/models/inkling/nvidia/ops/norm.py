@@ -157,16 +157,15 @@ def add_rmsnorm(
     assert residual.ndim == 2 and delta.ndim == 2, (residual.shape, delta.shape)
     n_rows, n_cols = residual.shape
     assert weight.shape[0] == n_cols
-    # The residual stream is kept in FP32 while the normed output stays in the
-    # model dtype.
+    # Both the residual stream and the incoming delta may be FP32 while the
+    # normed output stays in the model dtype.
     #
-    # Inkling is a BF16 model and its residual grows geometrically with depth
-    # -- measured ~1.55x per layer on this checkpoint, from 59 after layer 0 to
-    # 1544 after layer 9 -- which BF16 absorbs (max ~3.4e38) and FP16 does not
-    # (max 65504). On Volta, where BF16 does not exist, an FP16 residual goes
-    # non-finite partway up the stack; here that happened at layer 10, and
-    # would happen regardless of the exact layer since 42 layers of that growth
-    # lands around 1e9.
+    # Inkling is a BF16 model, and on this checkpoint the pre-norm sconv delta
+    # carries outlier channels far outside FP16 range: at layer 10 the
+    # reduce-scatter shard owned by TP rank 4 peaks at 7.7e3 and the short
+    # convolution over it overflows FP16 (max 65504) to +inf, which the
+    # all-gather then spreads to every rank and rmsnorm turns into NaN. Volta
+    # has no BF16, so the delta path is widened to FP32 instead.
     #
     # Only the accumulator needs the range: `y` is post-rmsnorm and therefore
     # O(1), so sublayers still receive the model dtype and the quantized GEMMs
@@ -174,7 +173,7 @@ def add_rmsnorm(
     # through `dtype.element_ty`, so it needs no change -- only these two
     # allocations, which previously both aliased the residual's dtype.
     y = torch.empty(
-        (n_rows, n_cols), dtype=delta.dtype, device=residual.device
+        (n_rows, n_cols), dtype=weight.dtype, device=residual.device
     )
     res_out = torch.empty(
         (n_rows, n_cols), dtype=torch.float32, device=residual.device
