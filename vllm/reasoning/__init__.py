@@ -84,6 +84,10 @@ _REASONING_PARSERS_TO_REGISTER = {
         "qwen3_reasoning_parser",
         "Qwen3ReasoningParser",
     ),
+    "inkling": (
+        "inkling_reasoning_parser",
+        "InklingParserReasoningAdapter",
+    ),
     "minimax_m2": (
         "minimax_m2_reasoning_parser",
         "MiniMaxM2ReasoningParser",

@@ -20,16 +20,6 @@ _PARSERS_TO_REGISTER = {
         "minimax_m2_parser",  # filename
         "MiniMaxM2Parser",  # class_name
     ),
-    # vllm/parser/inkling.py ships an InklingParser whose config declares
-    # name="inkling", but nothing registered it, so --reasoning-parser inkling
-    # raised "has not been registered". It is a unified ParserEngine handling
-    # both reasoning and tool calls, so passing the same name to
-    # --reasoning-parser and --tool-call-parser takes ParserManager.get_parser's
-    # strategy 1 and returns it for both.
-    "inkling": (
-        "inkling",
-        "InklingParser",
-    ),
 }
 
 

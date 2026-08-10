@@ -122,6 +122,10 @@ _TOOL_PARSERS_TO_REGISTER = {
         "qwen3xml_tool_parser",
         "Qwen3XMLToolParser",
     ),
+    "inkling": (
+        "inkling_tool_parser",
+        "InklingEngineToolParser",
+    ),
     "minimax_m2": (
         "minimax_m2_tool_parser",
         "MinimaxM2ToolParser",
