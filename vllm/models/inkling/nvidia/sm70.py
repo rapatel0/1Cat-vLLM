@@ -255,11 +255,23 @@ def inkling_sm70_rel_attention(
     assert q.dim() == 3, f"expected (tokens, heads, dim) q, got {tuple(q.shape)}"
 
     num_tokens, num_heads, head_dim = q.shape
-    num_kv_heads = key_cache.shape[2]
+    # InklingAttention._split_kv_cache transposes and splits into
+    # (num_blocks, block_size, num_kv_heads, head_dim). The kernel indexes
+    # those axes positionally, so pin the assumption: if the cache layout ever
+    # changes, the gather would silently read the wrong slots rather than
+    # fail, and the model would just get quietly worse.
+    assert key_cache.dim() == 4 and key_cache.shape[-1] == head_dim, (
+        "expected (num_blocks, block_size, num_kv_heads, head_dim) kv cache, "
+        f"got {tuple(key_cache.shape)} for head_dim {head_dim}"
+    )
+    assert value_cache.shape == key_cache.shape
     block_size = key_cache.shape[1]
+    num_kv_heads = key_cache.shape[2]
     batch = cache_seqlens.shape[0]
 
-    assert num_heads % num_kv_heads == 0
+    assert num_heads % num_kv_heads == 0, (
+        f"{num_heads} query heads is not a multiple of {num_kv_heads} KV heads"
+    )
     q_per_kv = num_heads // num_kv_heads
 
     if out is None:
