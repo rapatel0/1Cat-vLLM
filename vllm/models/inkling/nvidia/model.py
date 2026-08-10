@@ -8,7 +8,11 @@ from collections.abc import Iterable
 from typing import Any, TypeAlias
 
 import regex as re
+import os
+
 import torch
+
+from vllm.logger import init_logger
 from torch import nn
 
 from vllm.config import VllmConfig
@@ -121,6 +125,9 @@ def _sconv_add_norm(
     if norm is None:
         return None, hidden + full
     return add_rmsnorm(hidden, full, norm_w, eps)
+
+
+logger = init_logger(__name__)
 
 
 class InklingDecoderLayer(nn.Module):
@@ -340,7 +347,14 @@ class InklingModel(nn.Module):
             )
 
         pending: tuple[InklingDelta, InklingShortConv] | None = None
-        for layer in self.layers[self.start_layer : self.end_layer]:
+        # Debug bisect: report the first layer whose output goes non-finite.
+        # Layers 0-1 are the unquantized dense prefix, so a NaN there clears
+        # the quantized path entirely. Off unless INKLING_DEBUG_NAN=1; the
+        # check forces a device sync per layer.
+        _debug_nan = os.environ.get("INKLING_DEBUG_NAN") == "1"
+        for _lidx, layer in enumerate(
+            self.layers[self.start_layer : self.end_layer], start=self.start_layer
+        ):
             hidden_states, pending = layer(
                 positions,
                 hidden_states,
@@ -349,6 +363,20 @@ class InklingModel(nn.Module):
                 attn_in=attn_in0,
                 log_scaling=log_scaling,
             )
+            if _debug_nan:
+                h = hidden_states
+                bad = not torch.isfinite(h).all().item()
+                logger.info(
+                    "INKLING_DEBUG_NAN layer=%d finite=%s absmax=%s",
+                    _lidx,
+                    not bad,
+                    f"{h.abs().max().item():.4g}",
+                )
+                if bad:
+                    raise RuntimeError(
+                        f"INKLING_DEBUG_NAN: first non-finite hidden state at "
+                        f"layer {_lidx}"
+                    )
             attn_in0 = None
 
         if not get_pp_group().is_last_rank:
