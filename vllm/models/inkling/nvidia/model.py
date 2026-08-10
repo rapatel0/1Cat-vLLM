@@ -69,6 +69,11 @@ def _layer_id(name: str) -> int | None:
     return int(m.group(1)) if m else None
 
 
+# Power of two: scaling by it is exact in FP16 (exponent shift only), so the
+# conv-state cache round trip loses no precision relative to storing unscaled.
+_SCONV_CACHE_SCALE = 1.0 / 64.0
+
+
 def _sconv_add_norm(
     delta: InklingDelta,
     hidden: torch.Tensor,
@@ -151,7 +156,31 @@ def _sconv_add_norm(
     _p("after_rs", shard)
     # FP32 out: the conv accumulates in FP32 already, but narrowing the store
     # to FP16 overflows on this checkpoint's outlier channels (see add_rmsnorm).
-    shard = sconv(shard.contiguous(), positions, out_dtype=torch.float32)
+    #
+    # The taps themselves also have to survive a round trip. fused_sconv writes
+    # this shard into the paged conv-state cache, which is FP16, and on the next
+    # step reads W-1 of the W taps back out of it. Measured prefill peaks per TP
+    # rank: rank 7 1.042e5 and rank 3 8.564e4, both past FP16's 65504, so those
+    # ranks stored +inf and the first decode step read it back and produced NaN.
+    # Prefill was unaffected because it takes every tap from `x` in registers.
+    #
+    # Scaled rather than widened: the cache is a SlidingWindowSpec registered
+    # with the hybrid KV-cache allocator, so changing its dtype changes
+    # page_size_bytes and perturbs page-size grouping and the KV budget. A
+    # power-of-two scale is exact in FP16 -- it only shifts the exponent -- and
+    # costs no memory and no bandwidth. 1/64 puts the measured peak at 1.6e3
+    # (40x headroom); the conv and its residual term are both linear, so
+    # undoing the scale on the output is exact.
+    #
+    # The invariant this relies on: every write to these two streams goes
+    # through here, so the cache is uniformly scaled. The K/V streams live in
+    # different regions of the same cache (off_s/ws) and are written by
+    # qkvr_prep at O(65), so they are untouched by this.
+    shard = sconv(
+        shard.mul(_SCONV_CACHE_SCALE).contiguous(), positions,
+        out_dtype=torch.float32,
+    )
+    shard = shard.mul_(1.0 / _SCONV_CACHE_SCALE)
     _p("after_sconv", shard)
     full = tensor_model_parallel_all_gather(shard, dim=-1)
     _p("after_ag", full)
