@@ -242,9 +242,34 @@ class InklingAttention(nn.Module, AttentionLayerBase):
         )
 
     def _split_kv_cache(self) -> tuple[torch.Tensor, torch.Tensor]:
-        key_cache, value_cache = self.kv_cache.transpose(1, 2).split(
-            self.head_dim, dim=-1
-        )
+        """Return the K and V views as (num_blocks, block_size, heads, dim).
+
+        The two FlashAttention backends disagree on how the bound cache holds
+        K and V, and upstream's split only handles its own:
+
+          upstream  (num_blocks, num_kv_heads, block_size, 2 * head_size)
+                    K/V packed into the content dim
+          this fork (num_blocks, 2, block_size, num_kv_heads, head_size)
+                    K/V on a separate leading axis
+
+        Upstream's `transpose(1, 2).split(head_dim, dim=-1)` on the fork's
+        5-D layout leaves a trailing dim of exactly head_dim, so `split`
+        returns a single chunk and the unpack raises
+        "not enough values to unpack (expected 2, got 1)".
+
+        Both layouts are handled here by rank, since the intermediate that
+        `sm70.inkling_sm70_rel_attention` and `fused_qkvr_prep` consume is the
+        same either way.
+        """
+        cache = self.kv_cache
+        if cache.dim() == 5:
+            # (num_blocks, 2, block_size, num_kv_heads, head_size)
+            key_cache, value_cache = cache.unbind(1)
+        else:
+            # (num_blocks, num_kv_heads, block_size, 2 * head_size)
+            key_cache, value_cache = cache.transpose(1, 2).split(
+                self.head_dim, dim=-1
+            )
         return (
             canonicalize_singleton_dim_strides(key_cache),
             canonicalize_singleton_dim_strides(value_cache),
