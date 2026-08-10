@@ -1450,9 +1450,13 @@ class _RoutedExpertsWrapper(torch.nn.Module):
     def moe_config(self):
         return self.routed_experts.moe_config
 
-    @property
-    def quant_method(self):
-        return self.routed_experts.quant_method
+    # NB: deliberately no `quant_method` property. Post-load processing selects
+    # layers with `getattr(module, "quant_method", None)` and passes the module
+    # itself as the layer, so exposing the child's quant method here makes this
+    # wrapper get processed as though it owned the expert weights -- it does
+    # not, and it fails on the first parameter access
+    # (AttributeError: w13_weight_g_idx). The inner FusedMoE is a registered
+    # child, so it is visited on its own with the right `layer`.
 
     def forward(self, *args, **kwargs) -> torch.Tensor:
         return self.routed_experts(*args, **kwargs)
