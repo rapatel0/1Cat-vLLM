@@ -420,9 +420,18 @@ class InklingModel(nn.Module):
             config.num_hidden_layers, get_layer, prefix=f"{prefix}.layers"
         )
         self.norm = InklingRMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
+        # The receive buffers must match what forward() sends: FP32, not the
+        # model dtype. The generic factory allocates in the model dtype, which
+        # is FP16 here and cannot hold the residual (peaks 1.26e6 vs 65504).
+        _generic_factory = make_empty_intermediate_tensors_factory(
             ["hidden_states"], config.hidden_size
         )
+
+        def _fp32_intermediate_tensors(batch_size, dtype, device):
+            del dtype  # deliberately ignored; see above
+            return _generic_factory(batch_size, torch.float32, device)
+
+        self.make_empty_intermediate_tensors = _fp32_intermediate_tensors
 
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         # Row gather + embed_norm in one launch.
@@ -506,7 +515,19 @@ class InklingModel(nn.Module):
                 hidden_states = _sconv_add_norm(
                     pending[0], hidden_states, pending[1], None, positions
                 )[1]
-            return IntermediateTensors({"hidden_states": hidden_states})
+            # The pipeline hand-off must stay FP32. `hidden_states` here is the
+            # residual stream, which peaks at 1.26e6 on this checkpoint --
+            # Inkling is bf16-native and Volta has no bf16, so the unnormalised
+            # accumulator is carried in FP32 (see ops/norm.add_rmsnorm). vLLM's
+            # make_empty_intermediate_tensors_factory allocates the receive
+            # buffers in the *model* dtype, i.e. FP16, whose max is 65504, so a
+            # mechanical PP2 x TP4 run overflowed the boundary to +inf and
+            # produced NaN logits -- argmax then emits token id 0, which is "!".
+            # Same root cause as the six FP16 overflow sites in the text path,
+            # just at a stage boundary rather than inside a layer.
+            return IntermediateTensors(
+                {"hidden_states": hidden_states.to(torch.float32)}
+            )
         if pending is not None:
             # Final RS/sconv/AG + residual add fused with the final rmsnorm.
             norm_out = _sconv_add_norm(
