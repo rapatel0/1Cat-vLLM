@@ -4,6 +4,8 @@
 
 from __future__ import annotations
 
+import os
+
 from collections.abc import Iterable, Mapping, Sequence
 from typing import Any, cast
 
@@ -46,7 +48,19 @@ from ..configs import InklingMMConfig
 # Maximum audio tokens accepted per clip. At the dMel rate of 20 tokens/s
 # (50 ms hop) this is ~10 minutes of audio. It bounds the persistent per-request
 # buffers and the encoder/memory budget; longer clips are rejected up front.
-MAX_AUDIO_TOKENS = 12_000
+# The dMel tower emits roughly 10 tokens per second of audio, so 12,000 tokens
+# is the model card's stated 20-minute maximum clip. That maximum is what gets
+# *budgeted*: the dummy audio used for profiling is sized to it (see
+# get_dummy_mm_data below), and vLLM then reserves an encoder cache of the same
+# size. On 8x32GB V100s that reservation alone drives available KV cache
+# negative (-2.44 GiB at 8 slots, util 0.85), so audio cannot be enabled at all
+# unless the ceiling is lowered.
+#
+# Overridable so clip length can be traded against memory. 12,000 keeps the
+# documented 20-minute ceiling; 1,200 gives 2 minutes at roughly a tenth of the
+# encoder-cache cost. Clips longer than this are rejected at line ~230, so this
+# is a real capability limit, not just a profiling hint.
+MAX_AUDIO_TOKENS = int(os.getenv("INKLING_MAX_AUDIO_TOKENS", "12000"))
 
 
 class InklingMultiModalDataParser(MultiModalDataParser):
