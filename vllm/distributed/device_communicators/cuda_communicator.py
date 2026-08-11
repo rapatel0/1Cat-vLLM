@@ -449,6 +449,50 @@ class CudaCommunicator(DeviceCommunicatorBase):
             )
         return out
 
+    def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
+        """All-gather over the PyNccl communicator rather than the process group.
+
+        The base implementation calls dist.all_gather_into_tensor, which runs on
+        ProcessGroupNCCL. That communicator is created lazily on first use, and
+        its setup allocates from the driver -- outside PyTorch's caching
+        allocator. On this deployment the first all-gather happens inside
+        profile_run, at the memory high-water mark, and the allocation fails:
+
+          ncclUnhandledCudaError: Failed to CUDA calloc async 136 bytes
+
+        with 8-11 GiB free at steady state. reduce_scatter, immediately before
+        it in _sconv_add_norm, goes through PyNccl and always succeeds, which is
+        what localises the fault to the second communicator rather than to
+        memory pressure as such.
+
+        PyNccl is already initialised by this point, so routing the all-gather
+        through it removes the lazy communicator entirely. Shape handling is
+        copied from BaseDeviceCommunicator.all_gather, including the
+        concat-style gather (stack-style breaks torch.compile, see
+        pytorch/pytorch#138795).
+        """
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is None or pynccl_comm.disabled:
+            return super().all_gather(input_, dim)
+
+        if dim < 0:
+            dim += input_.dim()
+        input_ = input_.contiguous()
+        input_size = input_.size()
+        output_size = (input_size[0] * self.world_size,) + input_size[1:]
+        output_tensor = torch.empty(
+            output_size, dtype=input_.dtype, device=input_.device
+        )
+        pynccl_comm.all_gather(output_tensor, input_)
+        output_tensor = output_tensor.reshape((self.world_size,) + input_size)
+        output_tensor = output_tensor.movedim(0, dim)
+        output_tensor = output_tensor.reshape(
+            input_size[:dim]
+            + (self.world_size * input_size[dim],)
+            + input_size[dim + 1 :]
+        )
+        return output_tensor
+
     def reduce_scatter(self, input_: torch.Tensor, dim: int = -1):
         world_size = self.world_size
         pynccl_comm = self.pynccl_comm
