@@ -284,7 +284,18 @@ def inkling_sm70_rel_attention(
 
     # Volta has 96 KB of shared memory per SM; 64x64 tiles at head_dim 128 keep
     # q/k/v tiles resident with room for the FP32 accumulator.
-    block_m = 64
+    #
+    # BLOCK_M is sized to the actual query length. A decode step has
+    # seqlen_q == 1, and a fixed BLOCK_M of 64 made the kernel compute a 64x64
+    # tl.dot and gather a 64x64 relative-bias tile for a single valid row --
+    # about 64x wasted work. A decode profile put this kernel at 33.8% of GPU
+    # time, 326us/call, by far the largest single consumer, which is what that
+    # waste looks like. Correctness never depended on the tile size: rows are
+    # masked by m_valid and the store is masked identically, so shrinking
+    # BLOCK_M only removes work that was being discarded.
+    #
+    # 16 is the floor: tl.dot requires M >= 16 on this Triton/arch pair.
+    block_m = 64 if max_seqlen_q > 32 else 16
     block_n = 64
 
     grid = (triton.cdiv(max_seqlen_q, block_m), num_heads, batch)

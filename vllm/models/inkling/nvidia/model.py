@@ -72,6 +72,9 @@ def _layer_id(name: str) -> int | None:
 # Power of two: scaling by it is exact in FP16 (exponent shift only), so the
 # conv-state cache round trip loses no precision relative to storing unscaled.
 _SCONV_CACHE_SCALE = 1.0 / 64.0
+# Same rationale as _SCONV_CACHE_SCALE, applied to the reduce-scatter wire
+# format. Power of two, so the scale itself is exact in FP16.
+_SCONV_RS_SCALE = 1.0 / 64.0
 
 
 def _sconv_add_norm(
@@ -161,7 +164,23 @@ def _sconv_add_norm(
     if shared_delta is not None:
         delta.add_(shared_delta)
     _p("delta_summed", delta)
-    shard = tensor_model_parallel_reduce_scatter(delta, dim=-1)
+    # Reduce-scatter in scaled FP16 rather than FP32.
+    #
+    # A decode profile put ncclDevKernel_ReduceScatter_Sum_f32 at 23.9% of GPU
+    # time, 115us/call against AllGather's 39us at a similar call count -- the
+    # f32 being a consequence of widening this path to fix the FP16 overflow.
+    # The values genuinely do not fit FP16 (measured up to 1.9e5 against a
+    # 65504 max), but they fit comfortably once scaled: the same power-of-two
+    # trick already used for the conv-state cache, exponent-only and so exact
+    # in the mantissa. 1/64 puts the measured peak near 3.0e3.
+    #
+    # The sum is still accumulated in FP32 before the cast, so only the wire
+    # format narrows; NCCL then reduces in FP16, which costs the same relative
+    # precision the surrounding activations already carry.
+    shard = tensor_model_parallel_reduce_scatter(
+        delta.mul_(_SCONV_RS_SCALE).to(torch.float16), dim=-1
+    )
+    shard = shard.to(torch.float32).mul_(1.0 / _SCONV_RS_SCALE)
     _p("after_rs", shard)
     # FP32 out: the conv accumulates in FP32 already, but narrowing the store
     # to FP16 overflows on this checkpoint's outlier channels (see add_rmsnorm).
