@@ -208,9 +208,17 @@ def _sconv_add_norm(
         shard.mul(_SCONV_CACHE_SCALE).contiguous(), positions,
         out_dtype=torch.float32,
     )
-    shard = shard.mul_(1.0 / _SCONV_CACHE_SCALE)
-    _p("after_sconv", shard)
-    full = tensor_model_parallel_all_gather(shard, dim=-1)
+    _p("after_sconv_scaled", shard)
+    # All-gather in scaled FP16 too. The conv output is still scaled by
+    # _SCONV_CACHE_SCALE at this point (the unscale that used to sit right after
+    # the conv has moved below), so it already fits FP16: the measured 1.9e5
+    # peak scales to ~3.0e3. Halves the bytes on the second collective, and the
+    # single unscale afterwards is one pass over the gathered tensor instead of
+    # one over each rank's shard.
+    full = tensor_model_parallel_all_gather(
+        shard.to(torch.float16), dim=-1
+    )
+    full = full.to(torch.float32).mul_(1.0 / _SCONV_CACHE_SCALE)
     _p("after_ag", full)
     if norm is None:
         return None, hidden + full
