@@ -151,10 +151,27 @@ class StreamingParserEngine:
 
         self._lexer = IncrementalLexer(lexer_shape, content_terminal=CONTENT_TERMINAL)
 
-        self._tool_terminals: frozenset[str] = frozenset(
+        # A terminal counts as a tool terminal only if it is used EXCLUSIVELY
+        # around tool states. Touching a tool state in one transition is not
+        # enough: a grammar may reuse a single block-end terminal to close
+        # every kind of block, and Inkling does exactly that -- <|end_message|>
+        # closes thinking, text and tool blocks alike. Classifying it as a tool
+        # terminal made the skip_tool_parsing branch in _on_terminal re-emit it
+        # as a visible TEXT_CHUNK, so every reasoning response came back with a
+        # literal "<|end_message|>" glued to the front of its content.
+        _tool_linked = {
             terminal
             for (state, terminal), tr in config.transitions.items()
             if tr.next_state in self._TOOL_STATES or state in self._TOOL_STATES
+        }
+        _non_tool_linked = {
+            terminal
+            for (state, terminal), tr in config.transitions.items()
+            if tr.next_state not in self._TOOL_STATES
+            and state not in self._TOOL_STATES
+        }
+        self._tool_terminals: frozenset[str] = frozenset(
+            _tool_linked - _non_tool_linked
         )
 
         self.skip_tool_parsing = False
