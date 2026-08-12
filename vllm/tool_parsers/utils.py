@@ -169,6 +169,27 @@ def find_tool_properties(
     return {}
 
 
+def find_tool_name(
+    tools: list[Tool] | None,
+    tool_name: str,
+) -> bool:
+    """True if ``tool_name`` names one of ``tools``.
+
+    ``parser_engine`` imports this but it was never written, so importing
+    ParserEngine raised ImportError and every parser built on it -- Inkling's
+    included -- failed to register. That surfaced only as
+    ``--enable-auto-tool-choice requires tool_parser:'inkling' which has not
+    been registered``, which reads like a registration bug rather than a
+    missing symbol two imports down.
+
+    No caller reaches it when ``validate_tool_names`` is False (the engine
+    short-circuits first), which is why the gap went unnoticed.
+    """
+    if not tools:
+        return False
+    return any(_extract_tool_info(tool)[0] == tool_name for tool in tools)
+
+
 def _get_tool_schema_from_tool(tool: Tool) -> dict:
     name, params = _extract_tool_info(tool)
     params = params if params else {"type": "object", "properties": {}}
