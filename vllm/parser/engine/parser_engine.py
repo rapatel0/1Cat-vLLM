@@ -425,6 +425,41 @@ class ParserEngine(Parser):
                 content = ""
         return content or None
 
+    def _initialize_history_tool_call_cnt(
+        self,
+        request: "ChatCompletionRequest | ResponsesRequest",
+    ) -> None:
+        """Seed the tool-call index from prior assistant tool calls, once.
+
+        Referenced by ``parse``/``parse_delta`` but never defined in this fork
+        -- the vendored subset dropped whatever upstream mixin supplied it, so
+        both entry points raised AttributeError the moment a unified
+        ParserEngine was actually registered. Nothing hit that path until
+        Inkling was registered as a unified parser, which is why it went
+        unnoticed.
+
+        The serving layer seeds ``_stream_state.history_tool_call_cnt`` before
+        the first delta, so this must never overwrite a non-zero value; it
+        exists for parsers constructed directly (tests, offline harnesses).
+        """
+        if getattr(self, "_history_tool_call_cnt_initialized", False):
+            return
+        self._history_tool_call_cnt_initialized = True
+        if self._stream_state.history_tool_call_cnt:
+            return
+        messages = getattr(request, "messages", None) or []
+        count = 0
+        for message in messages:
+            if isinstance(message, dict):
+                role = message.get("role")
+                tool_calls = message.get("tool_calls")
+            else:
+                role = getattr(message, "role", None)
+                tool_calls = getattr(message, "tool_calls", None)
+            if role == "assistant" and tool_calls:
+                count += len(list(tool_calls))
+        self._stream_state.history_tool_call_cnt = count
+
     # ── Streaming: parse_delta ────────────────────────────────────────
 
     def parse_delta(
@@ -434,7 +469,7 @@ class ParserEngine(Parser):
         request: ChatCompletionRequest | ResponsesRequest,
         prompt_token_ids: list[int] | None = None,
         *,
-        finished: bool,
+        finished: bool = False,
     ) -> DeltaMessage | None:
         self._initialize_history_tool_call_cnt(request)
         if not self._prompt_streaming_prepared and prompt_token_ids is not None:

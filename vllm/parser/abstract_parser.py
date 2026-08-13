@@ -320,6 +320,8 @@ class Parser:
         delta_token_ids: list[int],
         request: ChatCompletionRequest | ResponsesRequest,
         prompt_token_ids: list[int] | None = None,
+        *,
+        finished: bool = False,
     ) -> DeltaMessage | None:
         """Parse a single streaming delta, orchestrating reasoning then
         tool call extraction via internal stream state.
@@ -662,7 +664,13 @@ class DelegatingParser(Parser):
         delta_token_ids: list[int],
         request: ChatCompletionRequest | ResponsesRequest,
         prompt_token_ids: list[int] | None = None,
+        *,
+        finished: bool = False,
     ) -> DeltaMessage | None:
+        # `finished` is accepted for signature parity with ParserEngine, which
+        # needs it to flush trailing state. This implementation drives the two
+        # wrapped parsers incrementally and has nothing to flush.
+        del finished
         state = self._stream_state
 
         if not state.prompt_reasoning_checked and prompt_token_ids is not None:
