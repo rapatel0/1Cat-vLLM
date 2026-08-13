@@ -18,6 +18,8 @@ translated to the standard per-expert loads in
 
 from __future__ import annotations
 
+import os
+
 import math
 import re
 from typing import TYPE_CHECKING
@@ -289,6 +291,12 @@ def _inkling_moe_ep_size() -> int:
 # a true-magnitude tensor and there is no cross-module scaling contract to keep
 # in sync -- the same reasoning as the conv-state cache scale in model.py,
 # which does need such a contract because the cache itself holds scaled values.
+# Must match VLLM_SM70_MOE_W13_UP_DIV, which the shared SM70 AWQ MoE path folds
+# into the UP half of the W13 dequant scales at load time. Read from the same
+# env so the two cannot drift apart -- if they do, outputs are silently scaled
+# wrong rather than failing loudly.
+_W13_UP_DIV = float(os.getenv("VLLM_SM70_MOE_W13_UP_DIV", "1") or "1")
+
 _SINK_OUTPUT_SCALE = 1.0 / 64.0
 _ROUTED_OUTPUT_SCALE = 1.0 / 64.0
 
@@ -568,7 +576,16 @@ class InklingMoE(nn.Module):
         # headroom) and the sink store sat at 1.3x, so neither is safe to keep
         # in FP16 -- these are residual contributions and carry the model's
         # unnormalised range, which on a BF16-native model FP16 does not have.
-        out = out.float().mul_(1.0 / _ROUTED_OUTPUT_SCALE)
+        # Two scales come off here, not one. _ROUTED_OUTPUT_SCALE was folded
+        # into the router weights, which the fused op applies AFTER the expert
+        # GEMMs -- so it never protected the FP16 per-expert stage stores
+        # (the up projection, the SwiGLU product, the W2 output). That is why
+        # widening it did nothing for the tool-prompt NaN.
+        #
+        # _W13_UP_DIV is folded into the UP half of the W13 dequant scales, so
+        # every one of those stores is smaller by that factor while silu(gate)
+        # is untouched. Undone here, in FP32, where the true magnitude fits.
+        out = out.float().mul_(_W13_UP_DIV / _ROUTED_OUTPUT_SCALE)
         return out, sink_out
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:

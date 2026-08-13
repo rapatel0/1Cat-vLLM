@@ -84,13 +84,79 @@ def _legacy_single_token_compact_enabled() -> bool:
     return hasattr(torch.ops._C, "awq_moe_single_token_sm70_out")
 
 
+# Divisor folded into the UP half of the W13 dequant scales at load time. OFF
+# (1) by default: this file is shared with other SM70 models, and only a model
+# that applies the matching FP32 unscale may enable it. Inkling does, in
+# models/inkling/nvidia/moe.py.
+#
+# Why the up half specifically. SwiGLU is nonlinear, so scaling the expert
+# INPUT is invalid: silu(S*g)*(S*u) != S^2 * silu(g)*u. But the up branch enters
+# only as a factor, so
+#     silu(g) * (u/S) == (silu(g) * u) / S
+# is exact. Dividing just the up-half scales therefore shrinks the up store, the
+# SwiGLU product and the W2 input/output together, while silu(gate) stays
+# bit-identical. Powers of two only -- a pure exponent shift, no mantissa loss.
+#
+# Scaling AFTER the SwiGLU would be too late: torch.ops._C.silu_and_mul both
+# computes and stores the product into an FP16 buffer, so an overflow has
+# already happened inside that kernel before any Python-side .mul_() runs.
+#
+# This does NOT protect the gate projection. If gate is the first tensor to go
+# non-finite, it needs an FP32 W13 output instead.
+_W13_UP_DIV = float(os.getenv("VLLM_SM70_MOE_W13_UP_DIV", "1") or "1")
+
+
+# Lightweight per-stage finiteness probe. The full buffer dump
+# (VLLM_SM70_DUMP_AWQ_MOE_BUFFERS) writes whole tensors to disk, which is far
+# too heavy to leave on; this only reduces to a bool + absmax so it can run on
+# a real failing request. Set VLLM_SM70_MOE_FINITE_CHECK=1.
+_MOE_FINITE_CHECK = os.getenv("VLLM_SM70_MOE_FINITE_CHECK") == "1"
+
+
+def _stage_absmax(t: torch.Tensor) -> float:
+    return float(t.abs().max().item()) if t.numel() else 0.0
+
+
 def _silu_and_mul_w13(
     layer: RoutedExperts, out: torch.Tensor, gate_up: torch.Tensor
 ) -> None:
+    if (
+        _MOE_FINITE_CHECK
+        and gate_up.numel()
+        and torch.cuda.current_stream().cuda_stream is not None
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        if not bool(torch.isfinite(gate_up).all().item()):
+            logger.error(
+                "SM70_MOE_NONFINITE stage=gate_up (W13 out) layer=%s tokens=%s",
+                getattr(layer, "sm70_awq_moe_layer_id", "?"),
+                gate_up.shape[0],
+            )
+        else:
+            logger.info(
+                "SM70_MOE_STAGE gate_up finite absmax=%.4g tokens=%s",
+                _stage_absmax(gate_up),
+                gate_up.shape[0],
+            )
     if getattr(layer, "sm70_awq_moe_w13_interleaved", False):
         sm70_ops.silu_and_mul_interleaved(out, gate_up)
     else:
         torch.ops._C.silu_and_mul(out, gate_up)
+    if (
+        _MOE_FINITE_CHECK
+        and out.numel()
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        if not bool(torch.isfinite(out).all().item()):
+            logger.error(
+                "SM70_MOE_NONFINITE stage=silu_out layer=%s tokens=%s",
+                getattr(layer, "sm70_awq_moe_layer_id", "?"),
+                out.shape[0],
+            )
+        else:
+            logger.info(
+                "SM70_MOE_STAGE silu_out finite absmax=%.4g", _stage_absmax(out)
+            )
 
 
 def _parse_layer_id_filter(raw: str | None, env_name: str) -> set[int] | None:
@@ -592,6 +658,24 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         # single-token compact op. This keeps the compact speed path without
         # carrying a second per-expert W13 TurboMind copy.
         w13_interleaved = build_legacy_w13
+        if _W13_UP_DIV != 1.0:
+            # Contiguous [gate | up] halves along the output dim when not
+            # interleaved, so the up projection is the second half. Applied to
+            # the scales rather than the packed weights: the quantised ints are
+            # untouched and only the dequant multiplier moves, which keeps this
+            # an exact power-of-two shift.
+            n_out = layer.w13_scales.shape[-1]
+            if w13_interleaved:
+                layer.w13_scales[..., 1::2].div_(_W13_UP_DIV)
+            else:
+                layer.w13_scales[..., n_out // 2 :].div_(_W13_UP_DIV)
+            logger.info(
+                "SM70 AWQ MoE: divided W13 up-half scales by %.6g "
+                "(interleaved=%s, n_out=%d)",
+                _W13_UP_DIV,
+                w13_interleaved,
+                n_out,
+            )
         for expert_id in range(num_experts):
             r13 = sm70_ops.awq_sm70_prepare(
                 layer.w13_qweight[expert_id],
@@ -696,6 +780,11 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         )
 
     def _allocate_buffers(self, layer: RoutedExperts) -> None:
+        # torch.zeros, NOT torch.empty: these persistent buffers are read on
+        # their very first use, and any element a kernel never writes stays as
+        # whatever the allocator handed back. See the matching note in
+        # _get_buffers -- garbage in an index buffer becomes an out-of-range
+        # gather rather than merely a wrong value.
         device = layer.w13_tm_weight.device
         top_k = self.moe.experts_per_token
         persistent_tokens = _DEFAULT_PERSISTENT_MAX_TOKENS
@@ -703,79 +792,79 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer._awq_moe_buf_max_tokens = persistent_tokens
         layer._awq_moe_buf_max_slots = max_slots
         layer._awq_moe_buf_top_k = top_k
-        layer._awq_moe_buf_output = torch.empty(
+        layer._awq_moe_buf_output = torch.zeros(
             persistent_tokens,
             layer.sm70_hidden_logical_size,
             dtype=torch.float16,
             device=device,
         )
-        layer._awq_moe_buf_permuted_input = torch.empty(
+        layer._awq_moe_buf_permuted_input = torch.zeros(
             max_slots,
             layer.sm70_hidden_logical_size,
             dtype=torch.float16,
             device=device,
         )
-        layer._awq_moe_buf_gate_up = torch.empty(
+        layer._awq_moe_buf_gate_up = torch.zeros(
             max_slots, layer.sm70_w13_n_dim, dtype=torch.float16, device=device
         )
-        layer._awq_moe_buf_intermediate = torch.empty(
+        layer._awq_moe_buf_intermediate = torch.zeros(
             max_slots,
             layer.sm70_intermediate_size,
             dtype=torch.float16,
             device=device,
         )
-        layer._awq_moe_buf_sorted_output = torch.empty(
+        layer._awq_moe_buf_sorted_output = torch.zeros(
             max_slots, layer.sm70_w2_n_dim, dtype=torch.float16, device=device
         )
-        layer._awq_moe_buf_expert_offsets = torch.empty(
+        layer._awq_moe_buf_expert_offsets = torch.zeros(
             layer.sm70_num_experts + 1, dtype=torch.int32, device=device
         )
-        layer._awq_moe_buf_expert_offsets64 = torch.empty(
+        layer._awq_moe_buf_expert_offsets64 = torch.zeros(
             layer.sm70_num_experts + 1, dtype=torch.int64, device=device
         )
-        layer._awq_moe_buf_inv_permuted_idx = torch.empty(
+        layer._awq_moe_buf_inv_permuted_idx = torch.zeros(
             persistent_tokens, top_k, dtype=torch.int32, device=device
         )
-        layer._awq_moe_buf_topk_ids = torch.empty(
+        layer._awq_moe_buf_topk_ids = torch.zeros(
             persistent_tokens, top_k, dtype=torch.int32, device=device
         )
-        layer._awq_moe_buf_sorted_weights = torch.empty(
+        layer._awq_moe_buf_sorted_weights = torch.zeros(
             persistent_tokens, top_k, dtype=torch.float32, device=device
         )
         layer._awq_moe_buf_token_expert_indices = torch.arange(
             max_slots, dtype=torch.int32, device=device
         ).view(persistent_tokens, top_k)
-        layer._awq_moe_buf_permuted_idx = torch.empty(
+        layer._awq_moe_buf_permuted_idx = torch.zeros(
             max_slots, dtype=torch.int32, device=device
         )
-        layer._awq_moe_buf_sorted_expert_ids = torch.empty(
+        layer._awq_moe_buf_sorted_expert_ids = torch.zeros(
             max_slots, dtype=torch.int32, device=device
         )
         sort_workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
             max_slots, layer.global_num_experts
         )
-        layer._awq_moe_buf_sort_workspace = torch.empty(
+        layer._awq_moe_buf_sort_workspace = torch.zeros(
             sort_workspace_size, dtype=torch.int8, device=device
         )
-        layer._awq_moe_buf_permuted_experts_id = torch.empty(
+        layer._awq_moe_buf_permuted_experts_id = torch.zeros(
             max_slots, dtype=torch.int32, device=device
         )
-        layer._awq_moe_buf_sorted_row_idx = torch.empty(
+        layer._awq_moe_buf_sorted_row_idx = torch.zeros(
             max_slots, dtype=torch.int32, device=device
         )
-        layer._awq_moe_buf_topk_ids_for_sort = torch.empty(
+        layer._awq_moe_buf_topk_ids_for_sort = torch.zeros(
             max_slots, dtype=torch.int32, device=device
         )
-        layer._awq_moe_buf_strict_expert_offsets = torch.empty(
+        layer._awq_moe_buf_strict_expert_offsets = torch.zeros(
             layer.sm70_num_experts + 1, dtype=torch.int32, device=device
         )
-        layer._awq_moe_buf_strict_expert_offsets64 = torch.empty(
+        layer._awq_moe_buf_strict_expert_offsets64 = torch.zeros(
             layer.sm70_num_experts + 1, dtype=torch.int64, device=device
         )
-        layer._awq_moe_buf_strict_inv_permuted_idx = torch.empty(
+        layer._awq_moe_buf_strict_inv_permuted_idx = torch.zeros(
             persistent_tokens, top_k, dtype=torch.int32, device=device
         )
-        layer._awq_moe_buf_strict_sorted_expert_ids = torch.empty(
+        layer._awq_moe_buf_strict_sorted_expert_ids = torch.zeros(
             max_slots, dtype=torch.int32, device=device
         )
         layer._awq_moe_buf_dense_expert_ids = torch.arange(
@@ -784,28 +873,28 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
         layer._awq_moe_buf_active_expert_offsets = torch.arange(
             max_slots + 1, dtype=torch.int32, device=device
         )
-        layer._awq_moe_buf_active_group_indices = torch.empty(
+        layer._awq_moe_buf_active_group_indices = torch.zeros(
             min(max_slots, layer.sm70_num_experts),
             dtype=torch.int32,
             device=device,
         )
         ptr_row_bytes = int(layer.sm70_ptr_row_bytes)
-        layer._awq_moe_buf_compact_w13_ptrs_w = torch.empty(
+        layer._awq_moe_buf_compact_w13_ptrs_w = torch.zeros(
             top_k * ptr_row_bytes, dtype=torch.uint8, device=device
         )
-        layer._awq_moe_buf_compact_w13_ptrs_s = torch.empty(
+        layer._awq_moe_buf_compact_w13_ptrs_s = torch.zeros(
             top_k * ptr_row_bytes, dtype=torch.uint8, device=device
         )
-        layer._awq_moe_buf_legacy_w13_ptrs_w = torch.empty(
+        layer._awq_moe_buf_legacy_w13_ptrs_w = torch.zeros(
             top_k, ptr_row_bytes, dtype=torch.uint8, device=device
         )
-        layer._awq_moe_buf_legacy_w13_ptrs_s = torch.empty(
+        layer._awq_moe_buf_legacy_w13_ptrs_s = torch.zeros(
             top_k, ptr_row_bytes, dtype=torch.uint8, device=device
         )
-        layer._awq_moe_buf_legacy_w2_ptrs_w = torch.empty(
+        layer._awq_moe_buf_legacy_w2_ptrs_w = torch.zeros(
             top_k, ptr_row_bytes, dtype=torch.uint8, device=device
         )
-        layer._awq_moe_buf_legacy_w2_ptrs_s = torch.empty(
+        layer._awq_moe_buf_legacy_w2_ptrs_s = torch.zeros(
             top_k, ptr_row_bytes, dtype=torch.uint8, device=device
         )
 
@@ -891,11 +980,22 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
             legacy_w2_ptrs_w = torch.empty_like(legacy_w2_ptrs_w)
             legacy_w2_ptrs_s = torch.empty_like(legacy_w2_ptrs_s)
             sort_workspace = torch.empty_like(sort_workspace)
+        # torch.zeros, NOT torch.empty. This is the >32-token path: prompts up
+        # to _DEFAULT_PERSISTENT_MAX_TOKENS (32) reuse the persistent buffers,
+        # which earlier passes have already written, while anything larger
+        # allocated fresh UNINITIALISED memory here. Any element a kernel does
+        # not write is then read as garbage, and which elements get written
+        # depends on which of the 256 experts a batch activates -- so the
+        # failure is content-dependent, deterministic within a process, and
+        # varies across processes. Garbage in an INDEX buffer is worse than a
+        # bad value: it becomes an out-of-range gather, which is where the
+        # "CUDA error: an illegal memory access" from the legacy compact path
+        # comes from, and NaN logits ('!!!!' output) otherwise.
         if total_slots > layer._awq_moe_buf_max_slots:
             sort_workspace_size = torch.ops._moe_C.moe_permute_sort_workspace_size(
                 total_slots, layer.global_num_experts
             )
-            sort_workspace = torch.empty(
+            sort_workspace = torch.zeros(
                 sort_workspace_size, dtype=torch.int8, device=device
             )
             active_expert_offsets = torch.arange(
@@ -906,86 +1006,86 @@ class AWQSM70MoEMethod(FusedMoEMethodBase):
                 : total_slots + 1
             ]
         return {
-            "output": torch.empty(
+            "output": torch.zeros(
                 num_tokens,
                 layer.sm70_hidden_logical_size,
                 dtype=torch.float16,
                 device=device,
             ),
-            "permuted_input": torch.empty(
+            "permuted_input": torch.zeros(
                 total_slots,
                 layer.sm70_hidden_logical_size,
                 dtype=torch.float16,
                 device=device,
             ),
-            "gate_up": torch.empty(
+            "gate_up": torch.zeros(
                 total_slots,
                 layer.sm70_w13_n_dim,
                 dtype=torch.float16,
                 device=device,
             ),
-            "intermediate": torch.empty(
+            "intermediate": torch.zeros(
                 total_slots,
                 layer.sm70_intermediate_size,
                 dtype=torch.float16,
                 device=device,
             ),
-            "sorted_output": torch.empty(
+            "sorted_output": torch.zeros(
                 total_slots,
                 layer.sm70_w2_n_dim,
                 dtype=torch.float16,
                 device=device,
             ),
-            "expert_offsets": torch.empty(
+            "expert_offsets": torch.zeros(
                 layer.sm70_num_experts + 1, dtype=torch.int32, device=device
             ),
-            "expert_offsets64": torch.empty(
+            "expert_offsets64": torch.zeros(
                 layer.sm70_num_experts + 1, dtype=torch.int64, device=device
             ),
-            "inv_permuted_idx": torch.empty(
+            "inv_permuted_idx": torch.zeros(
                 num_tokens, top_k, dtype=torch.int32, device=device
             ),
-            "topk_ids": torch.empty(
+            "topk_ids": torch.zeros(
                 num_tokens, top_k, dtype=torch.int32, device=device
             ),
-            "sorted_weights": torch.empty(
+            "sorted_weights": torch.zeros(
                 num_tokens, top_k, dtype=torch.float32, device=device
             ),
             "token_expert_indices": torch.arange(
                 total_slots, dtype=torch.int32, device=device
             ).view(num_tokens, top_k),
-            "permuted_idx": torch.empty(
+            "permuted_idx": torch.zeros(
                 total_slots, dtype=torch.int32, device=device
             ),
-            "sorted_expert_ids": torch.empty(
+            "sorted_expert_ids": torch.zeros(
                 total_slots, dtype=torch.int32, device=device
             ),
             "sort_workspace": sort_workspace,
-            "permuted_experts_id": torch.empty(
+            "permuted_experts_id": torch.zeros(
                 total_slots, dtype=torch.int32, device=device
             ),
-            "sorted_row_idx": torch.empty(
+            "sorted_row_idx": torch.zeros(
                 total_slots, dtype=torch.int32, device=device
             ),
-            "topk_ids_for_sort": torch.empty(
+            "topk_ids_for_sort": torch.zeros(
                 total_slots, dtype=torch.int32, device=device
             ),
             "active_expert_offsets": active_expert_offsets,
-            "active_group_indices": torch.empty(
+            "active_group_indices": torch.zeros(
                 min(total_slots, layer.sm70_num_experts),
                 dtype=torch.int32,
                 device=device,
             ),
-            "strict_expert_offsets": torch.empty(
+            "strict_expert_offsets": torch.zeros(
                 layer.sm70_num_experts + 1, dtype=torch.int32, device=device
             ),
-            "strict_expert_offsets64": torch.empty(
+            "strict_expert_offsets64": torch.zeros(
                 layer.sm70_num_experts + 1, dtype=torch.int64, device=device
             ),
-            "strict_inv_permuted_idx": torch.empty(
+            "strict_inv_permuted_idx": torch.zeros(
                 num_tokens, top_k, dtype=torch.int32, device=device
             ),
-            "strict_sorted_expert_ids": torch.empty(
+            "strict_sorted_expert_ids": torch.zeros(
                 total_slots, dtype=torch.int32, device=device
             ),
             "compact_w13_ptrs_w": compact_w13_ptrs_w,
