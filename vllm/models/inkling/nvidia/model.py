@@ -71,6 +71,18 @@ def _layer_id(name: str) -> int | None:
 
 # Power of two: scaling by it is exact in FP16 (exponent shift only), so the
 # conv-state cache round trip loses no precision relative to storing unscaled.
+
+def _absmax(t: torch.Tensor) -> float:
+    """abs().max() that tolerates empty tensors.
+
+    The startup profiling pass runs zero-token shapes, and torch's max() raises
+    "Expected reduction dim to be specified for input.numel() == 0" on those.
+    That crashed the engine from inside the DEBUG path before the NaN bisect
+    could report a single layer.
+    """
+    return float(t.abs().max().item()) if t.numel() else 0.0
+
+
 _SCONV_CACHE_SCALE = 1.0 / 64.0
 # Same rationale as _SCONV_CACHE_SCALE, applied to the reduce-scatter wire
 # format. Power of two, so the scale itself is exact in FP16.
@@ -134,7 +146,7 @@ def _sconv_add_norm(
                 tag,
                 str(t.dtype).replace("torch.", ""),
                 bool(torch.isfinite(t).all().item()),
-                t.abs().max().item(),
+                _absmax(t),
             )
 
     _p("delta_in", delta)
@@ -343,7 +355,7 @@ class InklingDecoderLayer(nn.Module):
                 tag,
                 str(t.dtype).replace("torch.", ""),
                 bool(torch.isfinite(t).all().item()),
-                t.abs().max().item(),
+                _absmax(t),
             )
 
         _probe("attn_in", attn_in)
@@ -494,14 +506,18 @@ class InklingModel(nn.Module):
                 attn_in=attn_in0,
                 log_scaling=log_scaling,
             )
-            if _debug_nan:
+            # numel() guard: the startup profiling pass runs shapes with zero
+            # tokens, and .max() on an empty tensor raises "Expected reduction
+            # dim to be specified", which crashed the engine before the check
+            # could ever report a layer.
+            if _debug_nan and hidden_states.numel():
                 h = hidden_states
                 bad = not torch.isfinite(h).all().item()
                 logger.info(
                     "INKLING_DEBUG_NAN layer=%d finite=%s absmax=%s",
                     _lidx,
                     not bad,
-                    f"{h.abs().max().item():.4g}",
+                    f"{_absmax(h):.4g}",
                 )
                 if bad:
                     raise RuntimeError(

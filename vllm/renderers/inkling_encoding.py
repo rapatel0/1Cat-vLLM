@@ -116,6 +116,29 @@ def render_inkling_messages(
             all_tools.extend(message.get("tools") or [])
 
     if all_tools:
+        # sm70 WORKAROUND. On V100 this model emits NaN logits -- token id 0,
+        # rendering as '!!!!' -- for any sequence that BEGINS with the
+        # tool_declare block and is 33 or more tokens long. It is deterministic
+        # (6/6 at temperature 0), reproduces on the first request after a cold
+        # start so it is not prefix-cache state, and is independent of prompt
+        # length and tool count: plain prompts of 36-416 tokens are fine, and
+        # prepending a SINGLE token ahead of the tool block makes the identical
+        # request generate correctly.
+        #
+        # Emitting the reasoning-effort system message first is the cheapest
+        # such prefix and is already exercised by every system-prompted
+        # request, so it is known-good at position 0. Without this, every
+        # tool-using client (pi, Hermes) gets a response id followed by silence
+        # while the server burns its whole token budget on NaN.
+        #
+        # Not a fix: the underlying numerical fault is unexplained. Tested and
+        # refuted so far -- the attention tile switch at seqlen_q 32->33
+        # (forcing block_m=16 does not help) and the short-conv kernel width of
+        # 4 (prepending 1 token suffices, not 4).
+        if reasoning_effort is not None:
+            _append_reasoning_effort(input_ids, tokenizer, reasoning_effort)
+            reasoning_effort = None
+
         _append_message(
             input_ids,
             tokenizer,

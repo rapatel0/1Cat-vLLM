@@ -77,6 +77,16 @@ def _snapshot(attn, md):
     }
 
 
+def _absmax(t: "torch.Tensor") -> float:
+    """abs().max() that tolerates the empty tensors of the profiling pass.
+
+    The startup profiling run executes shapes with zero tokens. torch's max()
+    raises "Expected reduction dim to be specified for input.numel() == 0" on
+    those, which killed the engine before the NaN bisect could report anything.
+    """
+    return float(t.abs().max().item()) if t.numel() else 0.0
+
+
 def _dump_failing_attention(attn, q, rel_logits, out, before, q_before) -> None:
     """Save a non-finite SM70 attention call, once per process.
 
@@ -378,7 +388,7 @@ class InklingAttention(nn.Module, AttentionLayerBase):
                     self.prefix,
                     _tag,
                     bool(torch.isfinite(_t).all().item()),
-                    _t.abs().max().item(),
+                    _absmax(_t),
                 )
         qkvr = torch.cat((qkv, r), dim=-1)
 
@@ -442,7 +452,7 @@ class InklingAttention(nn.Module, AttentionLayerBase):
                         _tag,
                         self.is_local,
                         bool(torch.isfinite(_t).all().item()),
-                        _t.abs().max().item(),
+                        _absmax(_t),
                     )
             if _adbg:
                 _kvw = self._split_kv_cache()
@@ -455,9 +465,9 @@ class InklingAttention(nn.Module, AttentionLayerBase):
                     "v_finite=%s v_absmax=%.4g",
                     self.prefix,
                     bool(torch.isfinite(_kw).all().item()),
-                    _kw.abs().max().item(),
+                    _absmax(_kw),
                     bool(torch.isfinite(_vw).all().item()),
-                    _vw.abs().max().item(),
+                    _absmax(_vw),
                 )
                 _before = _snapshot(self, fa_md)
                 _q_before = q.detach().clone()
@@ -468,7 +478,7 @@ class InklingAttention(nn.Module, AttentionLayerBase):
                     "INKLING_ATTN kernel_out local=%s finite=%s absmax=%.4g",
                     self.is_local,
                     _fin,
-                    attn_output.abs().max().item(),
+                    _absmax(attn_output),
                 )
                 if not _fin and not _NAN_DUMPED:
                     # Capture the exact failing invocation so it can be
