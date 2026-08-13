@@ -201,6 +201,19 @@ class ParserManager:
             return parser
         logger.info_once('"auto" tool choice has been enabled.')
 
+        # A unified ParserEngine covers tool calling itself, and callers pair
+        # this with get_parser(), which returns it and takes precedence. Such a
+        # parser need not appear in ToolParserManager, so return None here
+        # rather than raising. Parsers like minimax_m2 register in both
+        # registries, which is why this path was never exercised by a
+        # unified-only parser.
+        if tool_parser_name in cls.list_registered():
+            logger.info_once(
+                "Tool parsing for '%s' is handled by its unified parser.",
+                tool_parser_name,
+            )
+            return None
+
         try:
             if (
                 tool_parser_name == "pythonic"

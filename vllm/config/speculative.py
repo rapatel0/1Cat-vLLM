@@ -624,7 +624,25 @@ class SpeculativeConfig:
                 # Align the quantization of draft model for cases such as
                 # --quantization fp8 with a bf16 checkpoint.
                 if not self.quantization:
-                    self.quantization = self.target_model_config.quantization
+                    # Inkling is the exception: its checkpoint excludes every
+                    # MTP layer from quantization ("re:model[.]mtp.*" in the
+                    # ignore list, and the weights are plain .weight tensors),
+                    # while the draft renames model.mtp.layers.N ->
+                    # model.layers.N as it loads. That ignore entry therefore
+                    # cannot match the draft's runtime prefixes, so inheriting
+                    # the target's compressed-tensors method would send the
+                    # loader looking for weight_packed/weight_scale that do not
+                    # exist. The draft is unquantized; leave it that way.
+                    target_arch = (
+                        self.target_model_config.hf_config.architectures[0]
+                        if self.target_model_config.hf_config.architectures
+                        else ""
+                    )
+                    if target_arch not in (
+                        "InklingForCausalLM",
+                        "InklingForConditionalGeneration",
+                    ):
+                        self.quantization = self.target_model_config.quantization
             elif self.method in ("ngram", "[ngram]"):
                 self.model = "ngram"
             elif self.method == "ngram_gpu":

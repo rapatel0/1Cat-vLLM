@@ -1877,9 +1877,17 @@ class SpecDecodeBaseProposer:
                     target_model.config.media_placeholder_token_id
                 )
             else:
-                self.model.config.image_token_index = (
-                    target_model.config.image_token_index
+                # Models that merge multimodal embeddings by mask -- i.e.
+                # _merge_multimodal_embeddings(..., is_multimodal=...) -- never
+                # read image_token_index, and their configs need not define it.
+                # Inkling is one. Copy it across when the target has one instead
+                # of requiring it, so those models are not locked out of MTP by
+                # an attribute they do not use.
+                image_token_index = getattr(
+                    target_model.config, "image_token_index", None
                 )
+                if image_token_index is not None:
+                    self.model.config.image_token_index = image_token_index
             target_language_model = cast(
                 SupportsMultiModal, target_model
             ).get_language_model()

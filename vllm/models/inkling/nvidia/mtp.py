@@ -244,7 +244,15 @@ class InklingMultiTokenPredictor(nn.Module):
         hidden = layer(combined, positions)
         if self.chain_norm is not None:
             hidden = self.chain_norm(hidden)
-        return hidden
+        # The decoder layer hands back the residual stream, which is carried in
+        # FP32 on Volta (see ops/norm.add_rmsnorm), and this checkpoint sets
+        # chain_hidden_post_norm=false so no norm brings it back down. Both
+        # consumers want the model dtype: the shared lm_head holds FP16 weights
+        # -- an FP32 hidden state fails the GEMM with "expected mat1 and mat2 to
+        # have the same dtype" -- and at depth > 1 this value returns as
+        # previous_hidden_states into input_proj, which is FP16 too. Mirrors
+        # InklingModel.forward's cast for the same reason.
+        return hidden.to(self.embed_tokens.weight.dtype)
 
 
 class InklingMTP(nn.Module, SupportsMultiModalEmbeddings):
