@@ -63,6 +63,15 @@ _NAN_DUMPED = False
 # prompt, in the same family as the MoE stores that did overflow. wo_ud is
 # linear in its input, so a power-of-two scale on the input scales the output
 # exactly and the unscale is done here in FP32 -- callers see true magnitude.
+#
+# Stays a constant, unlike the sconv wire formats in model.py, which take their
+# scale from the data. The tensor that overflows here is wo_ud's *output*, and
+# the only tensor in hand before the GEMM runs is its input; an input maximum
+# does not bound an output maximum without knowing the weight. Measuring the
+# input harder does not help. The sound version is a load-time bound --
+# |out| <= |in| * max_row_sum(|W|) -- which is guaranteed rather than observed,
+# but worst-case, so it may well spend more headroom than the 9x this constant
+# was measured to need. See vllm/model_executor/layers/fp16_range.py.
 _ATTN_OUTPUT_SCALE = 1.0 / 64.0
 
 

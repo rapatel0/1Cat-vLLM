@@ -24,6 +24,7 @@ from vllm.distributed import (
     tensor_model_parallel_reduce_scatter,
 )
 from vllm.forward_context import get_forward_context
+from vllm.model_executor.layers import fp16_range
 from vllm.model_executor.layers.quantization import QuantizationConfig
 from vllm.model_executor.layers.vocab_parallel_embedding import ParallelLMHead
 from vllm.model_executor.models.interfaces import (
@@ -115,10 +116,26 @@ def _absmax(t: torch.Tensor) -> float:
     return float(t.abs().max().item()) if t.numel() else 0.0
 
 
+# The conv-state cache scale stays a constant, and has to. This one is not a
+# wire format: fused_sconv writes the scaled shard into the paged FP16 cache and
+# reads W-1 of the W taps back out of it on the *next* step. A per-call scale
+# would have step N+1 unscale step N's taps by the wrong factor -- silently
+# wrong output rather than a crash. See fp16_range's "stateful store" case.
 _SCONV_CACHE_SCALE = 1.0 / 64.0
-# Same rationale as _SCONV_CACHE_SCALE, applied to the reduce-scatter wire
-# format. Power of two, so the scale itself is exact in FP16.
+
+# Static fallbacks for the two wire formats, used when VLLM_FP16_RANGE_DYNAMIC=0
+# selects the fixed-scale path. Power of two, so exact in FP16.
 _SCONV_RS_SCALE = 1.0 / 64.0
+
+# Targets for the dynamic path. The all-gather only copies, so it can aim near
+# the top of the range; the reduce-scatter *sums* tp_size contributions in FP16
+# after the cast, so each addend has to stay under FP16_MAX/tp_size and this
+# leaves a further 2x of margin on top.
+_SCONV_AG_TARGET = fp16_range.DEFAULT_TARGET
+
+
+def _sconv_rs_target(tp_size: int) -> float:
+    return fp16_range.FP16_MAX / (2.0 * tp_size)
 
 
 def _sconv_add_norm(
@@ -221,10 +238,28 @@ def _sconv_add_norm(
     # The sum is still accumulated in FP32 before the cast, so only the wire
     # format narrows; NCCL then reduces in FP16, which costs the same relative
     # precision the surrounding activations already carry.
-    shard = tensor_model_parallel_reduce_scatter(
-        delta.mul_(_SCONV_RS_SCALE).to(torch.float16), dim=-1
-    )
-    shard = shard.to(torch.float32).mul_(1.0 / _SCONV_RS_SCALE)
+    # The scale is derived from the data rather than fixed, so there is no
+    # constant left to be wrong about a future prompt. A reduce-scatter sums,
+    # and addends only add up if they share an exponent, so every rank has to
+    # agree on one scale: narrowest() takes the min over the ranks' scales,
+    # which is the one belonging to whichever rank has the largest maximum.
+    # That costs one extra collective, on a single scalar, routed through the
+    # same all-gather the payload uses so it stays CUDA-graph-safe.
+    tp_size = get_tensor_model_parallel_world_size()
+    if fp16_range.enabled() and tp_size > 1:
+        rs_scale = fp16_range.narrowest(
+            fp16_range.pow2_scale(delta, _sconv_rs_target(tp_size)),
+            tensor_model_parallel_all_gather,
+        )
+        shard = tensor_model_parallel_reduce_scatter(
+            delta.mul_(rs_scale).to(torch.float16), dim=-1
+        )
+        shard = shard.to(torch.float32).div_(rs_scale)
+    else:
+        shard = tensor_model_parallel_reduce_scatter(
+            delta.mul_(_SCONV_RS_SCALE).to(torch.float16), dim=-1
+        )
+        shard = shard.to(torch.float32).mul_(1.0 / _SCONV_RS_SCALE)
     _p("after_rs", shard)
     # FP32 out: the conv accumulates in FP32 already, but narrowing the store
     # to FP16 overflows on this checkpoint's outlier channels (see add_rmsnorm).
@@ -272,22 +307,38 @@ def _sconv_add_norm(
     # one rank; tool count, prompt length and the content-kind markers were all
     # coincidental, which is why none of them predicted it.
     #
-    # So this hop is FP32 now, deliberately, despite the bandwidth. A larger
-    # power-of-two shrink would also clear the overflow, but only by betting
-    # that some fixed constant stays above every future shard maximum -- the
-    # same bet 1/64 just lost -- and it pays for that headroom at the bottom of
-    # the range: every extra factor of 64 lifts the FP16 denormal cliff by the
-    # same factor, and this tensor is added into `hidden` channel by channel,
-    # where a small contribution to a non-outlier channel is not noise. FP32
-    # assumes nothing about the data, has no cliff, and drops the rounding this
-    # hop imposed even when nothing overflowed.
+    # So the wire stays FP16 but the scale is measured, not guessed. Widening
+    # the constant would only move the threshold: it bets that some fixed number
+    # stays above every future shard maximum -- the bet 1/64 just lost -- and it
+    # pays for the headroom at the bottom of the range, since every extra factor
+    # lifts the FP16 denormal cliff by the same factor and this tensor is added
+    # into `hidden` channel by channel, where a small contribution to a
+    # non-outlier channel is signal. A scale taken from the shard's own maximum
+    # has no threshold to exceed and centres the mantissa on the data.
     #
-    # The reduce-scatter above deliberately stays FP16: it is the expensive
-    # collective of the two (115us against this one's 39us, which is why it was
-    # narrowed in the first place) and it sums rather than copies, so it trades
-    # differently and is not covered by this argument.
-    full = tensor_model_parallel_all_gather(shard, dim=-1)
-    full = full.to(torch.float32).mul_(1.0 / _SCONV_CACHE_SCALE)
+    # Per rank, not shared. An all-gather only moves data, so ranks need not
+    # agree: each scales by its own factor, the factors ride the same collective,
+    # and the far side undoes them block by block. That is also where the
+    # precision goes -- on the eight shards above, a single shared scale set by
+    # rank 3's outlier would have cost the other seven up to 6 of FP16's 10
+    # mantissa bits, which is most of the format.
+    #
+    # The reduce-scatter above cannot do this: it sums, so its ranks must share
+    # one scale.
+    if fp16_range.enabled() and tp_size > 1:
+        ag_scale = fp16_range.pow2_scale(shard, _SCONV_AG_TARGET)
+        gathered = tensor_model_parallel_all_gather(
+            shard.mul(ag_scale).to(torch.float16), dim=-1
+        )
+        # The cache unscale is folded into the per-rank inverses so undoing both
+        # is one pass over the gathered tensor rather than two.
+        inv = tensor_model_parallel_all_gather(
+            ag_scale.reciprocal().div_(_SCONV_CACHE_SCALE).reshape(1), dim=-1
+        )
+        full = fp16_range.unscale_blocks(gathered.to(torch.float32), inv, tp_size)
+    else:
+        full = tensor_model_parallel_all_gather(shard, dim=-1)
+        full = full.to(torch.float32).mul_(1.0 / _SCONV_CACHE_SCALE)
     _p("after_ag", full)
     if norm is None:
         return None, hidden + full

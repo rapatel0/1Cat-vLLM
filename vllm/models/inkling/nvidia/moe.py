@@ -297,6 +297,20 @@ def _inkling_moe_ep_size() -> int:
 # wrong rather than failing loudly.
 _W13_UP_DIV = float(os.getenv("VLLM_SM70_MOE_W13_UP_DIV", "1") or "1")
 
+# Both stay constants rather than being derived from the data the way the sconv
+# wire formats in model.py now are, but for two different reasons.
+#
+# _SINK_OUTPUT_SCALE guards the W2 GEMM's FP16 output store while the only
+# tensor available before the GEMM is its input, and an input maximum does not
+# bound an output maximum without the weight -- the "operator output" case in
+# vllm/model_executor/layers/fp16_range.py, where the sound fix is a load-time
+# max_row_sum(|W|) bound rather than a measurement.
+#
+# _ROUTED_OUTPUT_SCALE is not guarding a store at all. It is folded into the
+# router weights, which the fused op applies *after* the expert GEMMs, so it
+# never covered the per-expert FP16 stages (see forward_partials below) -- which
+# is why widening it did nothing for the tool-prompt NaN. _W13_UP_DIV is what
+# actually protects those. Making this one dynamic would buy nothing.
 _SINK_OUTPUT_SCALE = 1.0 / 64.0
 _ROUTED_OUTPUT_SCALE = 1.0 / 64.0
 
