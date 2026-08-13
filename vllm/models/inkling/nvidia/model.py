@@ -72,6 +72,38 @@ def _layer_id(name: str) -> int | None:
 # Power of two: scaling by it is exact in FP16 (exponent shift only), so the
 # conv-state cache round trip loses no precision relative to storing unscaled.
 
+_NAN_CAPTURE_DIR = os.getenv("VLLM_SM70_MOE_CAPTURE_DIR", "")
+_nan_capture_done = {"v": False}
+
+
+def _capture_bad_layer(layer_idx, prev_h, positions) -> None:
+    """Persist the input to the first non-finite layer, once per process.
+
+    With this on disk the failing layer can be replayed standalone, which is
+    the whole point of the exercise: iterating against a 276B model that takes
+    fifteen minutes to load is what made the first investigation so expensive.
+    """
+    if not _NAN_CAPTURE_DIR or _nan_capture_done["v"] or prev_h is None:
+        return
+    try:
+        os.makedirs(_NAN_CAPTURE_DIR, exist_ok=True)
+        path = os.path.join(_NAN_CAPTURE_DIR, f"bad_layer_{layer_idx}.pt")
+        torch.save(
+            {
+                "layer_idx": layer_idx,
+                "hidden_in": prev_h.detach().cpu(),
+                "positions": positions.detach().cpu()
+                if positions is not None
+                else None,
+            },
+            path,
+        )
+        _nan_capture_done["v"] = True
+        logger.error("INKLING_NAN_CAPTURE wrote %s", path)
+    except Exception as exc:  # noqa: BLE001
+        logger.error("INKLING_NAN_CAPTURE failed: %s", exc)
+
+
 def _absmax(t: torch.Tensor) -> float:
     """abs().max() that tolerates empty tensors.
 
@@ -227,9 +259,34 @@ def _sconv_add_norm(
     # peak scales to ~3.0e3. Halves the bytes on the second collective, and the
     # single unscale afterwards is one pass over the gathered tensor instead of
     # one over each rank's shard.
-    full = tensor_model_parallel_all_gather(
-        shard.to(torch.float16), dim=-1
-    )
+    #
+    # ...except it did not fit. Measured on a 3-tool prompt at layer 40, the
+    # eight shards were
+    #   TP0 3137  TP1 2740  TP2 2119  TP3 8.16e4
+    #   TP4 3058  TP5 3676  TP6 2034  TP7 1.73e4
+    # so rank 3 sat 1.25x past FP16's 65504 while every other rank had 20x to
+    # spare. That single cast produced +inf, the all-gather copied it to all
+    # eight ranks, and layer 41 turned it into NaN logits -- argmax over NaN is
+    # token id 0, which is why the model emitted "!!!!". The trigger looked
+    # like "3 or more tool declarations" but is really one outlier channel on
+    # one rank; tool count, prompt length and the content-kind markers were all
+    # coincidental, which is why none of them predicted it.
+    #
+    # So this hop is FP32 now, deliberately, despite the bandwidth. A larger
+    # power-of-two shrink would also clear the overflow, but only by betting
+    # that some fixed constant stays above every future shard maximum -- the
+    # same bet 1/64 just lost -- and it pays for that headroom at the bottom of
+    # the range: every extra factor of 64 lifts the FP16 denormal cliff by the
+    # same factor, and this tensor is added into `hidden` channel by channel,
+    # where a small contribution to a non-outlier channel is not noise. FP32
+    # assumes nothing about the data, has no cliff, and drops the rounding this
+    # hop imposed even when nothing overflowed.
+    #
+    # The reduce-scatter above deliberately stays FP16: it is the expensive
+    # collective of the two (115us against this one's 39us, which is why it was
+    # narrowed in the first place) and it sums rather than copies, so it trades
+    # differently and is not covered by this argument.
+    full = tensor_model_parallel_all_gather(shard, dim=-1)
     full = full.to(torch.float32).mul_(1.0 / _SCONV_CACHE_SCALE)
     _p("after_ag", full)
     if norm is None:
@@ -495,9 +552,19 @@ class InklingModel(nn.Module):
         # the quantized path entirely. Off unless INKLING_DEBUG_NAN=1; the
         # check forces a device sync per layer.
         _debug_nan = os.environ.get("INKLING_DEBUG_NAN") == "1"
+        # Report-only. Raising here kills the engine core, which restarts the
+        # container and costs a 15-minute reload -- and takes the log with it,
+        # so the layer index the probe just computed is lost. Reporting instead
+        # lets one load run the whole test vector.
+        _first_bad = -1
+        _prev_h = None
         for _lidx, layer in enumerate(
             self.layers[self.start_layer : self.end_layer], start=self.start_layer
         ):
+            if _debug_nan and _first_bad < 0 and hidden_states.numel():
+                # The input to the first failing layer is the seed for an
+                # offline reproducer, so keep one layer of history.
+                _prev_h = hidden_states.detach().clone()
             hidden_states, pending = layer(
                 positions,
                 hidden_states,
@@ -510,20 +577,26 @@ class InklingModel(nn.Module):
             # tokens, and .max() on an empty tensor raises "Expected reduction
             # dim to be specified", which crashed the engine before the check
             # could ever report a layer.
-            if _debug_nan and hidden_states.numel():
+            if _debug_nan and hidden_states.numel() and _first_bad < 0:
                 h = hidden_states
                 bad = not torch.isfinite(h).all().item()
                 logger.info(
-                    "INKLING_DEBUG_NAN layer=%d finite=%s absmax=%s",
+                    "INKLING_DEBUG_NAN layer=%d finite=%s absmax=%s tokens=%d",
                     _lidx,
                     not bad,
                     f"{_absmax(h):.4g}",
+                    h.shape[0],
                 )
                 if bad:
-                    raise RuntimeError(
-                        f"INKLING_DEBUG_NAN: first non-finite hidden state at "
-                        f"layer {_lidx}"
+                    _first_bad = _lidx
+                    logger.error(
+                        "INKLING_DEBUG_NAN FIRST_BAD_LAYER=%d tokens=%d "
+                        "prev_absmax=%s",
+                        _lidx,
+                        h.shape[0],
+                        f"{_absmax(_prev_h):.4g}" if _prev_h is not None else "n/a",
                     )
+                    _capture_bad_layer(_lidx, _prev_h, positions)
             attn_in0 = None
 
         if not get_pp_group().is_last_rank:
