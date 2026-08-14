@@ -1125,28 +1125,54 @@ class OpenAIServingChat(OpenAIServing):
                 choices.append(choice_data)
                 continue
 
-            if reasoning_parser:
-                # If the reasoning parser is enabled,
-                # tool calls are extracted exclusively from the content.
-                reasoning, content = reasoning_parser.extract_reasoning(
-                    output.text, request=request
+            # A unified parser drives reasoning and tool calls from a single
+            # state machine, and registering one makes
+            # ParserManager.get_tool_parser return None for that name -- so
+            # self.tool_parser, which the split path below depends on, is None
+            # and no tool call is ever extracted. Streaming already routes
+            # through self.parser_cls; without the same route here, streaming
+            # returns tool_calls while non-streaming silently leaks the raw
+            # tool markers into content.
+            unified_parser = None
+            if self.parser_cls is not None and self.tool_parser is None:
+                if tokenizer is None:
+                    raise ValueError(
+                        "Tokenizer not available when `skip_tokenizer_init=True`"
+                    )
+                unified_parser = self.parser_cls(tokenizer, request.tools)
+
+            auto_tools_called = False
+            if unified_parser is not None:
+                reasoning, content, tool_calls = unified_parser.parse(
+                    output.text,
+                    request,
+                    enable_auto_tools=self.enable_auto_tools,
+                    model_output_token_ids=as_list(output.token_ids),
                 )
                 if not request.include_reasoning:
                     reasoning = None
             else:
-                reasoning = None
-                content = output.text
+                if reasoning_parser:
+                    # If the reasoning parser is enabled,
+                    # tool calls are extracted exclusively from the content.
+                    reasoning, content = reasoning_parser.extract_reasoning(
+                        output.text, request=request
+                    )
+                    if not request.include_reasoning:
+                        reasoning = None
+                else:
+                    reasoning = None
+                    content = output.text
 
-            auto_tools_called = False
-            # if auto tools are not enabled, and a named tool choice using
-            #   outlines is not being used
-            tool_calls, content = self._parse_tool_calls_from_content(
-                request=request,
-                tokenizer=tokenizer,
-                content=content,
-                enable_auto_tools=self.enable_auto_tools,
-                tool_parser_cls=self.tool_parser,
-            )
+                # if auto tools are not enabled, and a named tool choice using
+                #   outlines is not being used
+                tool_calls, content = self._parse_tool_calls_from_content(
+                    request=request,
+                    tokenizer=tokenizer,
+                    content=content,
+                    enable_auto_tools=self.enable_auto_tools,
+                    tool_parser_cls=self.tool_parser,
+                )
             if is_mistral_tokenizer(tokenizer):
                 from vllm.tool_parsers.mistral_tool_parser import MistralToolCall
 
@@ -1172,7 +1198,10 @@ class OpenAIServingChat(OpenAIServing):
                     tool_calls=tool_call_items,
                 )
 
-            elif (not self.enable_auto_tools or not self.tool_parser) and (
+            elif (
+                not self.enable_auto_tools
+                or not (self.tool_parser or self.parser_cls)
+            ) and (
                 not isinstance(request.tool_choice, ChatCompletionNamedToolChoiceParam)
                 and request.tool_choice != "required"
             ):
@@ -1259,7 +1288,7 @@ class OpenAIServingChat(OpenAIServing):
                 request.tools
                 and (request.tool_choice == "auto" or request.tool_choice is None)
                 and self.enable_auto_tools
-                and self.tool_parser
+                and (self.tool_parser or self.parser_cls)
             ):
                 # In the OpenAI API the finish_reason is "tools_called"
                 # if the tool choice is auto and the model produced a tool
