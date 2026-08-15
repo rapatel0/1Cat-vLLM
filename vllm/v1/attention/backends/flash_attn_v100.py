@@ -4197,29 +4197,77 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     ),
                     _format_tensor_debug(persistent_query_start_loc, "smallq_qsl"),
                 )
-            self._call_flash_attn_decode_paged(
-                query,
-                key_cache,
-                value_cache,
-                persistent_decode_block_table[:num_query_tokens],
-                persistent_decode_seq_lens[:num_query_tokens],
-                softmax_scale=self.scale,
-                out=out_view,
-                kv_cache_dtype=self.kv_cache_dtype,
-                k_scale=float(layer._k_scale_float),
-                v_scale=float(layer._v_scale_float),
-                window_size=self._flash_v100_window_size(causal=True),
-                max_seq_len_hint=getattr(
-                    attn_metadata,
-                    "smallq_decode_max_seq_len_hint",
-                    None,
-                ),
-                workspace_seq_capacity_hint=getattr(
-                    attn_metadata,
-                    "smallq_decode_workspace_seq_capacity_hint",
-                    None,
-                ),
+            decode_block_table = persistent_decode_block_table[:num_query_tokens]
+            decode_seq_lens = persistent_decode_seq_lens[:num_query_tokens]
+            window_size = self._flash_v100_window_size(causal=True)
+            max_seq_len_hint = getattr(
+                attn_metadata,
+                "smallq_decode_max_seq_len_hint",
+                None,
             )
+            workspace_seq_capacity_hint = getattr(
+                attn_metadata,
+                "smallq_decode_workspace_seq_capacity_hint",
+                None,
+            )
+            q_per_kv = (
+                query.shape[1] // key_cache.shape[2]
+                if key_cache.shape[2] > 0
+                and query.shape[1] % key_cache.shape[2] == 0
+                else 0
+            )
+            use_xqa = (
+                self.use_decode_xqa
+                and self.flash_attn_decode_paged_xqa is not None
+                and self.kv_cache_dtype in ("auto", "bfloat16")
+                and query.shape[0] == decode_seq_lens.shape[0]
+                and query.shape[2] == 256
+                and key_cache.dtype == torch.float16
+                and value_cache.dtype == torch.float16
+                and _decode_xqa_allowed_for_q_per_kv(q_per_kv, attn_metadata)
+                and window_size == (-1, -1)
+            )
+            if use_xqa:
+                _trace_decode_active(
+                    route="prefill_smallq_xqa_paged",
+                    query=query,
+                    key_cache=key_cache,
+                    seq_lens=decode_seq_lens,
+                    attn_metadata=attn_metadata,
+                    window_size=window_size,
+                )
+                self.flash_attn_decode_paged_xqa(
+                    query,
+                    key_cache,
+                    value_cache,
+                    decode_block_table,
+                    decode_seq_lens,
+                    softmax_scale=self.scale,
+                    out=out_view,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=float(layer._k_scale_float),
+                    v_scale=float(layer._v_scale_float),
+                    window_size=window_size,
+                    max_seq_len_hint=max_seq_len_hint,
+                    workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+                )
+                _record_route("prefill_smallq_xqa_paged")
+            else:
+                self._call_flash_attn_decode_paged(
+                    query,
+                    key_cache,
+                    value_cache,
+                    decode_block_table,
+                    decode_seq_lens,
+                    softmax_scale=self.scale,
+                    out=out_view,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=float(layer._k_scale_float),
+                    v_scale=float(layer._v_scale_float),
+                    window_size=window_size,
+                    max_seq_len_hint=max_seq_len_hint,
+                    workspace_seq_capacity_hint=workspace_seq_capacity_hint,
+                )
             return output
 
         if _is_cuda_graph_capturing(query):

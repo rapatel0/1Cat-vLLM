@@ -603,6 +603,79 @@ def test_flash_v100_smallq_forward_prefers_persistent_decode_metadata():
     assert torch.all(output == 1)
 
 
+def test_flash_v100_smallq_qwen38_tp4_uses_xqa(monkeypatch):
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    monkeypatch.delenv("VLLM_FLASH_V100_DECODE_USE_XQA", raising=False)
+
+    impl = FlashAttnV100Impl(
+        num_heads=6,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="auto",
+    )
+
+    persistent_block_table = torch.tensor([[3]] * 4, dtype=torch.int32)
+    persistent_seq_lens = torch.tensor([8, 9, 10, 11], dtype=torch.int32)
+    calls: list[str] = []
+
+    def hit_xqa(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        **kwargs,
+    ):
+        calls.append("xqa")
+        assert block_table.data_ptr() == persistent_block_table.data_ptr()
+        assert seq_lens.data_ptr() == persistent_seq_lens.data_ptr()
+        kwargs["out"].fill_(1)
+
+    def fail_scalar(*args, **kwargs):
+        raise AssertionError("supported TP4 small-query verifier should use XQA")
+
+    impl.flash_attn_decode_paged_xqa = hit_xqa  # type: ignore[method-assign]
+    impl.flash_attn_decode_paged = fail_scalar  # type: ignore[method-assign]
+
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=4,
+        query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        query_start_loc_cpu=torch.tensor([0, 4], dtype=torch.int32),
+        seq_lens=torch.tensor([11], dtype=torch.int32),
+        seq_lens_cpu=torch.tensor([11], dtype=torch.int32),
+        block_table=torch.tensor([[7]], dtype=torch.int32),
+        smallq_decode_block_table=persistent_block_table,
+        smallq_decode_seq_lens=persistent_seq_lens,
+        smallq_query_start_loc=torch.tensor([0, 4], dtype=torch.int32),
+        smallq_decode_max_seq_len_hint=11,
+        smallq_decode_workspace_seq_capacity_hint=16,
+    )
+    layer = SimpleNamespace(_k_scale_float=1.0, _v_scale_float=1.0)
+    query = torch.zeros((4, 6, 256), dtype=torch.float16)
+    output = torch.zeros((4, 6, 256), dtype=torch.float16)
+    key_cache = torch.zeros((4, 16, 1, 256), dtype=torch.float16)
+    value_cache = torch.zeros((4, 16, 1, 256), dtype=torch.float16)
+
+    result = impl._flash_v100_small_query_prefill_as_decode(
+        layer,
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        output,
+        attn_metadata.query_start_loc,
+        attn_metadata.seq_lens,
+    )
+
+    assert result is output
+    assert calls == ["xqa"]
+    assert torch.all(output == 1)
+
+
 def test_flash_v100_decode_forwards_shape_hints():
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 
