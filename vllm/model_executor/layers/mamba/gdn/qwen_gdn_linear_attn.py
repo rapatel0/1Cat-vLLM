@@ -99,6 +99,9 @@ _SM70_GDN_GRAPH_BUFFERS: dict[str, torch.Tensor] = {}
 _SM70_GDN_GRAPH_META: dict[str, dict[str, object]] = {}
 _SM70_FLASHQLA_DECODE_ROUTE_DEBUG_COUNTS: dict[str, int] = {}
 _SM70_GDN_PREFILL_PROFILE_COUNTS: dict[str, int] = {}
+_SM70_COMPILE_GRAPH_SLICE_INDICES: dict[
+    tuple[str, int | None, int, int], torch.Tensor
+] = {}
 _SM70_GDN_PREFILL_WARMUP_KEYS: set[tuple[object, ...]] = set()
 
 
@@ -1171,7 +1174,11 @@ def _sm70_compile_graph_slice_dim(
         slices = [slice(None)] * tensor.ndim
         slices[dim] = slice(start, start + size)
         return tensor[tuple(slices)]
-    indices = torch.arange(start, start + size, device=tensor.device)
+    cache_key = (tensor.device.type, tensor.device.index, start, size)
+    indices = _SM70_COMPILE_GRAPH_SLICE_INDICES.get(cache_key)
+    if indices is None:
+        indices = torch.arange(start, start + size, device=tensor.device)
+        _SM70_COMPILE_GRAPH_SLICE_INDICES[cache_key] = indices
     return tensor.index_select(dim, indices)
 
 
