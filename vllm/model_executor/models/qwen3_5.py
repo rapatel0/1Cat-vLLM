@@ -24,6 +24,7 @@
 # limitations under the License.
 """Inference-only Qwen3.5 Series compatible with HuggingFace weights."""
 
+import os
 import typing
 from collections.abc import Callable, Iterable
 
@@ -74,6 +75,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import (
     Qwen3_5MoeConfig,
     Qwen3_5MoeTextConfig,
 )
+from vllm.triton_utils import tl, triton
 from vllm.utils.torch_utils import (
     _encode_layer_name,
 )
@@ -115,6 +117,74 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _sm70_gdn_extract_zba_kernel(
+    mixed_qkvz_ptr,
+    ba_ptr,
+    z_ptr,
+    b_ptr,
+    a_ptr,
+    mixed_stride: tl.constexpr,
+    ba_stride: tl.constexpr,
+    qkv_size: tl.constexpr,
+    z_size: tl.constexpr,
+    ba_size: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    """Copy the three strided GDN projection slices in one GPU launch."""
+    row = tl.program_id(0)
+    offsets = tl.arange(0, block_size)
+
+    z_mask = offsets < z_size
+    z = tl.load(
+        mixed_qkvz_ptr + row * mixed_stride + qkv_size + offsets,
+        mask=z_mask,
+    )
+    tl.store(z_ptr + row * z_size + offsets, z, mask=z_mask)
+
+    ba_mask = offsets < ba_size
+    b = tl.load(ba_ptr + row * ba_stride + offsets, mask=ba_mask)
+    a = tl.load(ba_ptr + row * ba_stride + ba_size + offsets, mask=ba_mask)
+    tl.store(b_ptr + row * ba_size + offsets, b, mask=ba_mask)
+    tl.store(a_ptr + row * ba_size + offsets, a, mask=ba_mask)
+
+
+def _sm70_gdn_extract_zba(
+    mixed_qkvz: torch.Tensor,
+    ba: torch.Tensor,
+    qkv_size: int,
+    z_size: int,
+    ba_size: int,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Materialize z/b/a without three separate contiguous-copy launches."""
+    mixed_2d = mixed_qkvz.reshape(-1, mixed_qkvz.shape[-1])
+    ba_2d = ba.reshape(-1, ba.shape[-1])
+    z = torch.empty(
+        (mixed_2d.shape[0], z_size),
+        dtype=mixed_qkvz.dtype,
+        device=mixed_qkvz.device,
+    )
+    b = torch.empty(
+        (ba_2d.shape[0], ba_size), dtype=ba.dtype, device=ba.device
+    )
+    a = torch.empty_like(b)
+    block_size = triton.next_power_of_2(max(z_size, ba_size))
+    _sm70_gdn_extract_zba_kernel[(mixed_2d.shape[0],)](
+        mixed_2d,
+        ba_2d,
+        z,
+        b,
+        a,
+        mixed_stride=mixed_2d.stride(0),
+        ba_stride=ba_2d.stride(0),
+        qkv_size=qkv_size,
+        z_size=z_size,
+        ba_size=ba_size,
+        block_size=block_size,
+    )
+    return z, b, a
 
 def _parse_sm70_moe_dense_allowlist() -> set[str] | None:
     raw = envs.VLLM_SM70_MOE_DENSE_ALLOWLIST
@@ -269,9 +339,16 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             )
             ba = _sm70_dump_gdn_projection_tensor("in_proj_ba", layer_name, ba)
             mixed_qkv = mixed_qkvz[..., :qkv_size]
-            z = _sm70_compile_graph_slice_dim(mixed_qkvz, -1, qkv_size, z_size)
-            b = ba[..., :ba_size]
-            a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
+            if os.getenv("VLLM_SM70_GDN_FUSED_ZBA_EXTRACT", "0") == "1":
+                z, b, a = _sm70_gdn_extract_zba(
+                    mixed_qkvz, ba, qkv_size, z_size, ba_size
+                )
+            else:
+                z = _sm70_compile_graph_slice_dim(
+                    mixed_qkvz, -1, qkv_size, z_size
+                )
+                b = ba[..., :ba_size]
+                a = _sm70_compile_graph_slice_dim(ba, -1, ba_size, ba_size)
         else:
             mixed_qkvzba, _ = self.in_proj_qkvz(hidden_states)
             mixed_qkvzba = _sm70_dump_gdn_projection_tensor(
@@ -297,9 +374,14 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         if envs.VLLM_SM70_GDN_MIXED_QKV_CONTIGUOUS:
             mixed_qkv = mixed_qkv.contiguous()
         z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
-        z = z.contiguous().reshape(z.size(0), -1, self.head_v_dim)
-        b = b.contiguous()
-        a = a.contiguous()
+        if not (
+            self.use_split_input_projections
+            and os.getenv("VLLM_SM70_GDN_FUSED_ZBA_EXTRACT", "0") == "1"
+        ):
+            z = z.contiguous()
+            b = b.contiguous()
+            a = a.contiguous()
+        z = z.reshape(z.size(0), -1, self.head_v_dim)
 
         core_attn_out = torch.zeros(
             (num_tokens, self.num_v_heads // self.tp_size, self.head_v_dim),

@@ -2042,6 +2042,12 @@ class SpecDecodeBaseProposer:
                             "Shared target model lm_head with MTP shared_head.head."
                         )
 
+            prepare_draft_fp8_head = getattr(
+                self.model, "prepare_sm70_draft_lm_head_fp8", None
+            )
+            if prepare_draft_fp8_head is not None:
+                prepare_draft_fp8_head()
+
         if hasattr(target_language_model.model, "topk_indices_buffer"):
             if hasattr(self.model.model, "topk_indices_buffer"):
                 del self.model.model.topk_indices_buffer

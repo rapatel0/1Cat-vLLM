@@ -10,6 +10,7 @@ from collections.abc import Callable, Iterable
 import torch
 from torch import nn
 
+from vllm import _sm70_ops as sm70_ops
 from vllm import envs
 from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
@@ -582,11 +583,113 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
     ) -> torch.Tensor | None:
         return self.logits_processor(self.lm_head, hidden_states)
 
+    def prepare_sm70_draft_lm_head_fp8(self) -> bool:
+        """Build a draft-only block-FP8 shadow of the shared FP16 LM head."""
+        if os.getenv("VLLM_SM70_MTP_FP8_LM_HEAD", "0") != "1":
+            return False
+        if hasattr(self, "_sm70_draft_lm_head_fp8_weight"):
+            return True
+        weight = getattr(self.lm_head, "weight", None)
+        if (
+            not isinstance(weight, torch.Tensor)
+            or not weight.is_cuda
+            or weight.dtype != torch.float16
+            or weight.ndim != 2
+            or torch.cuda.get_device_capability(weight.device) != (7, 0)
+            or weight.shape[0] % 128 != 0
+            or weight.shape[1] % 128 != 0
+            or not hasattr(torch.ops._C, "fp8_sm70_prepare")
+        ):
+            logger.warning_once(
+                "SM70 MTP FP8 LM-head shadow requested but the shared head is "
+                "not eligible; retaining the FP16 draft head."
+            )
+            return False
+
+        n, k = weight.shape
+        qweight = torch.empty_like(weight, dtype=torch.float8_e4m3fn)
+        scales = torch.empty(
+            (n // 128, k // 128), dtype=torch.float32, device=weight.device
+        )
+        # Keep preparation below the live model's transient-memory ceiling.
+        for start in range(0, n, 128 * 16):
+            end = min(start + 128 * 16, n)
+            blocks = weight[start:end].reshape(
+                (end - start) // 128, 128, k // 128, 128
+            )
+            chunk_scales = blocks.abs().amax(dim=(1, 3)).float() / 448.0
+            chunk_scales.clamp_min_(torch.finfo(torch.float32).tiny)
+            scales[start // 128 : end // 128].copy_(chunk_scales)
+            expanded = (
+                chunk_scales[:, None, :, None]
+                .expand_as(blocks)
+                .reshape(end - start, k)
+            )
+            qweight[start:end].copy_((weight[start:end] / expanded).to(qweight.dtype))
+
+        tm_weight, tm_scales, meta = sm70_ops.fp8_sm70_prepare(
+            qweight, scales, 128, False
+        )
+        self.register_buffer(
+            "_sm70_draft_lm_head_fp8_weight", tm_weight, persistent=False
+        )
+        self.register_buffer(
+            "_sm70_draft_lm_head_fp8_scales", tm_scales, persistent=False
+        )
+        self._sm70_draft_lm_head_fp8_k_ld = int(meta[0].item())
+        self._sm70_draft_lm_head_fp8_q_ld = int(meta[1].item())
+        logger.info(
+            "SM70 MTP draft-only block-FP8 LM-head shadow enabled "
+            "for shard shape %s.",
+            tuple(weight.shape),
+        )
+        return True
+
     def get_top_tokens(
         self,
         hidden_states: torch.Tensor,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
+        if (
+            hasattr(self, "_sm70_draft_lm_head_fp8_weight")
+            and hidden_states.reshape(-1, hidden_states.shape[-1]).shape[0] == 1
+        ):
+            x = hidden_states.reshape(-1, hidden_states.shape[-1]).contiguous()
+            logits = torch.empty(
+                (1, self.lm_head.num_embeddings_per_partition),
+                dtype=x.dtype,
+                device=x.device,
+            )
+            sm70_ops.fp8_gemm_sm70_out(
+                logits,
+                x,
+                self._sm70_draft_lm_head_fp8_weight,
+                self._sm70_draft_lm_head_fp8_scales,
+                128,
+                self._sm70_draft_lm_head_fp8_k_ld,
+                self._sm70_draft_lm_head_fp8_q_ld,
+                False,
+            )
+            if self.logits_processor.soft_cap is not None:
+                logits = (
+                    torch.tanh(logits / self.logits_processor.soft_cap)
+                    * self.logits_processor.soft_cap
+                )
+            if self.logits_processor.scale != 1.0:
+                logits.mul_(self.logits_processor.scale)
+            num_pad = self.lm_head.shard_indices.num_org_vocab_padding
+            if num_pad > 0:
+                logits[..., -num_pad:] = -float("inf")
+            local_values, local_indices = logits.max(dim=-1)
+            global_indices = (
+                local_indices + self.lm_head.shard_indices.org_vocab_start_index
+            )
+            return self.logits_processor.reduce_local_top_tokens(
+                self.lm_head,
+                hidden_states,
+                local_values,
+                global_indices,
+            )
         return self.logits_processor.get_top_tokens(self.lm_head, hidden_states)
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

@@ -21,6 +21,7 @@ import torch
 
 import vllm.envs as envs
 from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
@@ -84,6 +85,45 @@ _draft_graph_debug_counts: dict[str, int] = {}
 _DEFAULT_DECODE_PARTITION_SIZE = 256
 _VALID_DECODE_PARTITION_SIZES = (256, 512, 1024)
 _DEFAULT_Q4_XQA_MIN_SEQ_LEN = 32768
+
+
+@triton.jit
+def _expand_single_request_smallq_metadata_kernel(
+    source_block_table,
+    source_seq_lens,
+    output_block_table,
+    output_seq_lens,
+    output_block_table_stride,
+    num_block_cols: tl.constexpr,
+    real_query_tokens: tl.constexpr,
+    block_cols_per_program: tl.constexpr,
+):
+    """Expand one q=N request directly into persistent paged-decode rows."""
+    query_idx = tl.program_id(0)
+    block_program = tl.program_id(1)
+    block_col = block_program * block_cols_per_program + tl.arange(
+        0, block_cols_per_program
+    )
+    valid_col = block_col < num_block_cols
+    valid_query = query_idx < real_query_tokens
+    block = tl.load(source_block_table + block_col, mask=valid_col, other=0)
+    block = tl.maximum(block, 0)
+    block = tl.where(valid_query, block, 0)
+    tl.store(
+        output_block_table
+        + query_idx * output_block_table_stride
+        + block_col,
+        block,
+        mask=valid_col,
+    )
+    seq_len = tl.maximum(tl.load(source_seq_lens), real_query_tokens)
+    decode_seq_len = seq_len - real_query_tokens + query_idx + 1
+    decode_seq_len = tl.where(valid_query, decode_seq_len, 0)
+    tl.store(
+        output_seq_lens + query_idx,
+        decode_seq_len,
+        mask=block_program == 0,
+    )
 
 
 def _split_paged_kv_cache(
@@ -1799,6 +1839,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens_cpu = common_attn_metadata.seq_lens_cpu
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        num_live_reqs = int(torch.count_nonzero(query_lens_cpu).item())
         has_prefix_context = bool(torch.any(query_lens_cpu != seq_lens_cpu).item())
         if (
             not force
@@ -1843,65 +1884,88 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         if real_num_query_tokens > num_query_tokens:
             return
 
-        repeat_query_lens = query_lens
         padding_tokens = num_query_tokens - real_num_query_tokens
-        if padding_tokens > 0:
-            repeat_query_lens = query_lens.clone()
-            repeat_query_lens[-1] += padding_tokens
-
         seq_lens = attn_metadata.seq_lens[:num_reqs]
-        effective_seq_lens = torch.maximum(
-            seq_lens,
-            real_query_lens.to(dtype=seq_lens.dtype),
-        )
-        block_table = block_table.clamp_min(0)
-        decode_block_table = torch.repeat_interleave(
-            block_table,
-            repeat_query_lens,
-            dim=0,
-            output_size=num_query_tokens,
-        ).contiguous()
-        seq_lens_rep = torch.repeat_interleave(
-            effective_seq_lens,
-            repeat_query_lens,
-            output_size=num_query_tokens,
-        )
-        query_lens_rep = torch.repeat_interleave(
-            real_query_lens.to(dtype=seq_lens.dtype),
-            repeat_query_lens,
-            output_size=num_query_tokens,
-        )
-        start_locs_rep = torch.repeat_interleave(
-            query_start_loc[:-1].to(dtype=seq_lens.dtype),
-            repeat_query_lens,
-            output_size=num_query_tokens,
-        )
-        token_indices = self._smallq_token_indices[:num_query_tokens].to(
-            dtype=seq_lens.dtype
-        )
-        offsets = token_indices - start_locs_rep + 1
-        decode_seq_lens = (seq_lens_rep - query_lens_rep + offsets).contiguous()
-        if padding_tokens > 0:
-            padding_mask = token_indices >= real_num_query_tokens
-            decode_seq_lens = torch.where(
-                padding_mask,
-                torch.zeros_like(decode_seq_lens),
-                decode_seq_lens,
-            ).contiguous()
-            decode_block_table = torch.where(
-                padding_mask[:, None],
-                torch.zeros_like(decode_block_table),
-                decode_block_table,
-            ).contiguous()
+        if num_live_reqs == 1 and int(query_lens_cpu[0].item()) > 0:
+            # The production single-stream verifier is one q=N request.  The
+            # generic repeat_interleave construction below launches several
+            # data-dependent indexing kernels and synchronizes their output
+            # sizes.  Write the persistent CUDA-graph metadata in one launch.
+            block_cols_per_program = 256
+            num_block_cols = int(block_table.shape[1])
+            _expand_single_request_smallq_metadata_kernel[
+                (
+                    num_query_tokens,
+                    triton.cdiv(num_block_cols, block_cols_per_program),
+                )
+            ](
+                block_table,
+                seq_lens,
+                self._smallq_decode_block_table,
+                self._smallq_decode_seq_lens,
+                self._smallq_decode_block_table.stride(0),
+                num_block_cols=num_block_cols,
+                real_query_tokens=real_num_query_tokens,
+                block_cols_per_program=block_cols_per_program,
+            )
+        else:
+            repeat_query_lens = query_lens
+            if padding_tokens > 0:
+                repeat_query_lens = query_lens.clone()
+                repeat_query_lens[-1] += padding_tokens
 
-        self._smallq_decode_block_table[:num_query_tokens].copy_(
-            decode_block_table,
-            non_blocking=True,
-        )
-        self._smallq_decode_seq_lens[:num_query_tokens].copy_(
-            decode_seq_lens,
-            non_blocking=True,
-        )
+            effective_seq_lens = torch.maximum(
+                seq_lens,
+                real_query_lens.to(dtype=seq_lens.dtype),
+            )
+            block_table = block_table.clamp_min(0)
+            decode_block_table = torch.repeat_interleave(
+                block_table,
+                repeat_query_lens,
+                dim=0,
+                output_size=num_query_tokens,
+            ).contiguous()
+            seq_lens_rep = torch.repeat_interleave(
+                effective_seq_lens,
+                repeat_query_lens,
+                output_size=num_query_tokens,
+            )
+            query_lens_rep = torch.repeat_interleave(
+                real_query_lens.to(dtype=seq_lens.dtype),
+                repeat_query_lens,
+                output_size=num_query_tokens,
+            )
+            start_locs_rep = torch.repeat_interleave(
+                query_start_loc[:-1].to(dtype=seq_lens.dtype),
+                repeat_query_lens,
+                output_size=num_query_tokens,
+            )
+            token_indices = self._smallq_token_indices[:num_query_tokens].to(
+                dtype=seq_lens.dtype
+            )
+            offsets = token_indices - start_locs_rep + 1
+            decode_seq_lens = (seq_lens_rep - query_lens_rep + offsets).contiguous()
+            if padding_tokens > 0:
+                padding_mask = token_indices >= real_num_query_tokens
+                decode_seq_lens = torch.where(
+                    padding_mask,
+                    torch.zeros_like(decode_seq_lens),
+                    decode_seq_lens,
+                ).contiguous()
+                decode_block_table = torch.where(
+                    padding_mask[:, None],
+                    torch.zeros_like(decode_block_table),
+                    decode_block_table,
+                ).contiguous()
+
+            self._smallq_decode_block_table[:num_query_tokens].copy_(
+                decode_block_table,
+                non_blocking=True,
+            )
+            self._smallq_decode_seq_lens[:num_query_tokens].copy_(
+                decode_seq_lens,
+                non_blocking=True,
+            )
         self._smallq_query_start_loc[: num_reqs + 1].copy_(
             query_start_loc,
             non_blocking=True,

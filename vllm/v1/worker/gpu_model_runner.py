@@ -128,6 +128,8 @@ from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
 )
+
+
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -3418,6 +3420,7 @@ class GPUModelRunner(
         cascade_attn_prefix_lens: list[list[int]] | None = None,
         slot_mappings: dict[int, torch.Tensor] | None = None,
         ddtree_parent_metadata: DDTreeParentMetadata | None = None,
+        trace_builders: bool = False,
     ) -> tuple[PerLayerAttnMetadata, CommonAttentionMetadata | None]:
         """
         :return: tuple[attn_metadata, spec_decode_common_attn_metadata]
@@ -3599,6 +3602,7 @@ class GPUModelRunner(
             common_attn_metadata: CommonAttentionMetadata,
             ubid: int | None = None,
         ) -> None:
+            builder_started = time.perf_counter() if trace_builders else 0.0
             attn_group = self.attn_groups[kv_cache_gid][attn_gid]
             builder = attn_group.get_metadata_builder(ubid or 0)
             kv_cache_spec = kv_cache_groups[kv_cache_gid].kv_cache_spec
@@ -3667,6 +3671,7 @@ class GPUModelRunner(
                 )
 
             if for_cudagraph_capture:
+                builder_path = "capture"
                 attn_metadata_i = builder.build_for_cudagraph_capture(
                     common_attn_metadata
                 )
@@ -3674,12 +3679,14 @@ class GPUModelRunner(
                 cache_key in cached_attn_metadata
                 and builder.supports_update_block_table
             ):
+                builder_path = "cached"
                 attn_metadata_i = builder.update_block_table(
                     cached_attn_metadata[cache_key],
                     common_attn_metadata.block_table_tensor,
                     common_attn_metadata.slot_mapping,
                 )
             else:
+                builder_path = "build"
                 attn_metadata_i = builder.build(
                     common_prefix_len=cascade_attn_prefix_len,
                     common_attn_metadata=common_attn_metadata,
@@ -3687,6 +3694,17 @@ class GPUModelRunner(
                 )
                 if builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = attn_metadata_i
+
+            if trace_builders:
+                logger.info(
+                    "SM70 attention metadata builder type=%s path=%s "
+                    "kv_gid=%d attn_gid=%d ms=%.3f",
+                    type(builder).__name__,
+                    builder_path,
+                    kv_cache_gid,
+                    attn_gid,
+                    (time.perf_counter() - builder_started) * 1000.0,
+                )
 
             if ubid is None:
                 assert isinstance(attn_metadata, dict)
@@ -5969,6 +5987,7 @@ class GPUModelRunner(
                     cascade_attn_prefix_lens=cascade_attn_prefix_lens,
                     slot_mappings=slot_mappings_by_group,
                     ddtree_parent_metadata=self._ddtree_parent_metadata,
+                    trace_builders=trace_log,
                 )
             )
             if trace_log:

@@ -11,6 +11,7 @@ import torch
 from vllm import envs
 from vllm.config import VllmConfig
 from vllm.logger import init_logger
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -41,6 +42,63 @@ GDN_SPEC_METADATA_TENSORS = tuple[
     torch.Tensor,
 ]
 _GDN_SPEC_METADATA_TENSOR_REGISTRY: dict[str, GDN_SPEC_METADATA_TENSORS] = {}
+
+
+@triton.jit
+def _build_single_request_gdn_spec_metadata_kernel(
+    source_state_ids,
+    source_accepted_tokens,
+    source_state_selectors,
+    output_state_ids,
+    output_state_stride,
+    output_sequence_masks,
+    output_token_indices,
+    output_query_start_loc,
+    output_accepted_tokens,
+    output_state_selectors,
+    batch_size: tl.constexpr,
+    real_query_tokens: tl.constexpr,
+    state_width: tl.constexpr,
+    state_block_size: tl.constexpr,
+    capture_only: tl.constexpr,
+    pad_slot_id: tl.constexpr,
+):
+    """Materialize graph-persistent metadata for one live q=N request."""
+    row = tl.program_id(0)
+    state_col = tl.arange(0, state_block_size)
+    state_mask = state_col < state_width
+    live_row = row == 0
+    state_ids = tl.load(
+        source_state_ids + state_col,
+        mask=live_row & (not capture_only) & state_mask,
+        other=pad_slot_id,
+    )
+    tl.store(
+        output_state_ids + row * output_state_stride + state_col,
+        state_ids,
+        mask=state_mask,
+    )
+    tl.store(output_sequence_masks + row, live_row)
+
+    accepted = tl.load(source_accepted_tokens, mask=live_row, other=1)
+    selector = tl.load(source_state_selectors, mask=live_row, other=1)
+    tl.store(output_accepted_tokens + row, accepted)
+    tl.store(output_state_selectors + row, selector)
+
+    tl.store(
+        output_token_indices + row,
+        row,
+        mask=row < real_query_tokens,
+    )
+    tl.store(
+        output_query_start_loc + row,
+        tl.where(live_row, 0, real_query_tokens),
+    )
+    tl.store(
+        output_query_start_loc + batch_size,
+        real_query_tokens,
+        mask=live_row,
+    )
 
 
 def _sm70_flashqla_original_prefill_enabled() -> bool:
@@ -589,15 +647,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
-        context_lens_tensor = m.compute_num_computed_tokens()
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
-        block_table_tensor = mamba_get_block_table_tensor(
-            m.block_table_tensor,
-            m.seq_lens,
-            self.kv_cache_spec,
-            self.vllm_config.cache_config.mamba_cache_mode,
-        )
-        is_mamba_cache_all = self.vllm_config.cache_config.mamba_cache_mode == "all"
 
         num_reqs = query_start_loc_cpu.numel() - 1
         if spec_sequence_masks_cpu is not None:
@@ -632,6 +682,99 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             assert ddtree_num_tree_tokens_cpu.numel() == num_reqs, (
                 "ddtree_num_tree_tokens_cpu must align with query_start_loc"
             )
+
+        if (
+            os.getenv("VLLM_SM70_GDN_SINGLE_SPEC_METADATA", "0") == "1"
+            and self.use_spec_decode
+            and self.use_full_cuda_graph
+            and current_state_block_ids is not None
+            and num_decode_draft_tokens_cpu is not None
+            and num_accepted_tokens is not None
+            and spec_state_slot_selectors is not None
+            and ddtree_parent_ids is None
+            and not os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR")
+        ):
+            query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+            single_spec_mask_cpu = num_decode_draft_tokens_cpu >= 0
+            single_live_spec = (
+                int(single_spec_mask_cpu.sum().item()) == 1
+                and bool(single_spec_mask_cpu[0].item())
+                and int(query_lens_cpu[0].item()) > 1
+                and int(num_decode_draft_tokens_cpu[0].item())
+                == self.num_spec
+                and int(torch.count_nonzero(query_lens_cpu).item()) == 1
+            )
+            if single_live_spec:
+                batch_size = int(m.num_actual_tokens)
+                real_query_tokens = int(query_lens_cpu[0].item())
+                state_width = self.num_spec_state_tokens + 1
+                if (
+                    batch_size <= self.decode_cudagraph_max_bs
+                    and real_query_tokens <= batch_size
+                    and current_state_block_ids.shape[1] >= state_width
+                ):
+                    _build_single_request_gdn_spec_metadata_kernel[(batch_size,)](
+                        current_state_block_ids,
+                        num_accepted_tokens,
+                        spec_state_slot_selectors,
+                        self.spec_state_indices_tensor,
+                        self.spec_state_indices_tensor.stride(0),
+                        self.spec_sequence_masks,
+                        self.spec_token_indx,
+                        self.spec_query_start_loc,
+                        self.num_accepted_tokens,
+                        self.spec_state_slot_selectors,
+                        batch_size=batch_size,
+                        real_query_tokens=real_query_tokens,
+                        state_width=state_width,
+                        state_block_size=triton.next_power_of_2(state_width),
+                        capture_only=for_cudagraph_capture,
+                        pad_slot_id=PAD_SLOT_ID,
+                    )
+                    attn_metadata = GDNAttentionMetadata(
+                        num_prefills=0,
+                        num_prefill_tokens=0,
+                        num_decodes=0,
+                        num_decode_tokens=0,
+                        num_spec_decodes=1,
+                        num_spec_decode_tokens=real_query_tokens,
+                        num_actual_tokens=batch_size,
+                        spec_query_start_loc=self.spec_query_start_loc[
+                            : batch_size + 1
+                        ],
+                        spec_state_indices_tensor=self.spec_state_indices_tensor[
+                            :batch_size
+                        ],
+                        spec_sequence_masks=self.spec_sequence_masks[:batch_size],
+                        spec_token_indx=self.spec_token_indx[:real_query_tokens],
+                        non_spec_token_indx=self.non_spec_token_indx[:0],
+                        num_accepted_tokens=self.num_accepted_tokens[:batch_size],
+                        spec_state_slot_selectors=self.spec_state_slot_selectors[
+                            :batch_size
+                        ],
+                    )
+                    if envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
+                        register_gdn_spec_metadata_tensors(
+                            self.layer_names,
+                            gdn_spec_metadata_tensors(
+                                attn_metadata, query_start_loc.device
+                            ),
+                        )
+                    return attn_metadata
+
+        # The single-request speculative fast path above only consumes the
+        # already-selected recurrent-state IDs.  Keep the generic block-table
+        # transform and context tensor lazy: constructing them before that
+        # return launches a full stack of tiny indexing kernels for every GDN
+        # cache group even though none of their results are used.
+        context_lens_tensor = m.compute_num_computed_tokens()
+        block_table_tensor = mamba_get_block_table_tensor(
+            m.block_table_tensor,
+            m.seq_lens,
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )
+        is_mamba_cache_all = self.vllm_config.cache_config.mamba_cache_mode == "all"
 
         if not self.use_spec_decode:
             spec_sequence_masks = None

@@ -39,6 +39,38 @@ GREEDY_TEMPERATURE: tl.constexpr = 0
 MAX_SPEC_LEN = 128
 
 
+@triton.jit
+def _force_target_relative_prob_kernel(
+    target_probs_ptr,
+    draft_token_ids_ptr,
+    uniform_probs_ptr,
+    vocab_size: tl.constexpr,
+    relative_prob: tl.constexpr,
+    block_size: tl.constexpr,
+):
+    """Force plausible draft tokens without a separate max/gather/mask stack."""
+    token_idx = tl.program_id(0)
+    offsets = tl.arange(0, block_size)
+    row_start = token_idx * vocab_size
+    mode_prob = 0.0
+    for block_start in range(0, vocab_size, block_size):
+        vocab_offsets = block_start + offsets
+        values = tl.load(
+            target_probs_ptr + row_start + vocab_offsets,
+            mask=vocab_offsets < vocab_size,
+            other=0.0,
+        )
+        mode_prob = tl.maximum(mode_prob, tl.max(values))
+
+    draft_token_id = tl.load(draft_token_ids_ptr + token_idx)
+    draft_prob = tl.load(target_probs_ptr + row_start + draft_token_id)
+    uniform_prob = tl.load(uniform_probs_ptr + token_idx)
+    tl.store(
+        uniform_probs_ptr + token_idx,
+        tl.where(draft_prob >= relative_prob * mode_prob, 0.0, uniform_prob),
+    )
+
+
 def _parse_step_filter(raw_steps: str | None) -> set[int] | None:
     if not raw_steps:
         return None
@@ -722,6 +754,23 @@ def rejection_sample(
     # Compute probability distribution from target logits.
     target_probs = target_logits.softmax(dim=-1, dtype=torch.float32)
     assert target_probs.is_contiguous()
+
+    relative_prob_raw = os.getenv("VLLM_MTP_FORCE_TARGET_RELATIVE_PROB")
+    if relative_prob_raw is not None:
+        assert uniform_probs is not None
+        relative_prob = float(relative_prob_raw)
+        if not 0.0 < relative_prob <= 1.0:
+            raise ValueError(
+                "VLLM_MTP_FORCE_TARGET_RELATIVE_PROB must be in (0, 1]"
+            )
+        _force_target_relative_prob_kernel[(target_probs.shape[0],)](
+            target_probs,
+            draft_token_ids,
+            uniform_probs,
+            vocab_size=target_probs.shape[1],
+            relative_prob=relative_prob,
+            block_size=8192,
+        )
 
     # Sample recovered tokens for each position.
     # [num_tokens]

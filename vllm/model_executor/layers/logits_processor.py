@@ -262,6 +262,24 @@ class LogitsProcessor(PluggableLayer):
         else:
             local_max_vals, global_indices = local_top1
 
+        return self.reduce_local_top_tokens(
+            lm_head,
+            hidden_states,
+            local_max_vals,
+            global_indices,
+            embedding_bias,
+        )
+
+    def reduce_local_top_tokens(
+        self,
+        lm_head: VocabParallelEmbedding,
+        hidden_states: torch.Tensor,
+        local_max_vals: torch.Tensor,
+        global_indices: torch.Tensor,
+        embedding_bias: torch.Tensor | None = None,
+    ) -> torch.Tensor:
+        """Reduce precomputed vocab-shard top-1 pairs across TP ranks."""
+        tp_size = get_tensor_model_parallel_world_size()
         if tp_size == 1:
             self._maybe_dump_top_token_margin(
                 lm_head, hidden_states, embedding_bias, global_indices
