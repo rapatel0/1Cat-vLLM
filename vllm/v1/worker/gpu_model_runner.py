@@ -1428,6 +1428,7 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self._sm70_prompt_tail_cache: dict[int, dict[str, object]] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -1444,6 +1445,7 @@ class GPUModelRunner(
 
         self.use_aux_hidden_state_outputs = False
         # Set up speculative decoding.
+        self.drafter = None
         # NOTE(Jiayi): currently we put the entire draft model on
         # the last PP rank. This is not ideal if there are many
         # layers in the draft model.
@@ -8028,6 +8030,118 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    def _sm70_prompt_tail_key(self) -> int | None:
+        if self.input_batch.num_reqs != 1:
+            return None
+        prompt_len = int(self.input_batch.num_prompt_tokens[0])
+        if prompt_len <= 0:
+            return None
+        tokens = self.input_batch.token_ids_cpu[0, :prompt_len]
+        return hash(tokens.tobytes())
+
+    def _sm70_prompt_tail_len(self) -> int:
+        prompt_len = int(self.input_batch.num_prompt_tokens[0])
+        block_size = max(int(self.cache_config.block_size or 16), 1)
+        return prompt_len % block_size
+
+    def _sm70_tail_page_views(self) -> list:
+        req_id = self.input_batch.req_ids[0]
+        req_state = self.requests.get(req_id)
+        if req_state is None or req_state.block_ids is None:
+            return []
+        state_idx = self.mamba_state_idx.get(req_id)
+        ctx = self.compilation_config.static_forward_context
+        pages = []
+        mamba_pages = 0
+        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if gid >= len(req_state.block_ids):
+                return []
+            block_ids = req_state.block_ids[gid]
+            if not block_ids:
+                return []
+            if isinstance(group.kv_cache_spec, MambaSpec):
+                if state_idx is None or not (0 <= state_idx < len(block_ids)):
+                    return []
+                bid = int(block_ids[state_idx])
+            else:
+                bid = int(block_ids[-1])
+            if bid < 0:
+                return []
+            for name in group.layer_names:
+                layer = ctx.get(name)
+                cache = getattr(layer, "kv_cache", None) if layer is not None else None
+                tensors = []
+                if torch.is_tensor(cache):
+                    tensors = [cache]
+                elif isinstance(cache, (list, tuple)):
+                    tensors = [t for t in cache if torch.is_tensor(t)]
+                for tensor in tensors:
+                    if tensor.ndim < 1 or bid >= tensor.shape[0]:
+                        return []
+                    pages.append(tensor[bid])
+                    if isinstance(group.kv_cache_spec, MambaSpec):
+                        mamba_pages += 1
+        if mamba_pages <= 0:
+            return []
+        return pages
+
+    def _sm70_try_load_prompt_tail(self, scheduler_output, num_tokens):
+        import os
+        if os.getenv("VLLM_SM70_PROMPT_TAIL_CACHE", "1") != "1":
+            return None
+        if self.input_batch.num_reqs != 1:
+            return None
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return None
+        tail = self._sm70_prompt_tail_len()
+        if tail <= 1 or num_tokens != tail:
+            return None
+        key = self._sm70_prompt_tail_key()
+        entry = self._sm70_prompt_tail_cache.get(key) if key is not None else None
+        if entry is None:
+            return None
+        hidden = entry.get("hidden")
+        pages = entry.get("pages")
+        if not torch.is_tensor(hidden) or hidden.shape[0] != tail:
+            return None
+        dest = self._sm70_tail_page_views()
+        if not isinstance(pages, list) or not dest or len(pages) != len(dest):
+            return None
+        try:
+            for src, dst in zip(pages, dest):
+                if not torch.is_tensor(src) or src.shape != dst.shape:
+                    return None
+                dst.copy_(src)
+        except Exception:
+            return None
+        return hidden
+
+    def _sm70_try_save_prompt_tail(self, scheduler_output, num_tokens, hidden_states):
+        import os
+        if os.getenv("VLLM_SM70_PROMPT_TAIL_CACHE", "1") != "1":
+            return
+        if self.input_batch.num_reqs != 1:
+            return
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return
+        tail = self._sm70_prompt_tail_len()
+        if tail <= 1 or num_tokens != tail:
+            return
+        if not torch.is_tensor(hidden_states) or hidden_states.shape[0] < tail:
+            return
+        key = self._sm70_prompt_tail_key()
+        if key is None:
+            return
+        views = self._sm70_tail_page_views()
+        if not views:
+            return
+        pages = [page.detach().clone() for page in views]
+        self._sm70_prompt_tail_cache.clear()
+        self._sm70_prompt_tail_cache[key] = {
+            "hidden": hidden_states[:tail].detach().clone(),
+            "pages": pages,
+        }
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -8392,13 +8506,22 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
+            cached_output = self._sm70_try_load_prompt_tail(
+                scheduler_output, num_tokens_unpadded
             )
+            if cached_output is not None:
+                model_output = cached_output
+            else:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+                self._sm70_try_save_prompt_tail(
+                    scheduler_output, num_tokens_unpadded, model_output
+                )
         if trace_log:
             trace_forward_submit_ms = (time.perf_counter() - trace_forward_t0) * 1000.0
         self._sm70_mtp_profile_finish(
@@ -10615,7 +10738,7 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if self.speculative_config and (
+            if self.speculative_config and get_pp_group().is_last_rank and (
                 self.speculative_config.use_eagle()
                 or self.speculative_config.uses_draft_model()
                 or self.speculative_config.uses_extract_hidden_states()
@@ -10687,6 +10810,8 @@ class GPUModelRunner(
         logit_indices_device = torch.from_numpy(logit_indices).to(
             self.device, non_blocking=True
         )
+        if not get_pp_group().is_last_rank:
+            return hidden_states, None
         _sm70_profile_trace(
             "_dummy_run return hidden_shape=%s sampled_count=%s",
             tuple(hidden_states.shape),
@@ -10960,11 +11085,14 @@ class GPUModelRunner(
         hidden_states, last_hidden_states = self._dummy_run(
             self.max_num_tokens, is_profile=True
         )
-        _sm70_profile_trace(
-            "profile_run dummy_run exit hidden_shape=%s last_hidden_shape=%s",
-            tuple(hidden_states.shape),
-            tuple(last_hidden_states.shape),
-        )
+        if not get_pp_group().is_last_rank:
+            _sm70_profile_trace("profile_run dummy_run exit PP non-last")
+        else:
+            _sm70_profile_trace(
+                "profile_run dummy_run exit hidden_shape=%s last_hidden_shape=%s",
+                tuple(hidden_states.shape),
+                tuple(last_hidden_states.shape),
+            )
         if get_pp_group().is_last_rank:
             if self.is_pooling_model:
                 _sm70_profile_trace("profile_run pooler enter")
@@ -11585,7 +11713,7 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
+        if self.speculative_config and get_pp_group().is_last_rank and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_draft_model()
         ):
@@ -11638,7 +11766,7 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
+        if self.speculative_config and get_pp_group().is_last_rank and (
             self.speculative_config.use_eagle()
             or self.speculative_config.uses_extract_hidden_states()
         ):
@@ -12102,6 +12230,7 @@ class GPUModelRunner(
 
         if (
             self.speculative_config
+            and get_pp_group().is_last_rank
             and self.speculative_config.uses_extract_hidden_states()
         ):
             assert isinstance(self.drafter, ExtractHiddenStatesProposer)

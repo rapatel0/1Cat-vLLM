@@ -524,7 +524,7 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                     computed.append(cached)
             else:
                 break
-        if use_eagle and computed_blocks[0]:
+        if use_eagle and computed_blocks[0] and block_size <= 64:
             # Need to drop the last matched block if eagle is enabled.
             for computed in computed_blocks:
                 computed.pop()
@@ -632,7 +632,7 @@ class SlidingWindowManager(SingleTypeKVCacheManager):
             ):
                 for computed in computed_blocks:
                     computed.pop()
-        if use_eagle and computed_blocks[0]:
+        if use_eagle and computed_blocks[0] and block_size <= 64:
             for computed in computed_blocks:
                 computed.pop()
             # Re-align after eagle pop: the pop may break the alignment

@@ -440,7 +440,7 @@ class Scheduler(SchedulerInterface):
             block_size = self.cache_config.block_size
             last_cache_position = request.num_tokens - request.num_tokens % block_size
             # eagle prune
-            if self.use_eagle:
+            if self.use_eagle and block_size <= 64:
                 last_cache_position = max(last_cache_position - block_size, 0)
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
             if num_computed_tokens_after_sched < last_cache_position:

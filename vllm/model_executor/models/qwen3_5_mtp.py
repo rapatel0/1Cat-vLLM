@@ -32,6 +32,7 @@ from vllm.transformers_utils.configs.qwen3_5 import Qwen3_5TextConfig
 from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
 
 from .interfaces import (
+    SupportsPP,
     MultiModalEmbeddings,
     SupportsMultiModal,
     _require_is_multimodal,
@@ -206,9 +207,11 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             hidden_states = self.fc(hidden_states)
             residual = None
         else:
-            assert intermediate_tensors is not None
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+            if intermediate_tensors is not None:
+                hidden_states = intermediate_tensors["hidden_states"]
+                residual = intermediate_tensors["residual"]
+            else:
+                residual = None
 
         current_step_idx = spec_step_idx % self.num_mtp_layers
         hidden_states, residual = self.layers[current_step_idx](
@@ -434,7 +437,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         "hidden_states": 0,
     }
 )
-class Qwen3_5MTP(nn.Module, SupportsMultiModal):
+class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -483,6 +486,10 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
         self.share_target_io_weights = (
             os.getenv("VLLM_QWEN35_MTP_SHARE_IO_WEIGHTS", "1") != "0"
         )
+        # When pipeline-parallel is active, the MTP head on the last PP stage
+        # needs its own TP-sharded embedding (PPMissingLayer returns junk).
+        if get_pp_group().world_size > 1:
+            self.share_target_io_weights = False
         mtp_vllm_config = vllm_config
         keep_quant = os.getenv("VLLM_QWEN35_MTP_KEEP_QUANT", "0") == "1"
         if (
