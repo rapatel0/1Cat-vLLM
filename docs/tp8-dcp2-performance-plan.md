@@ -21,15 +21,18 @@ explicitly qualified.
 
 | Mode | Existing throughput evidence | KV tokens | Provenance |
 |---|---:|---:|---|
-| TP8+DCP1, no speculation | 70.9 tok/s at ~13K context | — | `homelab/docs/qwen38-27b-bringup.md` |
-| TP8+DCP1+MTP4 | 126 tok/s single; 1,730 tok/s c32 | 1,209,336 | operator anchors retained in `docs/dcp2-qwen38-final-benchmark.json` |
+| TP8+DCP1, no speculation | about 120 tok/s single; 1,700 tok/s c32 | 1,209,336 | operator-confirmed reference; the final artifact previously mislabeled it as MTP4 |
+| TP8+DCP1, no speculation | 70.9 tok/s at ~13K context | — | different long-context shape in `homelab/docs/qwen38-27b-bringup.md` |
 | TP8+DCP2, no speculation | 45.5–50.4 short-request tok/s | 2,612,021 | `docs/dcp2-qwen38-validation.md` |
-| TP8+DCP2+MTP4 | 51.464 tok/s single; 377.005 tok/s c32 | 2,090,088 | `docs/dcp2-qwen38-final-benchmark.json` |
+| TP8+DCP2+MTP4, original | 51.464 tok/s single; 377.005 tok/s c32 | 2,090,088 | `docs/dcp2-qwen38-final-benchmark.json` |
+| TP8+DCP2+MTP4, current | 54.251 tok/s single; 734.934 tok/s c32 | 2,097,152 | seven-run fused-ZBA qualification |
 
 The early 55.4/539 DCP2 figures in the implementation report predate the final
-cross-rank LSE correction and are deliberately excluded. The retained
-benchmarks use different prompt and warmup shapes, so they are
-capacity/performance anchors rather than a promotion comparison by themselves.
+cross-rank LSE correction and are deliberately excluded. The old 126/1,730
+artifact values were operator-supplied and mislabeled as TP8+MTP4; the corrected
+reference is about 120/1,700 for TP8 without MTP. The retained benchmarks use
+different prompt and warmup shapes, so they are capacity/performance anchors
+rather than a promotion comparison by themselves.
 They are sufficient to start code work; no MTP3 or baseline-recreation matrix
 is a Phase-0 prerequisite.
 New canary runs are required only to validate a changed candidate, not to
@@ -119,6 +122,10 @@ Implement and validate one focused change per commit, in this order:
    See `docs/tp8-dcp2-xqa-decode.md`.
 5. Overlap query all-gather with independent replicated causal-suffix work,
    using graph-safe streams/events, only if the trace shows useful overlap.
+6. **Completed:** native MTP4 on SM70 now uses the exact fused Qwen3.5 GDN
+   z/b/a projection-slice copy by default. The seven-run c32 median increased
+   from 678.638 to 734.934 tok/s, while completion tokens per verifier step
+   stayed at 2.503 and KV capacity stayed at 2,097,152 tokens.
 
 Each change first passes targeted unit/kernel tests and no-MTP/MTP4 graph and
 numerical tests, then a direct canary S1/c32 candidate gate.  Keep a change

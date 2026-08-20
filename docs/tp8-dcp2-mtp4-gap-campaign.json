@@ -1,0 +1,153 @@
+{
+  "date": "2026-08-20",
+  "branch": "experiment/qwen38-mtp-dcp2",
+  "runtime_commit": "8b760b5f65198b88ec86a00c548507d79e3d34ac",
+  "rejected_xqa_revert_commit": "708d115dbd",
+  "configuration": {
+    "hardware": "gpu-01: 8 x Tesla V100-SXM2-32GB",
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 2,
+    "dcp_comm_backend": "a2a",
+    "speculator": "native MTP4",
+    "max_model_len": 262144,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384,
+    "gpu_memory_utilization": 0.78,
+    "active_exact_paths": [
+      "direct PyNCCL query gather",
+      "packed output/LSE A2A",
+      "uniform q=5 verifier batching",
+      "scalar q=1 DCP decode",
+      "fused Qwen3.5 GDN z/b/a extraction"
+    ]
+  },
+  "reference_correction": {
+    "tp8_no_mtp_single_tok_s": 120.0,
+    "tp8_no_mtp_c32_tok_s": 1700.0,
+    "note": "Operator-confirmed no-MTP reference. Earlier artifacts mislabeled about 126/1730 as TP8+MTP4."
+  },
+  "profile_attribution": {
+    "cuda_event_profile": {
+      "scope": "last 64 steady c32 calls, calculated from cumulative-profile deltas",
+      "target_q5_forward_ms": 59.45,
+      "target_logits_ms": 2.621,
+      "target_rejection_sample_ms": 0.818,
+      "mtp_draft_total_ms": 13.26,
+      "proposer_total_gpu_ms": 13.051,
+      "proposer_first_forward_ms": 4.597,
+      "proposer_first_sample_ms": 0.587,
+      "proposer_loop_forward_ms": [1.569, 1.526, 1.502],
+      "proposer_loop_sample_ms": [0.586, 0.594, 0.590],
+      "proposer_loop_metadata_cpu_ms": 2.191,
+      "warning": "CUDA-event diagnostics synchronize and are not throughput measurements."
+    },
+    "async_cpu_trace": {
+      "c32_target_preprocess_ms_range": [9.3, 11.5],
+      "c32_attention_metadata_ms_range": [6.1, 7.6],
+      "c32_forward_submit_ms_range": [0.5, 1.6],
+      "sample_kernel_submission_ms_range": [0.6, 1.1],
+      "state_update_ms_range": [0.4, 0.7]
+    },
+    "torch_profiler_rank0": {
+      "active_iterations": 8,
+      "kernel_duration_sum_ms": 2307.407,
+      "serialized_kernel_duration_shares_pct": {
+        "linear_gemm": 48.477,
+        "tp_all_reduce": 32.732,
+        "dcp_packed_a2a": 2.983,
+        "dcp_query_all_gather": 1.596,
+        "dcp_pack_merge": 0.343,
+        "full_attention": 2.299,
+        "gdn_core": 3.725,
+        "sampler_recovery": 0.081,
+        "other": 7.765
+      },
+      "warning": "Kernel-duration shares are serialized sums. NCCL kernels can include device wait and kernels can overlap."
+    }
+  },
+  "implementation": {
+    "change": "Use one Triton kernel to copy Qwen3.5 split-projection z/b/a slices for native SM70 MTP4 instead of three contiguous-copy launches.",
+    "default_scope": "SM70, native MTP, exactly four speculative tokens",
+    "environment_override": "VLLM_SM70_GDN_FUSED_ZBA_EXTRACT",
+    "no_mtp_default_changed": false,
+    "semantics": "Exact copy-only transformation; sampling and acceptance math are unchanged."
+  },
+  "matched_seven_run_comparison": {
+    "baseline": {
+      "single_median_tok_s": 54.17095017924199,
+      "single_runs_tok_s": [57.157284405520755, 57.0566789586169, 50.376437421779976, 50.81384943579534, 55.67469449027415, 54.17095017924199, 52.293684300081054],
+      "c32_median_tok_s": 678.6383811901009,
+      "c32_runs_tok_s": [559.8267049206779, 669.5716188641779, 670.8057248502602, 678.6383811901009, 702.3175893541205, 711.2596873783531, 715.6655149463841],
+      "single_wall_ms_per_verifier_step": 45.6855,
+      "c32_wall_ms_per_batch_verifier_step": 118.9269,
+      "accepted_drafts_per_step_c32": 1.4846843724275378
+    },
+    "candidate": {
+      "single_median_tok_s": 54.250915556177624,
+      "single_runs_tok_s": [54.86505100321362, 52.3843327267515, 56.27905165140333, 54.2683598300241, 54.250915556177624, 51.08322154852182, 53.769163611192944],
+      "c32_median_tok_s": 734.9341345014149,
+      "c32_runs_tok_s": [734.9341345014149, 748.8999211744342, 736.1693213660574, 735.7780383268482, 730.2654708820796, 725.9166400522536, 727.6313211882401],
+      "single_wall_ms_per_verifier_step": 44.6519,
+      "c32_wall_ms_per_batch_verifier_step": 109.0993,
+      "accepted_drafts_per_step_c1": 1.398793565683646,
+      "completion_tokens_per_step_c1": 2.4021447721179623,
+      "accepted_drafts_per_step_c32": 1.502968136185072,
+      "completion_tokens_per_step_c32": 2.5030117852466174
+    },
+    "change_pct": {
+      "single_median_tok_s": 0.1476,
+      "c32_median_tok_s": 8.2954,
+      "single_step_latency": -2.2623,
+      "c32_batch_step_latency": -8.2635
+    }
+  },
+  "official_three_run_candidate": {
+    "single_median_tok_s": 53.42494375558661,
+    "single_runs_tok_s": [50.01014928194172, 53.42494375558661, 57.286684191383394],
+    "c32_median_tok_s": 663.5078068574841,
+    "c32_runs_tok_s": [523.4129058201976, 663.5078068574841, 674.0436975659545],
+    "accepted_drafts_per_step_c1": 1.3919129082426127,
+    "accepted_drafts_per_step_c32": 1.5017800834096227,
+    "needle_128k": true
+  },
+  "progress": {
+    "current_vs_120_single_reference_pct": 45.2091,
+    "current_vs_1700_c32_reference_pct": 43.2314,
+    "current_vs_original_dcp2_mtp4_single_pct": 5.4152,
+    "current_vs_original_dcp2_mtp4_c32_pct": 94.9404,
+    "original_dcp2_mtp4_single_tok_s": 51.46405522304799,
+    "original_dcp2_mtp4_c32_tok_s": 377.00459559245843
+  },
+  "correctness_capacity": {
+    "needle_8k": true,
+    "needle_32k": true,
+    "needle_128k": true,
+    "repeated_prefix_32k": [true, true],
+    "mtp4_kv_tokens": 2097152,
+    "mtp4_cuda_graph_gib": 2.03,
+    "no_mtp_8k_smoke": true,
+    "no_mtp_spec_counters_zero": true,
+    "no_mtp_kv_tokens": 2326331,
+    "no_mtp_cuda_graph_gib": 0.46
+  },
+  "next_bottleneck": "The q=5 target verifier trunk dominates. Rank-0 Torch profiling attributes 48.5% of serialized kernel duration to linear GEMMs and 32.7% to TP all-reduce. DCP query/A2A communication totals only 4.6%, and sampler/recovery is 0.08%.",
+  "artifacts": {
+    "projection": "/localpool/onecat-vllm-hy3-sm70/dcp2-branch-8b760b5f6519",
+    "projection_manifest_sha256": "94935eb74dc9505f8dbc22a04f875ade52fdc0cf075e8a4ce725b1ac0c26ea1b",
+    "official_benchmark_sha256": "6d632b3e8d9815b907882b6f98e61c045f76b54c066394f74200575fd0c2fa6d",
+    "seven_run_candidate_sha256": "67c3ffde2178677e03b168c2bdccb257e4d16ff0102547ecfa762f6f49277723",
+    "seven_run_baseline_sha256": "4b387d5ca077010e0a073b5700928c57d5e01ced0bba972dd737d6db1934e12c",
+    "long_correctness_sha256": "e27149465dba9106d8ca83783ce2ae747465ff5d973adc0e985f406a5018491e",
+    "no_mtp_smoke_sha256": "aec75849ab4b51701639ab9d1e1e25dab9ed00878603c3ac3d97bc9a000c22c5",
+    "torch_profile_dir": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/mtp-gap-torch",
+    "torch_rank0_trace_sha256": "385b2ae5931eadd4c3c5809d86b8ddd29d057acec55936b41caa954fb1dc8f5a",
+    "torch_rank0_summary_sha256": "5c81e3cb3444f58005b7eecdfafd90c311dbf1da39fc1f327e4c9afd0e230e5b"
+  },
+  "active_state": {
+    "qwen38-27b-fp8-tp8": "0/0",
+    "qwen38-27b-fp8-tp8-dcp2": "1/1 healthy",
+    "mode": "TP8+DCP2+A2A+native MTP4+uniform verifier batching+direct query gather+fused GDN z/b/a extraction",
+    "profiler_disabled": true,
+    "gateway_changed": false
+  }
+}
