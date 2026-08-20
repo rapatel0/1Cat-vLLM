@@ -1,0 +1,133 @@
+{
+  "date": "2026-08-20",
+  "branch": "experiment/qwen38-mtp-dcp2",
+  "runtime_source_commit": "9bc01fd4a3691632dfeeb63f8875a757f84d2214",
+  "durable_tip_before_record": "1d71b50cae53158753e04a2cf157b121dde23fc0",
+  "configuration": {
+    "hardware": "gpu-01: 8 x Tesla V100-SXM2-32GB",
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 2,
+    "dcp_comm_backend": "a2a",
+    "speculator": "native MTP4",
+    "max_model_len": 262144,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384,
+    "gpu_memory_utilization": 0.78
+  },
+  "implementation": {
+    "uniform_route": "one batched causal suffix attention, one batched local paged-prefix attention, one flattened exact-LSE DCP combine, one merged output",
+    "eligible_query_lengths": "2..VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q (default 16)",
+    "mtp4_query_length": 5,
+    "fallback": "per-request correction for nonuniform, single-request, noncausal, structurally invalid, or unsupported layouts",
+    "backends": ["a2a", "ag_rs"],
+    "route_counters": [
+      "prefill_prefix_dcp_uniform_batch",
+      "prefill_prefix_dcp_uniform_batch_a2a",
+      "prefill_prefix_dcp_uniform_batch_ag_rs",
+      "prefill_prefix_dcp_per_request_fallback"
+    ]
+  },
+  "tests": {
+    "cpu_source": "16 passed",
+    "dcp2_mtp4_c32_cuda_graph": "1 passed, 36 deselected",
+    "distributed_shape": {
+      "tokens": 160,
+      "heads_before_scatter": 6,
+      "heads_after_scatter": 3,
+      "head_dim": 256,
+      "ranks": 2
+    },
+    "correctness": {
+      "needle_8k": true,
+      "needle_32k": true,
+      "needle_128k": true,
+      "repeated_prefix_32k": [true, true],
+      "no_mtp_8k_smoke": true
+    }
+  },
+  "mtp4_performance": {
+    "official_three_run": {
+      "single_median_tok_s": 49.41948787790178,
+      "single_runs_tok_s": [49.41948787790178, 49.947615366710274, 46.8675576664439],
+      "c32_median_tok_s": 595.8024159287131,
+      "c32_cohorts_tok_s": [507.2152045274861, 595.8024159287131, 649.5790178594601],
+      "c32_accepted_drafts_per_step": 1.505044328951391
+    },
+    "single_followup_seven_run": {
+      "median_tok_s": 52.93403721070713,
+      "mean_tok_s": 52.098928505899224,
+      "runs_tok_s": [52.96111136891562, 51.12294000485411, 52.93403721070713, 53.72773917292005, 49.04018487080874, 53.001173817574006, 51.905313095514934]
+    },
+    "prior_a2a": {
+      "single_median_tok_s": 50.7535,
+      "c32_median_tok_s": 356.4301
+    },
+    "change_vs_prior_a2a_pct": {
+      "single_using_seven_run_median": 4.2963,
+      "c32": 67.1583
+    },
+    "change_vs_original_final_c32_pct": 58.036,
+    "original_final_c32_tok_s": 377.0046
+  },
+  "communication_profile": {
+    "old_total_a2a_collectives_all_ranks": 30368,
+    "new_total_a2a_collectives_all_ranks": 12216,
+    "total_change_pct": -59.7734,
+    "old_q5_per_request_combine_calls_per_rank": 2438,
+    "new_q5_fallback_calls_per_rank": 69,
+    "new_uniform_batch_calls_per_rank": 88,
+    "q5_correction_call_reduction": "2438 to 157 per rank (15.53x, -93.56%)",
+    "full_c32_payload_bytes": 495360,
+    "full_c32_calls_per_rank": 63,
+    "full_c32_median_host_us": {
+      "pack": 76.9895,
+      "all_to_all": 146.231,
+      "unpack": 72.7515,
+      "sum": 295.972
+    },
+    "prior_per_request_median_host_us": {
+      "pack": 61.507,
+      "all_to_all": 118.917,
+      "unpack": 74.350,
+      "sum": 254.774
+    },
+    "note": "The batched payload is 32 times larger but its median annotated combine envelope is only 16.17% larger than one old per-request combine. Nsight has no CUDA kernel tables, so these are host NVTX spans."
+  },
+  "capacity": {
+    "kv_tokens": 2090088,
+    "cuda_graph_gib": 2.04,
+    "prior_a2a_cuda_graph_gib": 4.13,
+    "graph_change_pct": -50.6053
+  },
+  "no_mtp_smoke": {
+    "needle_8k": true,
+    "single_128_output_tok_s": 51.139346725070496,
+    "c32_64_output_tok_s": 344.05424460253465,
+    "note": "Short smoke shapes are not comparable with the retained 512/256-output no-MTP benchmark."
+  },
+  "artifacts": {
+    "projection": "/localpool/onecat-vllm-hy3-sm70/dcp2-branch-1d71b50cae",
+    "projection_manifest_sha256": "46e12c24245babf5637cf7aac18be502d229840df02f88748bd20160748ff39c",
+    "nsys": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/batched-9bc01fd4a3-all-ranks.nsys-rep",
+    "nsys_sha256": "9eda02f016bea7b3bf4e5fc45b72f37e97be8f64e53f9e69bd7518a5a075e92e",
+    "sqlite": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/batched-9bc01fd4a3-all-ranks.sqlite",
+    "sqlite_sha256": "7f05e790574de60beb677fb5e0552c88bcb3d6c1d08cbc86fb0d14f3659fe0cf",
+    "benchmark_sha256": "49b748f82ab093e532e71633cf5bab42a17801d8fdebbf6b8eb5ed141fa9d267",
+    "single_followup_sha256": "2730a4f2acddc43dd7ceaa4ed0b8e7fd3b6b11c5783344ccba18e8518ea590d7",
+    "long_correctness_sha256": "7d1091ec79fe3aa16a22ea4888270ac0b51e22f5382f7d788af2234e73bc240f",
+    "no_mtp_smoke_sha256": "3624f7ce548af90525913c96c29ac4a4158e9d63609bf0684bf2040721326824",
+    "nvtx_analysis_sha256": "f3a788f3ac844848de55768f37c365abd4a1d0586189c24092d50c10e313405d"
+  },
+  "source_hashes": {
+    "vllm/v1/attention/backends/flash_attn_v100.py": "1b5109fe982d16ee92cba6f7895946a290bfe875ba47ef2a93a2f17620bbf35d",
+    "tests/v1/attention/test_flash_attn_v100_dcp.py": "1cb399736fec3d6c0054b1da31425b55eddf098d0d2933a520a86f6d67d9cb87",
+    "tests/distributed/test_dcp_a2a.py": "8e6b47acc82c8b434eff5e3aa4ba323b1f1f2b79d9d1725e58e80081607327e4"
+  },
+  "active_state": {
+    "qwen38-27b-fp8-tp8": "0/0",
+    "qwen38-27b-fp8-tp8-dcp2": "1/1 healthy",
+    "mode": "TP8+DCP2+A2A+native MTP4+uniform verifier batching",
+    "nvtx": false,
+    "gateway_changed": false
+  }
+}

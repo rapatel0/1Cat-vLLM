@@ -117,16 +117,19 @@ more than 2%.
 
 ### 3. Fix q>1 MTP4 scaling
 
-The primary MTP4 target is the DCP correction loop in the q>1 verifier path.
-Batch/flatten compatible requests so each full-attention layer performs local
-prefix attention and cross-rank correction once for the compatible batch,
-rather than once per logical request.  Preserve the existing per-request route
-for irregular prefill, prove routing with counters, and retain graph-stable
-addresses.
+**Completed:** runtime source `9bc01fd4a3` batches compatible uniform small
+queries across causal suffix attention, local paged-prefix attention, exact LSE
+correction, and state merge. The per-request route remains explicit for
+irregular layouts. See `docs/tp8-dcp2-mtp4-batched-correction.md`.
 
-**Exit:** MTP4 c32 verifier collective/correction work no longer scales once
-per request for uniform q>1 batches, while exact outputs, rejection rollback,
-and hybrid GDN-state handling remain correct.
+The qualified route reduced matched q=5 correction calls from 2,438 to 157 per
+rank, increased c32 from 356.4301 to 595.8024 tok/s, and reduced graph memory
+from 4.13 to 2.04 GiB. Exact 8K/32K/128K retrieval, repeated-prefix use,
+no-MTP smoke, and a two-rank c32-shape CUDA graph test passed.
+
+**Exit met:** MTP4 c32 verifier correction no longer scales once per request
+for uniform q>1 batches. Exact outputs, fallback routing, graph replay, prefix
+cache use, and hybrid GDN-state service behavior remain correct.
 
 ### 4. Qualification after accepted code changes
 
