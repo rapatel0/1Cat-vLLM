@@ -3994,9 +3994,22 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             local_context_len = int(local_context_kv_lens[i].item())
             q_context = query_across_dcp[start:end].unsqueeze(0)
             if local_context_len > 0:
+                required_blocks = (local_context_len + block_size - 1) // block_size
+                context_block_table = attn_metadata.block_table[
+                    i : i + 1, :required_blocks
+                ]
+                invalid_blocks = (context_block_table < 0) | (
+                    context_block_table >= key_cache.shape[0]
+                )
+                if bool(torch.any(invalid_blocks).item()):
+                    raise RuntimeError(
+                        "FLASH_ATTN_V100 DCP prefill received an invalid prefix "
+                        f"block table for sequence {i}: local_context_len="
+                        f"{local_context_len}, required_blocks={required_blocks}"
+                    )
                 k_context, v_context = _extract_contiguous_kv_from_paged_cache(
                     kv_cache=kv_cache,
-                    block_table=attn_metadata.block_table[i : i + 1],
+                    block_table=context_block_table,
                     seq_lens=local_context_kv_lens[i : i + 1],
                     num_kv_heads=num_kv_heads,
                     head_dim=head_dim,
