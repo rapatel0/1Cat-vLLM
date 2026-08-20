@@ -11,7 +11,10 @@ Tests cover:
 import math
 from types import SimpleNamespace
 
-import multiprocess as mp
+try:
+    import multiprocess as mp
+except ImportError:  # pragma: no cover - minimal GPU qualification images.
+    import multiprocessing as mp
 import pytest
 import torch
 import torch.distributed as dist
