@@ -559,6 +559,22 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
 
 
 @pytest.mark.skipif(
+    torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs."
+)
+def test_distributed_packed_a2a_dcp2_workspace_matches_reference():
+    _distributed_run(
+        _distributed_packed_a2a_worker,
+        world_size=2,
+        extra_env={
+            "TEST_DTYPE": "float16",
+            "RETURN_LSE": "1",
+            "LSE_BASE_E": "1",
+            "USE_WORKSPACE": "1",
+        },
+    )
+
+
+@pytest.mark.skipif(
     torch.accelerator.device_count() < 4, reason="Need at least 4 GPUs."
 )
 @pytest.mark.parametrize("dtype_name", ["float16", "bfloat16", "float32"])
