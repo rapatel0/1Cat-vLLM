@@ -1099,7 +1099,10 @@ std::vector<at::Tensor> flash_attention_forward(
     TORCH_CHECK(window_size_left >= -1 && window_size_right >= -1,
                 "window sizes must be >= -1");
     TORCH_CHECK(softcap == 0.f, "softcap not supported");
-    TORCH_CHECK(!return_softmax, "return_softmax not supported");
+    // The forward kernel always computes and returns softmax_lse. Accepting
+    // return_softmax exposes that existing result; probability tensors remain
+    // intentionally empty because callers only request LSE for DCP merging.
+    (void)return_softmax;
     TORCH_CHECK(!gen_.has_value(), "Generator not supported");
 
     TORCH_CHECK(q.dtype() == torch::kFloat16, "q must be fp16");

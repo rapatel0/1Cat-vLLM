@@ -12,6 +12,7 @@ ROOT = Path(__file__).parents[3]
 BACKEND = ROOT / "vllm/v1/attention/backends/flash_attn_v100.py"
 FLASH_INTERFACE = ROOT / "flash-attention-v100/flash_attn_v100/flash_attn_interface.py"
 ATTENTION_UTILS = ROOT / "vllm/v1/attention/backends/utils.py"
+FUSED_MHA_FORWARD = ROOT / "flash-attention-v100/kernel/fused_mha_forward.cu"
 
 
 def _dense_attention(q, k, v, *, causal, softmax_scale, **_kwargs):
@@ -368,6 +369,12 @@ def test_dcp_prefill_matches_dense_attention():
     _run_prefill_case(method, prefix_len=0)
     _run_prefill_case(method, prefix_len=5)
     _run_prefill_case(method, prefix_len=1)
+
+
+def test_dense_flash_exposes_existing_lse():
+    source = FUSED_MHA_FORWARD.read_text()
+    assert 'TORCH_CHECK(!return_softmax, "return_softmax not supported")' not in source
+    assert "return {out_fp16, softmax_lse, p, rng_state};" in source
 
 
 def test_decode_workspace_lse_reconstruction():
