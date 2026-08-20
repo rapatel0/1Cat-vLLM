@@ -294,6 +294,9 @@ def _namespace():
         "cp_lse_ag_out_rs": _cp_lse_combine,
         "dcp_a2a_lse_reduce": _a2a_lse_combine,
         "dcp_query_all_gather": _query_all_gather,
+        "_decode_xqa_allowed_for_q_per_kv": lambda q_per_kv, _metadata: (
+            q_per_kv in (6, 8)
+        ),
         "merge_attn_states": _merge_states,
         "_record_route": _RECORDED_ROUTES.append,
         "_is_cuda_graph_capturing": lambda _query: False,
@@ -430,14 +433,22 @@ class _StubDecodeImpl:
     kv_cache_dtype = "auto"
     scale = 0.5
     use_decode_xqa = False
+    flash_attn_decode_paged_xqa = None
+    _flash_decode_paged_xqa_kwargs = {"return_lse", "dcp_trace_range"}
     _get_dcp_decode_output_workspace = _load_method("_get_dcp_decode_output_workspace")
+    _dcp_decode_xqa_eligible = _load_method("_dcp_decode_xqa_eligible")
 
-    def __init__(self, rank, profile=False, backend="ag_rs"):
+    def __init__(self, rank, profile=False, backend="ag_rs", use_xqa=False):
         self.dcp_rank = rank
         self.dcp_comm_backend = backend
         self._dcp_decode_profile_enabled = profile
         self._dcp_decode_output_workspaces = {}
         self.profile_stages = []
+        self.scalar_calls = 0
+        self.xqa_calls = 0
+        self.use_decode_xqa = use_xqa
+        if use_xqa:
+            self.flash_attn_decode_paged_xqa = self._flash_attn_decode_paged_xqa
 
     def _dcp_decode_profile_range(self, stage):
         return _RecordingRange(self.profile_stages, stage)
@@ -446,6 +457,30 @@ class _StubDecodeImpl:
     def _flash_v100_window_size(*, causal):
         assert causal
         return (-1, -1)
+
+    def _decode_reference(self, query, seq_lens, kwargs, stage):
+        assert kwargs["return_lse"]
+        assert int(seq_lens[0]) == self.expected_local_len
+        trace_range = kwargs.get("dcp_trace_range")
+        if trace_range is None:
+            out, lse, _ = _dense_attention(
+                query.unsqueeze(0),
+                _CURRENT_GROUP.local_k.unsqueeze(0),
+                _CURRENT_GROUP.local_v.unsqueeze(0),
+                causal=False,
+                softmax_scale=self.scale,
+            )
+        else:
+            with trace_range(stage):
+                out, lse, _ = _dense_attention(
+                    query.unsqueeze(0),
+                    _CURRENT_GROUP.local_k.unsqueeze(0),
+                    _CURRENT_GROUP.local_v.unsqueeze(0),
+                    causal=False,
+                    softmax_scale=self.scale,
+                )
+        kwargs["out"].copy_(out.squeeze(0))
+        return kwargs["out"], lse.squeeze(0).transpose(0, 1).contiguous()
 
     def _call_flash_attn_decode_paged(
         self,
@@ -456,28 +491,25 @@ class _StubDecodeImpl:
         seq_lens,
         **kwargs,
     ):
-        assert kwargs["return_lse"]
-        assert int(seq_lens[0]) == self.expected_local_len
-        trace_range = kwargs["dcp_trace_range"]
-        if trace_range is None:
-            out, lse, _ = _dense_attention(
-                query.unsqueeze(0),
-                _CURRENT_GROUP.local_k.unsqueeze(0),
-                _CURRENT_GROUP.local_v.unsqueeze(0),
-                causal=False,
-                softmax_scale=self.scale,
-            )
-        else:
-            with trace_range("local_attention"):
-                out, lse, _ = _dense_attention(
-                    query.unsqueeze(0),
-                    _CURRENT_GROUP.local_k.unsqueeze(0),
-                    _CURRENT_GROUP.local_v.unsqueeze(0),
-                    causal=False,
-                    softmax_scale=self.scale,
-                )
-        kwargs["out"].copy_(out.squeeze(0))
-        return kwargs["out"], lse.squeeze(0).transpose(0, 1).contiguous()
+        self.scalar_calls += 1
+        return self._decode_reference(query, seq_lens, kwargs, "local_attention")
+
+    def _flash_attn_decode_paged_xqa(
+        self,
+        query,
+        _key_cache,
+        _value_cache,
+        _block_table,
+        seq_lens,
+        **kwargs,
+    ):
+        self.xqa_calls += 1
+        return self._decode_reference(
+            query,
+            seq_lens,
+            kwargs,
+            "local_attention_xqa",
+        )
 
 
 class _Metadata:
@@ -635,30 +667,51 @@ def _run_multi_request_prefill_case(
     return rank_combine_calls, list(_RECORDED_ROUTES)
 
 
-def _run_decode_case(method, prefix_len, profile=False, backend="ag_rs"):
+def _run_decode_case(
+    method,
+    prefix_len,
+    profile=False,
+    backend="ag_rs",
+    use_xqa=False,
+):
     global _CURRENT_GROUP
     torch.manual_seed(31 + prefix_len)
-    total_heads, local_heads, dim = 4, 2, 4
-    q_all = torch.randn(1, total_heads, dim)
-    prefix_k = torch.randn(prefix_len, 1, dim)
-    prefix_v = torch.randn(prefix_len, 1, dim)
+    total_heads, local_heads, dim = (6, 3, 256) if use_xqa else (4, 2, 4)
+    dtype = torch.float16 if use_xqa else torch.float32
+    q_all = torch.randn(1, total_heads, dim, dtype=dtype)
+    prefix_k = torch.randn(prefix_len, 1, dim, dtype=dtype)
+    prefix_v = torch.randn(prefix_len, 1, dim, dtype=dtype)
     rank_outputs = []
     rank_profile_stages = []
+    _RECORDED_ROUTES.clear()
 
     for rank in range(2):
         owned = torch.arange(prefix_len) % 2 == rank
         local_k, local_v = prefix_k[owned], prefix_v[owned]
-        cache = torch.zeros(1, 2, max(prefix_len, 1), 1, dim)
+        cache = torch.zeros(
+            1,
+            2,
+            max(prefix_len, 1),
+            1,
+            dim,
+            dtype=dtype,
+        )
         _CURRENT_GROUP = _FakeGroup(
             rank, q_all, prefix_k, prefix_v, local_k, local_v, _StubImpl.scale
         )
         metadata = _Metadata()
         metadata.num_actual_tokens = 1
+        metadata.max_query_len = 1
         metadata.seq_lens = torch.tensor([prefix_len], dtype=torch.int32)
         metadata.block_table = torch.zeros(1, 1, dtype=torch.int32)
-        impl = _StubDecodeImpl(rank, profile=profile, backend=backend)
+        impl = _StubDecodeImpl(
+            rank,
+            profile=profile,
+            backend=backend,
+            use_xqa=use_xqa,
+        )
         impl.expected_local_len = local_k.shape[0]
-        output = torch.empty(1, local_heads, dim)
+        output = torch.empty(1, local_heads, dim, dtype=dtype)
         method(
             impl,
             _Layer(),
@@ -670,6 +723,12 @@ def _run_decode_case(method, prefix_len, profile=False, backend="ag_rs"):
             output,
         )
         assert _CURRENT_GROUP.combine_calls == 1
+        if use_xqa:
+            assert impl.xqa_calls == 1
+            assert impl.scalar_calls == 0
+        else:
+            assert impl.xqa_calls == 0
+            assert impl.scalar_calls == 1
         rank_outputs.append(output)
         rank_profile_stages.append(impl.profile_stages)
 
@@ -774,6 +833,7 @@ def test_decode_interface_uses_direct_reduction_lse():
 
     assert "dcp_trace_range" in interface_source
     assert 'dcp_trace_range("local_attention")' in interface_source
+    assert 'dcp_trace_range("local_attention_xqa")' in interface_source
     assert 'dcp_trace_range("lse_reconstruction")' not in interface_source
     assert "_decode_lse_from_workspace" not in interface_source
     assert "final_lse if return_lse else None" in interface_source
@@ -797,6 +857,67 @@ def test_dcp_decode_a2a_matches_dense_attention():
     method = _load_method("_flash_v100_decode")
     _run_decode_case(method, prefix_len=5, backend="a2a")
     _run_decode_case(method, prefix_len=1, backend="a2a")
+    assert _RECORDED_ROUTES.count("decode_scalar_paged_dcp_fallback") == 2
+    assert _RECORDED_ROUTES.count("decode_scalar_paged_dcp_a2a") == 2
+    assert "decode_xqa_paged_dcp" not in _RECORDED_ROUTES
+
+
+def test_dcp_q1_xqa_q_per_kv6_matches_dense_attention_and_uses_a2a():
+    method = _load_method("_flash_v100_decode")
+    _run_decode_case(method, prefix_len=6, backend="a2a", use_xqa=True)
+    _run_decode_case(method, prefix_len=1, backend="a2a", use_xqa=True)
+    assert _RECORDED_ROUTES.count("decode_xqa_paged_dcp") == 2
+    assert _RECORDED_ROUTES.count("decode_xqa_paged_dcp_a2a") == 2
+    assert _RECORDED_ROUTES.count("decode_xqa_paged_dcp_complete") == 2
+    assert "decode_scalar_paged_dcp_fallback" not in _RECORDED_ROUTES
+
+
+def test_dcp_xqa_selection_excludes_q_greater_than_one_and_bad_shapes():
+    eligible = _load_method("_dcp_decode_xqa_eligible")
+    impl = _StubDecodeImpl(rank=0, use_xqa=True)
+    key_cache = torch.empty(1, 4, 1, 256, dtype=torch.float16)
+    value_cache = torch.empty_like(key_cache)
+    metadata = _Metadata()
+    metadata.max_query_len = 1
+    metadata.seq_lens = torch.ones(2, dtype=torch.int32)
+
+    assert eligible(
+        impl,
+        torch.empty(2, 6, 256, dtype=torch.float16),
+        key_cache,
+        value_cache,
+        metadata,
+        (-1, -1),
+    )
+
+    metadata.max_query_len = 5
+    metadata.seq_lens = torch.ones(2, dtype=torch.int32)
+    assert not eligible(
+        impl,
+        torch.empty(10, 6, 256, dtype=torch.float16),
+        key_cache,
+        value_cache,
+        metadata,
+        (-1, -1),
+    )
+
+    metadata.max_query_len = 1
+    assert not eligible(
+        impl,
+        torch.empty(2, 5, 256, dtype=torch.float16),
+        key_cache,
+        value_cache,
+        metadata,
+        (-1, -1),
+    )
+    assert not eligible(
+        impl,
+        torch.empty(2, 6, 256, dtype=torch.float16),
+        key_cache,
+        value_cache,
+        metadata,
+        (128, -1),
+    )
 
 
 def test_dcp_decode_rejects_unknown_communication_backend():
@@ -920,3 +1041,20 @@ def test_dcp_decode_a2a_profile_has_one_packed_collective():
         assert any(stage.startswith("output_copy bytes=") for stage in stages)
         assert not any(stage.startswith("lse_all_gather") for stage in stages)
         assert not any(stage.startswith("output_reduce_scatter") for stage in stages)
+
+
+def test_dcp_q1_xqa_profile_proves_xqa_and_packed_a2a_routes():
+    method = _load_method("_flash_v100_decode")
+    rank_stages = _run_decode_case(
+        method,
+        prefix_len=7,
+        profile=True,
+        backend="a2a",
+        use_xqa=True,
+    )
+    for stages in rank_stages:
+        assert "local_attention_xqa" in stages
+        assert "local_attention" not in stages
+        assert any(stage.startswith("a2a_all_to_all bytes=") for stage in stages)
+    assert _RECORDED_ROUTES.count("decode_xqa_paged_dcp") == 2
+    assert _RECORDED_ROUTES.count("decode_xqa_paged_dcp_a2a") == 2
