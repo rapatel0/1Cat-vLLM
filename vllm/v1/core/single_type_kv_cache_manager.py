@@ -60,7 +60,12 @@ class SingleTypeKVCacheManager(ABC):
         self.block_size = kv_cache_spec.block_size
         self.dcp_world_size = dcp_world_size
         self.pcp_world_size = pcp_world_size
-        if dcp_world_size * pcp_world_size > 1:
+        # DCP shards full-attention paged KV cache, but Mamba/GDN state is
+        # fixed-size per slot and replicated across DCP ranks.
+        if (
+            kv_cache_spec.dcp_shards_sequence
+            and dcp_world_size * pcp_world_size > 1
+        ):
             self.block_size *= dcp_world_size * pcp_world_size
         self.kv_cache_spec = kv_cache_spec
         self.block_pool = block_pool
@@ -878,7 +883,8 @@ class MambaManager(SingleTypeKVCacheManager):
         assert isinstance(kv_cache_spec, MambaSpec), (
             "MambaManager can only be used for mamba groups"
         )
-        assert dcp_world_size == 1, "DCP not support mamba now."
+        # Mamba/GDN state is replicated under DCP; only full-attention
+        # managers apply sequence-sharding semantics.
         assert pcp_world_size == 1, "PCP not support mamba now."
         computed_blocks: tuple[list[KVCacheBlock], ...] = tuple(
             [] for _ in range(len(kv_cache_group_ids))

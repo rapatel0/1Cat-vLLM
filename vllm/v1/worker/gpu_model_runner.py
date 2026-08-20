@@ -9271,9 +9271,12 @@ class GPUModelRunner(
                 continue
             block_size = kv_cache_group.kv_cache_spec.block_size
             block_sizes.append(block_size)
-            max_num_blocks_per_req = cdiv(
-                max_model_len, block_size * get_total_cp_world_size()
+            cp_factor = (
+                get_total_cp_world_size()
+                if kv_cache_group.kv_cache_spec.dcp_shards_sequence
+                else 1
             )
+            max_num_blocks_per_req = cdiv(max_model_len, block_size * cp_factor)
             if isinstance(kv_cache_group.kv_cache_spec, MambaSpec):
                 max_num_blocks_per_req = (
                     max_num_blocks_per_req
@@ -9303,6 +9306,11 @@ class GPUModelRunner(
                 logitsprocs_need_output_token_ids=self.input_batch.logitsprocs_need_output_token_ids,
                 is_pooling_model=self.is_pooling_model,
                 reasoning_config=self.vllm_config.reasoning_config,
+                dcp_shards_sequence=[
+                    g.kv_cache_spec.dcp_shards_sequence
+                    for g in kv_cache_config.kv_cache_groups
+                    if not isinstance(g.kv_cache_spec, EncoderOnlyAttentionSpec)
+                ],
             )
 
         assert self._init_block_sizes == block_sizes, (

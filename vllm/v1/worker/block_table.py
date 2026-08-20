@@ -26,6 +26,7 @@ class BlockTable:
         device: torch.device,
         kernel_block_size: int,
         cp_kv_cache_interleave_size: int,
+        dcp_shards_sequence: bool = True,
     ):
         """
         Args:
@@ -98,6 +99,7 @@ class BlockTable:
             self.dcp_world_size = 1
             self.dcp_rank = 0
         self.cp_kv_cache_interleave_size = cp_kv_cache_interleave_size
+        self.dcp_shards_sequence = dcp_shards_sequence
 
     def append_row(
         self,
@@ -145,8 +147,12 @@ class BlockTable:
         positions: torch.Tensor,
     ) -> None:
         num_tokens = positions.shape[0]
-        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
-        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        if self.dcp_shards_sequence:
+            total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+            total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        else:
+            total_cp_world_size = self.pcp_world_size
+            total_cp_rank = self.pcp_rank
         _compute_slot_mapping_kernel[(num_reqs + 1,)](
             num_tokens,
             self.max_num_batched_tokens,
@@ -165,8 +171,12 @@ class BlockTable:
 
     def warmup_slot_mapping_kernel(self) -> None:
         """JIT the slot-mapping kernel without touching live block-table state."""
-        total_cp_world_size = self.pcp_world_size * self.dcp_world_size
-        total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        if self.dcp_shards_sequence:
+            total_cp_world_size = self.pcp_world_size * self.dcp_world_size
+            total_cp_rank = self.pcp_rank * self.dcp_world_size + self.dcp_rank
+        else:
+            total_cp_world_size = self.pcp_world_size
+            total_cp_rank = self.pcp_rank
         max_num_tokens = self.max_num_batched_tokens
         block_table = torch.zeros(
             (1, self.max_num_blocks_per_req), dtype=torch.int32, device=self.device
@@ -274,7 +284,10 @@ class MultiGroupBlockTable:
         kernel_block_sizes: list[int],
         max_num_blocks: list[int] | None = None,
         cp_kv_cache_interleave_size: int = 1,
+        dcp_shards_sequence: list[bool] | None = None,
     ) -> None:
+        if dcp_shards_sequence is None:
+            dcp_shards_sequence = [True] * len(block_sizes)
         if len(kernel_block_sizes) != len(block_sizes):
             raise ValueError(
                 f"kernel_block_sizes length ({len(kernel_block_sizes)}) "
@@ -288,7 +301,9 @@ class MultiGroupBlockTable:
             total_cp_world_size = get_total_cp_world_size()
             max_num_blocks = [
                 cdiv(max_model_len, block_size * total_cp_world_size)
-                for block_size in block_sizes
+                if dcp_shards
+                else cdiv(max_model_len, block_size)
+                for block_size, dcp_shards in zip(block_sizes, dcp_shards_sequence)
             ]
 
         if len(max_num_blocks) != len(block_sizes):
@@ -314,9 +329,10 @@ class MultiGroupBlockTable:
                 device,
                 kernel_block_size,
                 cp_kv_cache_interleave_size,
+                dcp_shards_sequence=dcp_shards,
             )
-            for block_size, kernel_block_size, max_num_blocks_per_req in zip(
-                block_sizes, kernel_block_sizes, max_num_blocks
+            for block_size, kernel_block_size, max_num_blocks_per_req, dcp_shards in zip(
+                block_sizes, kernel_block_sizes, max_num_blocks, dcp_shards_sequence
             )
         ]
 

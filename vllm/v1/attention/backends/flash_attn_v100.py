@@ -2130,6 +2130,10 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
 class FlashAttnV100Impl(TritonAttentionImpl):
     """Flash Attention V100 implementation with explicit fallback policy."""
 
+    # The V100 decode workspace computes the local LSE components. The actual
+    # DCP LSE return/reduction path is added separately.
+    can_return_lse_for_decode: bool = True
+
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         (

@@ -101,6 +101,15 @@ class KVCacheSpec:
     block_size: int
 
     @property
+    def dcp_shards_sequence(self) -> bool:
+        """Whether DCP shards this cache's sequence dimension.
+
+        Full-attention paged KV cache is sequence-sharded. Hybrid Mamba/GDN
+        state is fixed-size per slot and overrides this to remain replicated.
+        """
+        return True
+
+    @property
     def page_size_bytes(self) -> int:
         """
         The size of a page with `block_size` tokens in bytes.
@@ -561,6 +570,12 @@ class SlidingWindowMLASpec(SlidingWindowSpec):
 
 @dataclass(frozen=True)
 class MambaSpec(KVCacheSpec):
+    """Mamba/GDN state is fixed-size per slot, not sequence-sharded by DCP."""
+
+    @property
+    def dcp_shards_sequence(self) -> bool:
+        return False
+
     shapes: tuple[tuple[int, ...], ...]
     dtypes: tuple[torch.dtype]
     page_size_padded: int | None = None
