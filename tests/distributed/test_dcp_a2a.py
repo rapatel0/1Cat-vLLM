@@ -561,7 +561,8 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
         is_lse_base_on_e = env["LSE_BASE_E"] == "1"
         rank = dist.get_rank()
         world_size = dist.get_world_size()
-        B, h_per_rank, D = 5, 2, 32
+        B = int(env.get("BATCH_TOKENS", "5"))
+        h_per_rank, D = 2, 32
         H = world_size * h_per_rank
 
         generator = torch.Generator(device=f"cuda:{local_rank}")
@@ -581,13 +582,44 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
             dtype=torch.float32,
             generator=generator,
         )
-        actual = dcp_a2a_lse_reduce(
-            cp_attn_out,
-            cp_attn_lse,
-            _FakeCPGroup(world_size, dist.group.WORLD),
-            return_lse=return_lse,
-            is_lse_base_on_e=is_lse_base_on_e,
-        )
+        cp_group = _FakeCPGroup(world_size, dist.group.WORLD)
+        use_graph = env.get("USE_CUDA_GRAPH") == "1"
+        if use_graph:
+            capture_stream = torch.cuda.Stream(device=local_rank)
+            capture_stream.wait_stream(torch.cuda.current_stream(local_rank))
+            with torch.cuda.stream(capture_stream):
+                # Compile Triton and populate the per-stream persistent buffers
+                # before capture. The MTP4 c32 shape is 32 requests x 5 tokens.
+                dcp_a2a_lse_reduce(
+                    cp_attn_out,
+                    cp_attn_lse,
+                    cp_group,
+                    return_lse=return_lse,
+                    is_lse_base_on_e=is_lse_base_on_e,
+                    use_persistent_buffers=True,
+                )
+            dist.barrier()
+            capture_stream.synchronize()
+            graph = torch.cuda.CUDAGraph()
+            with torch.cuda.graph(graph, stream=capture_stream):
+                actual = dcp_a2a_lse_reduce(
+                    cp_attn_out,
+                    cp_attn_lse,
+                    cp_group,
+                    return_lse=return_lse,
+                    is_lse_base_on_e=is_lse_base_on_e,
+                    use_persistent_buffers=True,
+                )
+            graph.replay()
+            torch.cuda.synchronize()
+        else:
+            actual = dcp_a2a_lse_reduce(
+                cp_attn_out,
+                cp_attn_lse,
+                cp_group,
+                return_lse=return_lse,
+                is_lse_base_on_e=is_lse_base_on_e,
+            )
 
         gathered_out = [torch.empty_like(cp_attn_out) for _ in range(world_size)]
         gathered_lse = [torch.empty_like(cp_attn_lse) for _ in range(world_size)]
@@ -639,6 +671,23 @@ def test_distributed_packed_a2a_dcp2_workspace_matches_reference():
             "RETURN_LSE": "1",
             "LSE_BASE_E": "1",
             "USE_WORKSPACE": "1",
+        },
+    )
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs."
+)
+def test_distributed_packed_a2a_dcp2_mtp4_c32_cuda_graph():
+    _distributed_run(
+        _distributed_packed_a2a_worker,
+        world_size=2,
+        extra_env={
+            "TEST_DTYPE": "float16",
+            "RETURN_LSE": "1",
+            "LSE_BASE_E": "1",
+            "BATCH_TOKENS": "160",
+            "USE_CUDA_GRAPH": "1",
         },
     )
 

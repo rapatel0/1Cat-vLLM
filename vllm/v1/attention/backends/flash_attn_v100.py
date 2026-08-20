@@ -3972,11 +3972,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
     ) -> torch.Tensor:
         """Run DCP prefill as separate cached-prefix and query-suffix states.
 
-        Each DCP rank owns an interleaved shard of the cached prefix. Queries
-        are gathered across the DCP group's head dimension, attended against
-        the local prefix shard, and globally combined using LSE correction.
-        The current query suffix is replicated, so it is evaluated locally and
-        merged with the corrected prefix state.
+        Uniform multi-token verifier batches use one batched prefix-attention
+        call and one DCP combine. Irregular layouts retain the per-request
+        path. Both routes evaluate the replicated causal suffix locally, then
+        merge it with the globally corrected prefix state using exact LSEs.
         """
         num_actual_tokens = attn_metadata.num_actual_tokens
         query = query[:num_actual_tokens]
@@ -4008,13 +4007,208 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
 
         dcp_group = get_dcp_group()
-        query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)
+        trace_range = (
+            self._dcp_decode_profile_range
+            if self._dcp_decode_profile_enabled
+            else None
+        )
+        if trace_range is None:
+            query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)
+        else:
+            with trace_range("query_prepare"):
+                query_for_gather = query.contiguous()
+            query_bytes = query_for_gather.numel() * query_for_gather.element_size()
+            with trace_range(f"query_all_gather bytes={query_bytes}"):
+                query_across_dcp = dcp_group.all_gather(query_for_gather, dim=1)
+
         key_cache, value_cache = _split_paged_kv_cache(kv_cache)
         block_size = key_cache.shape[1]
         causal = getattr(attn_metadata, "causal", True)
         window_size = self._flash_v100_window_size(causal)
-
         is_capturing = _is_cuda_graph_capturing(query)
+
+        # The paged-prefix kernel accepts a batch with row-specific block tables
+        # and sequence lengths, but the raw suffix kernel requires one common
+        # query length. Restrict this route to the exact uniform verifier layout
+        # so reshape operations remain views and graph replay sees stable shapes.
+        query_lens_host = query_start_loc_host[1:] - query_start_loc_host[:-1]
+        uniform_query_len = (
+            int(query_lens_host[0].item()) if num_seqs > 0 else 0
+        )
+        uniform_layout = (
+            num_seqs > 1
+            and uniform_query_len > 1
+            and self.smallq_decode_max_query_len > 0
+            and uniform_query_len <= self.smallq_decode_max_query_len
+            and int(query_start_loc_host[0].item()) == 0
+            and int(query_start_loc_host[-1].item()) == int(query.shape[0])
+            and bool(torch.all(query_lens_host == uniform_query_len).item())
+            and int(key.shape[0]) == int(query.shape[0])
+            and int(value.shape[0]) == int(query.shape[0])
+            and int(out_view.shape[0]) == int(query.shape[0])
+            and query.is_contiguous()
+            and key.is_contiguous()
+            and value.is_contiguous()
+            and out_view.is_contiguous()
+            and attn_metadata.block_table.ndim == 2
+            and int(attn_metadata.block_table.shape[0]) >= num_seqs
+            and int(attn_metadata.seq_lens.numel()) >= num_seqs
+            and causal
+        )
+
+        if uniform_layout:
+            if not is_capturing:
+                for i in range(num_seqs):
+                    local_context_len = int(local_context_kv_lens[i].item())
+                    if local_context_len < 0:
+                        raise RuntimeError(
+                            "FLASH_ATTN_V100 DCP uniform verifier received a "
+                            f"negative prefix length for sequence {i}: "
+                            f"{local_context_len}"
+                        )
+                    required_blocks = (
+                        local_context_len + block_size - 1
+                    ) // block_size
+                    context_blocks = attn_metadata.block_table[
+                        i : i + 1, :required_blocks
+                    ]
+                    invalid_blocks = (context_blocks < 0) | (
+                        context_blocks >= key_cache.shape[0]
+                    )
+                    if bool(torch.any(invalid_blocks).item()):
+                        raise RuntimeError(
+                            "FLASH_ATTN_V100 DCP uniform verifier received an "
+                            f"invalid prefix block table for sequence {i}: "
+                            f"local_context_len={local_context_len}, "
+                            f"required_blocks={required_blocks}"
+                        )
+
+            batch_shape = (num_seqs, uniform_query_len)
+            q_suffix = query.view(*batch_shape, query.shape[1], query.shape[2])
+            k_suffix = key.view(*batch_shape, key.shape[1], key.shape[2])
+            v_suffix = value.view(*batch_shape, value.shape[1], value.shape[2])
+            q_context = query_across_dcp.view(
+                *batch_shape,
+                query_across_dcp.shape[1],
+                query_across_dcp.shape[2],
+            )
+
+            if trace_range is None:
+                query_out, query_lse, _ = self.flash_attn_func(
+                    q_suffix,
+                    k_suffix,
+                    v_suffix,
+                    causal=True,
+                    softmax_scale=self.scale,
+                    window_size=window_size,
+                    softcap=self.logits_soft_cap,
+                    alibi_slopes=self.alibi_slopes,
+                    return_attn_probs=True,
+                )
+                context_out, context_lse = self.flash_attn_prefill_paged(
+                    q_context,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.block_table[:num_seqs],
+                    local_context_kv_lens,
+                    softmax_scale=self.scale,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=float(layer._k_scale_float),
+                    v_scale=float(layer._v_scale_float),
+                    causal=False,
+                    window_size=window_size,
+                    return_lse=True,
+                )
+            else:
+                with trace_range("uniform_suffix_attention"):
+                    query_out, query_lse, _ = self.flash_attn_func(
+                        q_suffix,
+                        k_suffix,
+                        v_suffix,
+                        causal=True,
+                        softmax_scale=self.scale,
+                        window_size=window_size,
+                        softcap=self.logits_soft_cap,
+                        alibi_slopes=self.alibi_slopes,
+                        return_attn_probs=True,
+                    )
+                with trace_range("uniform_prefix_attention"):
+                    context_out, context_lse = self.flash_attn_prefill_paged(
+                        q_context,
+                        key_cache,
+                        value_cache,
+                        attn_metadata.block_table[:num_seqs],
+                        local_context_kv_lens,
+                        softmax_scale=self.scale,
+                        kv_cache_dtype=self.kv_cache_dtype,
+                        k_scale=float(layer._k_scale_float),
+                        v_scale=float(layer._v_scale_float),
+                        causal=False,
+                        window_size=window_size,
+                        return_lse=True,
+                    )
+
+            has_local_context = local_context_kv_lens > 0
+            context_out = torch.where(
+                has_local_context.view(num_seqs, 1, 1, 1),
+                context_out,
+                torch.zeros_like(context_out),
+            )
+            context_lse = torch.where(
+                has_local_context.view(num_seqs, 1, 1),
+                context_lse,
+                torch.full_like(context_lse, -float("inf")),
+            )
+            flat_context_out = context_out.reshape(
+                query.shape[0], context_out.shape[2], context_out.shape[3]
+            )
+            flat_context_lse = context_lse.permute(0, 2, 1).reshape(
+                query.shape[0], context_lse.shape[1]
+            ).contiguous()
+
+            if self.dcp_comm_backend == "a2a":
+                flat_context_out, flat_context_lse = dcp_a2a_lse_reduce(
+                    flat_context_out,
+                    flat_context_lse,
+                    dcp_group,
+                    return_lse=True,
+                    trace_range=trace_range,
+                    use_persistent_buffers=True,
+                )
+                _record_route("prefill_prefix_dcp_uniform_batch_a2a")
+            elif self.dcp_comm_backend == "ag_rs":
+                flat_context_out, flat_context_lse = cp_lse_ag_out_rs(
+                    flat_context_out,
+                    flat_context_lse,
+                    dcp_group,
+                    return_lse=True,
+                    trace_range=trace_range,
+                )
+                _record_route("prefill_prefix_dcp_uniform_batch_ag_rs")
+            else:
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 DCP uniform verifier cannot execute "
+                    f"unsupported communication backend "
+                    f"{self.dcp_comm_backend!r}."
+                )
+
+            flat_query_out = query_out.reshape(
+                query.shape[0], query_out.shape[2], query_out.shape[3]
+            )
+            flat_query_lse = query_lse.permute(0, 2, 1).reshape(
+                query.shape[0], query_lse.shape[1]
+            ).transpose(0, 1).contiguous()
+            merge_attn_states(
+                out_view,
+                flat_context_out,
+                flat_context_lse.transpose(0, 1).contiguous(),
+                flat_query_out,
+                flat_query_lse,
+            )
+            _record_route("prefill_prefix_dcp_uniform_batch")
+            return output
+
+        _record_route("prefill_prefix_dcp_per_request_fallback")
         for i in range(num_seqs):
             start = int(query_start_loc_host[i].item())
             end = int(query_start_loc_host[i + 1].item())
@@ -4082,6 +4276,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     context_lse,
                     dcp_group,
                     return_lse=True,
+                    trace_range=trace_range,
                     allow_unmanaged_buffers=True,
                 )
                 _record_route("prefill_prefix_dcp_a2a")
@@ -4091,6 +4286,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     context_lse,
                     dcp_group,
                     return_lse=True,
+                    trace_range=trace_range,
                 )
                 _record_route("prefill_prefix_dcp_ag_rs")
             else:

@@ -45,6 +45,7 @@ def _merge_states(output, prefix_output, prefix_lse, suffix_output, suffix_lse):
 
 
 _CURRENT_GROUP = None
+_RECORDED_ROUTES: list[str] = []
 
 
 class _FakeGroup:
@@ -107,6 +108,104 @@ class _FakeGroup:
         return (
             full_out.squeeze(0)[:, head_slice],
             full_lse.squeeze(0)[head_slice].transpose(0, 1).contiguous(),
+        )
+
+
+class _FakeBatchGroup:
+    world_size = 2
+
+    def __init__(
+        self,
+        rank,
+        q_all,
+        prefix_ks,
+        prefix_vs,
+        local_ks,
+        local_vs,
+        scale,
+    ):
+        self.rank_in_group = rank
+        self.q_all = list(q_all)
+        self.prefix_ks = prefix_ks
+        self.prefix_vs = prefix_vs
+        self.local_ks = local_ks
+        self.local_vs = local_vs
+        self.scale = scale
+        self.combine_calls = 0
+        self.next_fallback_seq = 0
+
+    def all_gather(self, query, dim):
+        assert dim == 1
+        q_flat = torch.cat(self.q_all)
+        heads = query.shape[1]
+        torch.testing.assert_close(
+            query,
+            q_flat[
+                :,
+                self.rank_in_group * heads : (self.rank_in_group + 1) * heads,
+            ],
+        )
+        return q_flat
+
+    @staticmethod
+    def _attention(q, k, v, scale):
+        if k.shape[0] == 0:
+            return (
+                torch.zeros_like(q),
+                torch.full(q.shape[:-1], -torch.inf),
+            )
+        out, lse, _ = _dense_attention(
+            q.unsqueeze(0),
+            k.unsqueeze(0),
+            v.unsqueeze(0),
+            causal=False,
+            softmax_scale=scale,
+        )
+        return out.squeeze(0), lse.squeeze(0).transpose(0, 1).contiguous()
+
+    def combine(self, local_out, local_lse, return_lse):
+        assert return_lse
+        self.combine_calls += 1
+        total_tokens = sum(q.shape[0] for q in self.q_all)
+        if local_out.shape[0] == total_tokens:
+            seq_indices = range(len(self.q_all))
+        else:
+            seq_indices = [self.next_fallback_seq]
+            self.next_fallback_seq += 1
+
+        expected_local_out = []
+        expected_local_lse = []
+        full_out = []
+        full_lse = []
+        for seq_idx in seq_indices:
+            q_seq = self.q_all[seq_idx]
+            out, lse = self._attention(
+                q_seq,
+                self.local_ks[seq_idx],
+                self.local_vs[seq_idx],
+                self.scale,
+            )
+            expected_local_out.append(out)
+            expected_local_lse.append(lse)
+            out, lse = self._attention(
+                q_seq,
+                self.prefix_ks[seq_idx],
+                self.prefix_vs[seq_idx],
+                self.scale,
+            )
+            full_out.append(out)
+            full_lse.append(lse)
+
+        torch.testing.assert_close(local_out, torch.cat(expected_local_out))
+        torch.testing.assert_close(local_lse, torch.cat(expected_local_lse))
+        heads_per_rank = self.q_all[0].shape[1] // self.world_size
+        head_slice = slice(
+            self.rank_in_group * heads_per_rank,
+            (self.rank_in_group + 1) * heads_per_rank,
+        )
+        return (
+            torch.cat(full_out)[:, head_slice],
+            torch.cat(full_lse)[:, head_slice].contiguous(),
         )
 
 
@@ -183,7 +282,7 @@ def _namespace():
         "cp_lse_ag_out_rs": _cp_lse_combine,
         "dcp_a2a_lse_reduce": _a2a_lse_combine,
         "merge_attn_states": _merge_states,
-        "_record_route": lambda _route: None,
+        "_record_route": _RECORDED_ROUTES.append,
         "_is_cuda_graph_capturing": lambda _query: False,
     }
 
@@ -234,6 +333,8 @@ def _load_top_level_function(path: Path, name: str):
 class _StubImpl:
     dcp_world_size = 2
     dcp_comm_backend = "ag_rs"
+    _dcp_decode_profile_enabled = False
+    smallq_decode_max_query_len = 16
     cp_kv_cache_interleave_size = 1
     kv_cache_dtype = "auto"
     scale = 0.5
@@ -243,6 +344,39 @@ class _StubImpl:
 
     @staticmethod
     def flash_attn_prefill_paged(q, *_args, **kwargs):
+        if isinstance(_CURRENT_GROUP, _FakeBatchGroup):
+            outputs = []
+            lses = []
+            if q.shape[0] == 1:
+                seq_idx = _CURRENT_GROUP.next_fallback_seq
+                batch_rows = [(q[0], seq_idx)]
+            else:
+                batch_rows = [(q_seq, i) for i, q_seq in enumerate(q)]
+            for q_seq, seq_idx in batch_rows:
+                local_k = _CURRENT_GROUP.local_ks[seq_idx]
+                local_v = _CURRENT_GROUP.local_vs[seq_idx]
+                if local_k.shape[0] == 0:
+                    outputs.append(torch.zeros_like(q_seq))
+                    lses.append(
+                        torch.full(
+                            (q_seq.shape[1], q_seq.shape[0]),
+                            -torch.inf,
+                            dtype=torch.float32,
+                        )
+                    )
+                else:
+                    out, lse, _ = _dense_attention(
+                        q_seq.unsqueeze(0),
+                        local_k.unsqueeze(0),
+                        local_v.unsqueeze(0),
+                        causal=kwargs["causal"],
+                        softmax_scale=kwargs["softmax_scale"],
+                    )
+                    outputs.append(out.squeeze(0))
+                    lses.append(lse.squeeze(0))
+            assert kwargs["return_lse"]
+            return torch.stack(outputs), torch.stack(lses)
+
         out, lse, _ = _dense_attention(
             q,
             _CURRENT_GROUP.local_k.unsqueeze(0),
@@ -252,6 +386,9 @@ class _StubImpl:
         )
         assert kwargs["return_lse"]
         return out, lse
+
+    def _dcp_decode_profile_range(self, _stage):
+        raise AssertionError("profile ranges are disabled in CPU prefill tests")
 
     @staticmethod
     def _flash_v100_window_size(_causal):
@@ -391,6 +528,96 @@ def _run_prefill_case(method, prefix_len, backend="ag_rs"):
     torch.testing.assert_close(actual, expected.squeeze(0), rtol=1e-5, atol=1e-5)
 
 
+def _run_multi_request_prefill_case(
+    method,
+    query_lens,
+    prefix_lens,
+    backend="a2a",
+):
+    global _CURRENT_GROUP
+    torch.manual_seed(97 + sum(query_lens) + sum(prefix_lens))
+    total_heads, local_heads, dim = 4, 2, 4
+    q_all = [torch.randn(q_len, total_heads, dim) for q_len in query_lens]
+    prefix_ks = [torch.randn(length, 1, dim) for length in prefix_lens]
+    prefix_vs = [torch.randn(length, 1, dim) for length in prefix_lens]
+    suffix_ks = [torch.randn(q_len, 1, dim) for q_len in query_lens]
+    suffix_vs = [torch.randn(q_len, 1, dim) for q_len in query_lens]
+    query_flat = torch.cat(q_all)
+    key_flat = torch.cat(suffix_ks)
+    value_flat = torch.cat(suffix_vs)
+    query_start_loc = torch.tensor(
+        [0, *torch.tensor(query_lens).cumsum(0).tolist()],
+        dtype=torch.int32,
+    )
+    rank_outputs = []
+    rank_combine_calls = []
+    _RECORDED_ROUTES.clear()
+
+    for rank in range(2):
+        local_ks = []
+        local_vs = []
+        for prefix_k, prefix_v in zip(prefix_ks, prefix_vs):
+            owned = torch.arange(prefix_k.shape[0]) % 2 == rank
+            local_ks.append(prefix_k[owned])
+            local_vs.append(prefix_v[owned])
+        max_local_len = max(1, *(local_k.shape[0] for local_k in local_ks))
+        cache = torch.zeros(1, 2, max_local_len, 1, dim)
+        metadata = _Metadata()
+        metadata.num_actual_tokens = query_flat.shape[0]
+        metadata.query_start_loc = query_start_loc
+        metadata.query_start_loc_cpu = query_start_loc
+        metadata.seq_lens = torch.tensor(
+            [prefix_len + q_len for prefix_len, q_len in zip(prefix_lens, query_lens)],
+            dtype=torch.int32,
+        )
+        metadata.block_table = torch.zeros(len(query_lens), 1, dtype=torch.int32)
+        _CURRENT_GROUP = _FakeBatchGroup(
+            rank,
+            q_all,
+            prefix_ks,
+            prefix_vs,
+            local_ks,
+            local_vs,
+            _StubImpl.scale,
+        )
+        impl = _StubImpl()
+        impl.dcp_rank = rank
+        impl.dcp_comm_backend = backend
+        output = torch.empty(query_flat.shape[0], local_heads, dim)
+        method(
+            impl,
+            _Layer(),
+            query_flat[:, rank * local_heads : (rank + 1) * local_heads].contiguous(),
+            key_flat,
+            value_flat,
+            cache,
+            metadata,
+            output,
+        )
+        rank_combine_calls.append(_CURRENT_GROUP.combine_calls)
+        rank_outputs.append(output)
+
+    actual = torch.cat(rank_outputs, dim=1)
+    expected = []
+    for q_seq, prefix_k, prefix_v, suffix_k, suffix_v in zip(
+        q_all,
+        prefix_ks,
+        prefix_vs,
+        suffix_ks,
+        suffix_vs,
+    ):
+        out, _, _ = _dense_attention(
+            q_seq.unsqueeze(0),
+            torch.cat((prefix_k, suffix_k)).unsqueeze(0),
+            torch.cat((prefix_v, suffix_v)).unsqueeze(0),
+            causal=True,
+            softmax_scale=_StubImpl.scale,
+        )
+        expected.append(out.squeeze(0))
+    torch.testing.assert_close(actual, torch.cat(expected), rtol=1e-5, atol=1e-5)
+    return rank_combine_calls, list(_RECORDED_ROUTES)
+
+
 def _run_decode_case(method, prefix_len, profile=False, backend="ag_rs"):
     global _CURRENT_GROUP
     torch.manual_seed(31 + prefix_len)
@@ -468,6 +695,46 @@ def test_dcp_prefix_prefill_a2a_matches_dense_attention():
     method = _load_method("_forward_with_dcp")
     _run_prefill_case(method, prefix_len=5, backend="a2a")
     _run_prefill_case(method, prefix_len=1, backend="a2a")
+
+
+def test_dcp_uniform_mtp4_batch_combines_once_with_uneven_empty_contexts():
+    method = _load_method("_forward_with_dcp")
+    combine_calls, routes = _run_multi_request_prefill_case(
+        method,
+        query_lens=[5, 5, 5, 5],
+        prefix_lens=[0, 1, 6, 9],
+        backend="a2a",
+    )
+    assert combine_calls == [1, 1]
+    assert routes.count("prefill_prefix_dcp_uniform_batch_a2a") == 2
+    assert routes.count("prefill_prefix_dcp_uniform_batch") == 2
+    assert "prefill_prefix_dcp_per_request_fallback" not in routes
+
+
+def test_dcp_uniform_batch_ag_rs_matches_dense_attention():
+    method = _load_method("_forward_with_dcp")
+    combine_calls, routes = _run_multi_request_prefill_case(
+        method,
+        query_lens=[4, 4, 4],
+        prefix_lens=[2, 7, 0],
+        backend="ag_rs",
+    )
+    assert combine_calls == [1, 1]
+    assert routes.count("prefill_prefix_dcp_uniform_batch_ag_rs") == 2
+
+
+def test_dcp_irregular_query_lengths_use_per_request_fallback():
+    method = _load_method("_forward_with_dcp")
+    combine_calls, routes = _run_multi_request_prefill_case(
+        method,
+        query_lens=[5, 3, 4],
+        prefix_lens=[0, 7, 2],
+        backend="a2a",
+    )
+    assert combine_calls == [3, 3]
+    assert routes.count("prefill_prefix_dcp_per_request_fallback") == 2
+    assert routes.count("prefill_prefix_dcp_a2a") == 6
+    assert "prefill_prefix_dcp_uniform_batch" not in routes
 
 
 def test_dense_flash_exposes_existing_lse():
