@@ -123,8 +123,8 @@ class TestDCPCommBackendConfig:
         """A2A backend is valid when DCP > 1."""
         config = ParallelConfig(
             dcp_comm_backend="a2a",
-            tensor_parallel_size=4,
-            decode_context_parallel_size=4,
+            tensor_parallel_size=2,
+            decode_context_parallel_size=2,
         )
         assert config.dcp_comm_backend == "a2a"
 
