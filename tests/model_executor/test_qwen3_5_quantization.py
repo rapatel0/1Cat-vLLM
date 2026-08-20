@@ -8,6 +8,51 @@ class _QuantConfig:
     pass
 
 
+def test_sm70_mtp4_enables_fused_gdn_projection_extract_by_default():
+    from vllm.model_executor.models.qwen3_5 import (
+        _sm70_gdn_fused_zba_extract_enabled,
+    )
+
+    speculative_config = Mock(method="mtp", num_speculative_tokens=4)
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        patch("vllm.model_executor.models.qwen3_5.current_platform") as mock_platform,
+    ):
+        mock_platform.is_device_capability.return_value = True
+        assert _sm70_gdn_fused_zba_extract_enabled(speculative_config)
+
+
+def test_fused_gdn_projection_extract_default_is_narrow_to_sm70_mtp4():
+    from vllm.model_executor.models.qwen3_5 import (
+        _sm70_gdn_fused_zba_extract_enabled,
+    )
+
+    with (
+        patch.dict("os.environ", {}, clear=True),
+        patch("vllm.model_executor.models.qwen3_5.current_platform") as mock_platform,
+    ):
+        mock_platform.is_device_capability.return_value = True
+        assert not _sm70_gdn_fused_zba_extract_enabled(None)
+        assert not _sm70_gdn_fused_zba_extract_enabled(
+            Mock(method="mtp", num_speculative_tokens=3)
+        )
+        mock_platform.is_device_capability.return_value = False
+        assert not _sm70_gdn_fused_zba_extract_enabled(
+            Mock(method="mtp", num_speculative_tokens=4)
+        )
+
+
+def test_fused_gdn_projection_extract_explicit_disable_wins():
+    from vllm.model_executor.models.qwen3_5 import (
+        _sm70_gdn_fused_zba_extract_enabled,
+    )
+
+    with patch.dict("os.environ", {"VLLM_SM70_GDN_FUSED_ZBA_EXTRACT": "0"}, clear=True):
+        assert not _sm70_gdn_fused_zba_extract_enabled(
+            Mock(method="mtp", num_speculative_tokens=4)
+        )
+
+
 def test_qwen3_5_split_gdn_detects_compressed_tensors_ignore():
     from vllm.model_executor.models.qwen3_5 import (
         _uses_split_gdn_input_projections,

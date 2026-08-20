@@ -66,6 +66,7 @@ from vllm.model_executor.model_loader.weight_utils import (
     maybe_remap_kv_scale_name,
 )
 from vllm.multimodal import MULTIMODAL_REGISTRY
+from vllm.platforms import current_platform
 from vllm.sequence import IntermediateTensors
 from vllm.transformers_utils.configs.qwen3_5 import (
     Qwen3_5Config,
@@ -117,6 +118,19 @@ from .utils import (
 )
 
 logger = init_logger(__name__)
+
+
+def _sm70_gdn_fused_zba_extract_enabled(speculative_config: object | None) -> bool:
+    """Use the exact fused projection-slice copy for SM70 native MTP4."""
+    override = os.getenv("VLLM_SM70_GDN_FUSED_ZBA_EXTRACT")
+    if override is not None:
+        return override.strip().lower() in ("1", "true", "yes", "on")
+    return (
+        current_platform.is_device_capability(70)
+        and speculative_config is not None
+        and getattr(speculative_config, "method", None) == "mtp"
+        and getattr(speculative_config, "num_speculative_tokens", None) == 4
+    )
 
 
 @triton.jit
@@ -273,6 +287,9 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
         self.use_split_input_projections = _uses_split_gdn_input_projections(
             self.quant_config
         )
+        self.use_fused_zba_extract = _sm70_gdn_fused_zba_extract_enabled(
+            self.speculative_config
+        )
 
     def create_qkvz_proj(
         self,
@@ -339,7 +356,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             )
             ba = _sm70_dump_gdn_projection_tensor("in_proj_ba", layer_name, ba)
             mixed_qkv = mixed_qkvz[..., :qkv_size]
-            if os.getenv("VLLM_SM70_GDN_FUSED_ZBA_EXTRACT", "0") == "1":
+            if self.use_fused_zba_extract:
                 z, b, a = _sm70_gdn_extract_zba(
                     mixed_qkvz, ba, qkv_size, z_size, ba_size
                 )
@@ -375,8 +392,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             mixed_qkv = mixed_qkv.contiguous()
         z = _sm70_dump_gdn_projection_tensor("split_z", layer_name, z)
         if not (
-            self.use_split_input_projections
-            and os.getenv("VLLM_SM70_GDN_FUSED_ZBA_EXTRACT", "0") == "1"
+            self.use_split_input_projections and self.use_fused_zba_extract
         ):
             z = z.contiguous()
             b = b.contiguous()
