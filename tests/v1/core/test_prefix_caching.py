@@ -2453,6 +2453,38 @@ def test_eagle_with_sliding_window():
     assert num_tokens == 0
 
 
+def test_hybrid_dcp_prefix_hit_uses_effective_full_attention_block_size():
+    block_size = 16
+    manager = KVCacheManager(
+        make_kv_cache_config_hybrid_model(
+            block_size,
+            num_blocks=100,
+            sliding_window_blocks=1,
+            second_spec_type="mamba",
+        ),
+        max_model_len=8192,
+        enable_caching=True,
+        hash_block_size=block_size,
+        dcp_world_size=2,
+    )
+    coordinator = manager.coordinator
+    assert coordinator.single_type_managers[0].block_size == 2 * block_size
+    assert coordinator.single_type_managers[1].block_size == block_size
+    assert coordinator.lcm_block_size == 2 * block_size
+
+    token_ids = [i for i in range(6) for _ in range(block_size)]
+    req0 = make_request("dcp-prime", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req0)
+    assert num_computed_tokens == 0
+    manager.allocate_slots(req0, len(token_ids), 0, computed_blocks)
+    manager.free(req0)
+
+    req1 = make_request("dcp-hit", token_ids, block_size, sha256)
+    computed_blocks, num_computed_tokens = manager.get_computed_blocks(req1)
+    assert num_computed_tokens == 4 * block_size
+    assert len(computed_blocks.blocks[0]) == 2
+
+
 def test_different_block_size():
     block_size = 16
     # full attention and sliding window attention layers have the same page size:
