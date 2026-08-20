@@ -797,7 +797,6 @@ def flash_attn_decode_paged_xqa(
     workspace_seq_capacity_hint: Optional[int] = None,
     active_num_partitions: Optional[torch.Tensor] = None,
     return_lse: bool = False,
-    dcp_trace_range: Optional[Callable[[str], ContextManager[None]]] = None,
 ):
     if not flash_attn_decode_paged_xqa_available():
         raise RuntimeError("flash_attn_v100 CUDA extension lacks XQA decode")
@@ -838,7 +837,7 @@ def flash_attn_decode_paged_xqa(
         )
     )
 
-    decode_args = (
+    attn_out = flash_attn_v100_cuda.decode_paged_xqa_fwd(
         q,
         k_cache,
         v_cache,
@@ -859,11 +858,6 @@ def flash_attn_decode_paged_xqa(
         int(window_size_right),
         final_lse if return_lse else None,
     )
-    if dcp_trace_range is None:
-        attn_out = flash_attn_v100_cuda.decode_paged_xqa_fwd(*decode_args)
-    else:
-        with dcp_trace_range("local_attention_xqa"):
-            attn_out = flash_attn_v100_cuda.decode_paged_xqa_fwd(*decode_args)
     if not return_lse:
         return attn_out
     return attn_out, final_lse
