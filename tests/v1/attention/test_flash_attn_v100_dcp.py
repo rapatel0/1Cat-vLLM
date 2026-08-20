@@ -154,7 +154,9 @@ def _a2a_lse_combine(
     group,
     return_lse=False,
     trace_range=None,
+    allow_unmanaged_buffers=False,
 ):
+    del allow_unmanaged_buffers
     payload_bytes = (out.numel() + 2 * lse.numel()) * out.element_size()
     if trace_range is None:
         result = group.combine(out, lse, True)

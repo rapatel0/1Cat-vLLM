@@ -139,20 +139,33 @@ def _dcp_a2a_call_buffers(
     device: torch.device,
     dtype: torch.dtype,
     return_lse: bool,
+    allow_unmanaged_buffers: bool = False,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
-    """Allocate all live A2A buffers together so graph views never alias."""
+    """Allocate all live A2A buffers together so graph views never alias.
+
+    Decode uses the graph-stable workspace manager. Large prefix-prefill calls
+    happen outside capture after that manager is locked; those callers may opt
+    into request-scoped buffers rather than trying to grow the locked arena.
+    """
     lse_shape = out_shape[:-1]
     if is_workspace_manager_initialized():
-        specs = [
-            (comm_shape, dtype),
-            (comm_shape, dtype),
-            (out_shape, dtype),
-        ]
-        if return_lse:
-            specs.append((lse_shape, torch.float32))
-        buffers = current_workspace_manager().get_simultaneous(*specs)
-        out_lse = buffers[3] if return_lse else None
-        return buffers[0], buffers[1], buffers[2], out_lse
+        manager = current_workspace_manager()
+        if not (allow_unmanaged_buffers and manager.is_locked()):
+            specs = [
+                (comm_shape, dtype),
+                (comm_shape, dtype),
+                (out_shape, dtype),
+            ]
+            if return_lse:
+                specs.append((lse_shape, torch.float32))
+            buffers = manager.get_simultaneous(*specs)
+            out_lse = buffers[3] if return_lse else None
+            return buffers[0], buffers[1], buffers[2], out_lse
+        if device.type == "cuda" and torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "DCP A2A prefix prefill requires request-scoped buffers after "
+                "the workspace is locked, which is unsafe during CUDA capture."
+            )
 
     send_buffer = torch.empty(comm_shape, device=device, dtype=dtype)
     recv_buffer = torch.empty(comm_shape, device=device, dtype=dtype)
@@ -453,6 +466,7 @@ def dcp_a2a_lse_reduce(
     return_lse: bool = False,
     is_lse_base_on_e: bool = True,
     trace_range: Callable[[str], AbstractContextManager[None]] | None = None,
+    allow_unmanaged_buffers: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Combine partial attention outputs across DCP ranks using All-to-All.
@@ -509,6 +523,7 @@ def dcp_a2a_lse_reduce(
         device=cp_attn_out.device,
         dtype=cp_attn_out.dtype,
         return_lse=return_lse,
+        allow_unmanaged_buffers=allow_unmanaged_buffers,
     )
     payload_bytes = send_buffer.numel() * send_buffer.element_size()
 

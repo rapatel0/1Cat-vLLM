@@ -473,6 +473,40 @@ class TestPackedA2AKernels:
         finally:
             reset_workspace_manager()
 
+    @pytest.mark.skipif(
+        torch.accelerator.device_count() < 1, reason="CUDA is required."
+    )
+    def test_locked_workspace_allows_explicit_eager_prefill_buffers(self):
+        from vllm.v1.attention.ops.dcp_alltoall import _dcp_a2a_call_buffers
+        from vllm.v1.worker.workspace import (
+            init_workspace_manager,
+            lock_workspace,
+            reset_workspace_manager,
+        )
+
+        reset_workspace_manager()
+        init_workspace_manager(torch.device("cuda"))
+        try:
+            _dcp_a2a_call_buffers(
+                (2, 1, 3, 258),
+                (1, 3, 256),
+                device=torch.device("cuda"),
+                dtype=torch.float16,
+                return_lse=False,
+            )
+            lock_workspace()
+            buffers = _dcp_a2a_call_buffers(
+                (2, 8192, 3, 258),
+                (8192, 3, 256),
+                device=torch.device("cuda"),
+                dtype=torch.float16,
+                return_lse=True,
+                allow_unmanaged_buffers=True,
+            )
+            assert all(buffer is not None for buffer in buffers)
+        finally:
+            reset_workspace_manager()
+
 
 def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
     update_environment_variables(env)

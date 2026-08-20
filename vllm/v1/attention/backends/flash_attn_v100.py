@@ -4082,6 +4082,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     context_lse,
                     dcp_group,
                     return_lse=True,
+                    allow_unmanaged_buffers=True,
                 )
                 _record_route("prefill_prefix_dcp_a2a")
             elif self.dcp_comm_backend == "ag_rs":
