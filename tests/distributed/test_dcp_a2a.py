@@ -9,6 +9,7 @@ Tests cover:
 """
 
 import math
+from types import SimpleNamespace
 
 import multiprocess as mp
 import pytest
@@ -698,6 +699,124 @@ def test_distributed_packed_a2a_dcp2_mtp4_c32_cuda_graph():
             "BATCH_TOKENS": "160",
             "USE_CUDA_GRAPH": "1",
         },
+    )
+
+
+def _distributed_direct_query_gather_worker(env: dict[str, str]) -> None:
+    update_environment_variables(env)
+    local_rank = int(env["LOCAL_RANK"])
+    torch.accelerator.set_device_index(local_rank)
+    dist.init_process_group(backend="gloo")
+    from vllm.distributed.device_communicators.pynccl import PyNcclCommunicator
+    from vllm.v1.attention.ops.dcp_query_gather import (
+        _dcp_query_gather_buffer_cache,
+        dcp_query_all_gather,
+    )
+
+    communicator = PyNcclCommunicator(dist.group.WORLD, device=local_rank)
+    rank = dist.get_rank()
+    world_size = dist.get_world_size()
+    group = SimpleNamespace(
+        world_size=world_size,
+        rank_in_group=rank,
+        unique_name="dcp:query-gather-test",
+        device_communicator=SimpleNamespace(pynccl_comm=communicator),
+    )
+    graph = None
+    capture_stream = None
+    try:
+        tokens, local_heads, head_dim = 160, 3, 256
+        token_values = torch.arange(
+            tokens, device=f"cuda:{local_rank}", dtype=torch.float16
+        ).view(tokens, 1, 1)
+        head_values = torch.arange(
+            local_heads, device=f"cuda:{local_rank}", dtype=torch.float16
+        ).view(1, local_heads, 1)
+        dim_values = (
+            torch.arange(head_dim, device=f"cuda:{local_rank}") % 7
+        ).to(torch.float16).view(1, 1, head_dim)
+        local = token_values + 10 * head_values + dim_values + 1000 * rank
+        backing = torch.empty(
+            tokens,
+            local_heads,
+            head_dim * 2,
+            device=f"cuda:{local_rank}",
+            dtype=torch.float16,
+        )
+        query = backing[..., ::2]
+        query.copy_(local)
+        assert not query.is_contiguous()
+
+        first, direct = dcp_query_all_gather(query, group)
+        second, direct_second = dcp_query_all_gather(query, group)
+        assert direct and direct_second
+        assert first.data_ptr() == second.data_ptr()
+        expected = torch.cat(
+            [local + 1000 * (other_rank - rank) for other_rank in range(world_size)],
+            dim=1,
+        )
+        torch.testing.assert_close(second, expected)
+
+        # A graph replay must read new strided input through the persistent local
+        # staging tensor and retain the direct collective/output addresses.
+        capture_stream = torch.cuda.Stream(device=local_rank)
+        capture_stream.wait_stream(torch.cuda.current_stream(local_rank))
+        with torch.cuda.stream(capture_stream):
+            warm, warm_direct = dcp_query_all_gather(query, group)
+        assert warm_direct
+        capture_stream.synchronize()
+        dist.barrier()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph, stream=capture_stream):
+            captured, captured_direct = dcp_query_all_gather(query, group)
+        assert captured_direct
+        query.add_(1)
+        graph.replay()
+        capture_stream.synchronize()
+        torch.testing.assert_close(captured, expected + 1)
+
+        different_shape, shape_direct = dcp_query_all_gather(query[:80], group)
+        assert shape_direct
+        assert different_shape.data_ptr() != first.data_ptr()
+
+        other_stream = torch.cuda.Stream(device=local_rank)
+        with torch.cuda.stream(other_stream):
+            stream_output, stream_direct = dcp_query_all_gather(query, group)
+        other_stream.synchronize()
+        assert stream_direct
+        assert stream_output.data_ptr() != first.data_ptr()
+        torch.testing.assert_close(stream_output, expected + 1)
+
+        spans_by_key = []
+        for buffers in _dcp_query_gather_buffer_cache.values():
+            spans = sorted(
+                (
+                    tensor.data_ptr(),
+                    tensor.data_ptr() + tensor.numel() * tensor.element_size(),
+                )
+                for tensor in buffers
+            )
+            assert all(
+                left[1] <= right[0] for left, right in zip(spans, spans[1:])
+            )
+            spans_by_key.append(spans)
+        assert len(spans_by_key) >= 3
+    finally:
+        del graph, capture_stream
+        _dcp_query_gather_buffer_cache.clear()
+        torch.cuda.synchronize()
+        communicator.destroy()
+        dist.destroy_process_group()
+
+
+@pytest.mark.skipif(
+    torch.accelerator.device_count() < 2, reason="Need at least 2 GPUs."
+)
+def test_distributed_direct_query_gather_dcp2_cuda_graph():
+    _distributed_run(
+        _distributed_direct_query_gather_worker,
+        world_size=2,
+        extra_env={},
     )
 
 

@@ -13,6 +13,7 @@ ROOT = Path(__file__).parents[3]
 BACKEND = ROOT / "vllm/v1/attention/backends/flash_attn_v100.py"
 FLASH_INTERFACE = ROOT / "flash-attention-v100/flash_attn_v100/flash_attn_interface.py"
 ATTENTION_UTILS = ROOT / "vllm/v1/attention/backends/utils.py"
+DCP_QUERY_GATHER = ROOT / "vllm/v1/attention/ops/dcp_query_gather.py"
 FUSED_MHA_FORWARD = ROOT / "flash-attention-v100/kernel/fused_mha_forward.cu"
 FLASH_DECODE = ROOT / "flash-attention-v100/kernel/flash_decode_paged.cu"
 
@@ -247,6 +248,17 @@ def _cp_lse_combine(
     return result if return_lse else result[0]
 
 
+def _query_all_gather(query, group, trace_range=None):
+    query_bytes = query.numel() * query.element_size()
+    if trace_range is None:
+        return group.all_gather(query.contiguous(), dim=1), False
+    with trace_range(f"query_gather_prepare_fallback bytes={query_bytes}"):
+        prepared = query.contiguous()
+    with trace_range(f"query_all_gather_fallback bytes={query_bytes}"):
+        gathered = group.all_gather(prepared, dim=1)
+    return gathered, False
+
+
 def _a2a_lse_combine(
     out,
     lse,
@@ -281,6 +293,7 @@ def _namespace():
         "_normalize_query_start_loc_for_available_tokens": lambda qsl, _n: qsl,
         "cp_lse_ag_out_rs": _cp_lse_combine,
         "dcp_a2a_lse_reduce": _a2a_lse_combine,
+        "dcp_query_all_gather": _query_all_gather,
         "merge_attn_states": _merge_states,
         "_record_route": _RECORDED_ROUTES.append,
         "_is_cuda_graph_capturing": lambda _query: False,
@@ -325,7 +338,11 @@ def _load_top_level_function(path: Path, name: str):
     ):
         arg.annotation = None
     module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
-    namespace = {"os": os, "torch": torch}
+    namespace = {
+        "os": os,
+        "torch": torch,
+        "_dcp_query_gather_buffer_cache": {},
+    }
     exec(compile(module, str(path), "exec"), namespace)
     return namespace[name]
 
@@ -813,11 +830,66 @@ def test_dcp_decode_output_workspace_reuses_stable_storage():
     assert len(impl._dcp_decode_output_workspaces) == 2
 
 
+def test_dcp_query_gather_reformat_preserves_rank_head_order():
+    reformat = _load_top_level_function(
+        DCP_QUERY_GATHER, "_reformat_rank_major_query"
+    )
+    world_size, tokens, local_heads, head_dim = 2, 3, 2, 4
+    rank_major = torch.empty(world_size, tokens, local_heads, head_dim)
+    for rank in range(world_size):
+        for token in range(tokens):
+            for head in range(local_heads):
+                rank_major[rank, token, head].fill_(100 * rank + 10 * token + head)
+    head_major = torch.empty(tokens, world_size * local_heads, head_dim)
+    actual = reformat(rank_major, head_major)
+    expected = torch.cat([rank_major[rank] for rank in range(world_size)], dim=1)
+    assert actual is head_major
+    torch.testing.assert_close(actual, expected)
+
+
+def test_dcp_query_gather_workspace_is_stable_separate_and_non_aliasing():
+    get_buffers = _load_top_level_function(
+        DCP_QUERY_GATHER, "_dcp_query_gather_buffers"
+    )
+    query = torch.empty(5, 3, 8)
+    first = get_buffers(query, 2, "dcp:test")
+    second = get_buffers(query, 2, "dcp:test")
+    assert all(left is right for left, right in zip(first, second))
+
+    spans = sorted(
+        (
+            tensor.data_ptr(),
+            tensor.data_ptr() + tensor.numel() * tensor.element_size(),
+        )
+        for tensor in first
+    )
+    assert all(left[1] <= right[0] for left, right in zip(spans, spans[1:]))
+
+    different_shape = get_buffers(torch.empty(4, 3, 8), 2, "dcp:test")
+    strided = torch.empty(5, 3, 16)[..., ::2]
+    different_stride = get_buffers(strided, 2, "dcp:test")
+    different_group = get_buffers(query, 2, "dcp:other")
+    assert different_shape[0] is not first[0]
+    assert different_stride[0] is not first[0]
+    assert different_group[0] is not first[0]
+
+
+def test_dcp_query_gather_source_has_direct_and_fail_closed_fallback():
+    source = DCP_QUERY_GATHER.read_text()
+    assert "pynccl.all_gather(rank_major, prepared)" in source
+    assert "query_all_gather_direct bytes=" in source
+    assert "query_gather_reformat bytes=" in source
+    assert "query_gather_cache_acquire" in source
+    assert "query_all_gather_fallback bytes=" in source
+    assert "cp_group.all_gather(prepared, dim=1)" in source
+    assert "torch.compiler.is_compiling()" in source
+    assert "_is_fake_tensor(query)" in source
+
+
 def test_dcp_decode_profile_covers_hot_path_without_changing_output():
     method = _load_method("_flash_v100_decode")
     rank_stages = _run_decode_case(method, prefix_len=5, profile=True)
     expected_stages = {
-        "query_prepare",
         "local_attention",
         "lse_prepare",
         "output_correction",
@@ -825,7 +897,14 @@ def test_dcp_decode_profile_covers_hot_path_without_changing_output():
     }
     for stages in rank_stages:
         assert expected_stages.issubset(stages)
-        assert any(stage.startswith("query_all_gather bytes=") for stage in stages)
+        assert any(
+            stage.startswith("query_gather_prepare_fallback bytes=")
+            for stage in stages
+        )
+        assert any(
+            stage.startswith("query_all_gather_fallback bytes=")
+            for stage in stages
+        )
         assert any(stage.startswith("lse_all_gather bytes=") for stage in stages)
         assert any(stage.startswith("output_reduce_scatter bytes=") for stage in stages)
         assert any(stage.startswith("output_copy bytes=") for stage in stages)
@@ -836,7 +915,10 @@ def test_dcp_decode_a2a_profile_has_one_packed_collective():
     method = _load_method("_flash_v100_decode")
     rank_stages = _run_decode_case(method, prefix_len=5, profile=True, backend="a2a")
     for stages in rank_stages:
-        assert any(stage.startswith("query_all_gather bytes=") for stage in stages)
+        assert any(
+            stage.startswith("query_all_gather_fallback bytes=")
+            for stage in stages
+        )
         assert any(stage.startswith("a2a_pack bytes=") for stage in stages)
         assert any(stage.startswith("a2a_all_to_all bytes=") for stage in stages)
         assert any(stage.startswith("a2a_unpack bytes=") for stage in stages)

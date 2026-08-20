@@ -35,6 +35,7 @@ from vllm.v1.attention.backends.triton_attn import (
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
 from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+from vllm.v1.attention.ops.dcp_query_gather import dcp_query_all_gather
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 logger = init_logger(__name__)
@@ -4012,14 +4013,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if self._dcp_decode_profile_enabled
             else None
         )
-        if trace_range is None:
-            query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)
-        else:
-            with trace_range("query_prepare"):
-                query_for_gather = query.contiguous()
-            query_bytes = query_for_gather.numel() * query_for_gather.element_size()
-            with trace_range(f"query_all_gather bytes={query_bytes}"):
-                query_across_dcp = dcp_group.all_gather(query_for_gather, dim=1)
+        query_across_dcp, direct_query_gather = dcp_query_all_gather(
+            query,
+            dcp_group,
+            trace_range=trace_range,
+        )
+        _record_route(
+            "dcp_query_gather_direct"
+            if direct_query_gather
+            else "dcp_query_gather_fallback"
+        )
 
         key_cache, value_cache = _split_paged_kv_cache(kv_cache)
         block_size = key_cache.shape[1]
@@ -4358,15 +4361,19 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 if self._dcp_decode_profile_enabled
                 else None
             )
+            query_across_dcp, direct_query_gather = dcp_query_all_gather(
+                query,
+                dcp_group,
+                trace_range=trace_range,
+            )
+            _record_route(
+                "dcp_query_gather_direct"
+                if direct_query_gather
+                else "dcp_query_gather_fallback"
+            )
             if trace_range is None:
-                query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)
                 dcp_out = self._get_dcp_decode_output_workspace(query_across_dcp)
             else:
-                with trace_range("query_prepare"):
-                    query_for_gather = query.contiguous()
-                query_bytes = query_for_gather.numel() * query_for_gather.element_size()
-                with trace_range(f"query_all_gather bytes={query_bytes}"):
-                    query_across_dcp = dcp_group.all_gather(query_for_gather, dim=1)
                 with trace_range("output_workspace_acquire"):
                     dcp_out = self._get_dcp_decode_output_workspace(query_across_dcp)
             local_seq_lens = get_dcp_local_seq_lens(
