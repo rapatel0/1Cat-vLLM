@@ -11,15 +11,17 @@ plus Flash-decode runs do not count as the final SM70 FlashAttention route.
 from __future__ import annotations
 
 import atexit
-from collections.abc import Callable
 import inspect
 import json
 import os
 import time
+from collections.abc import Callable
 
 import torch
 
 import vllm.envs as envs
+from vllm.config import get_current_vllm_config_or_none
+from vllm.distributed.parallel_state import get_dcp_group
 from vllm.logger import init_logger
 from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
@@ -29,6 +31,9 @@ from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionMetadata,
     TritonAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
+from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 logger = init_logger(__name__)
 
@@ -2136,6 +2141,12 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
+        vllm_config = get_current_vllm_config_or_none()
+        self.cp_kv_cache_interleave_size = (
+            vllm_config.parallel_config.cp_kv_cache_interleave_size
+            if vllm_config is not None
+            else 1
+        )
         (
             self.flash_attn_func,
             self.flash_attn_bhmd_func,
@@ -3031,6 +3042,20 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
 
         if is_prefill:
+            if self.dcp_world_size > 1:
+                self._reset_decode_cache()
+                result = self._forward_with_dcp(
+                    layer,
+                    query,
+                    key,
+                    value,
+                    kv_cache,
+                    attn_metadata,
+                    output,
+                )
+                _record_route("prefill_dcp_dense_flash")
+                return result
+
             available_query_tokens = min(
                 int(query.shape[0]),
                 int(key.shape[0]),
@@ -3860,6 +3885,153 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 softmax_scale=self.scale,
             )
             out_view[start:end].copy_(out_seq.squeeze(0))
+        return output
+
+    def _forward_with_dcp(
+        self,
+        layer: torch.nn.Module,
+        query: torch.Tensor,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run DCP prefill as separate cached-prefix and query-suffix states.
+
+        Each DCP rank owns an interleaved shard of the cached prefix. Queries
+        are gathered across the DCP group's head dimension, attended against
+        the local prefix shard, and globally combined using LSE correction.
+        The current query suffix is replicated, so it is evaluated locally and
+        merged with the corrected prefix state.
+        """
+        num_actual_tokens = attn_metadata.num_actual_tokens
+        query = query[:num_actual_tokens]
+        key = key[:num_actual_tokens]
+        value = value[:num_actual_tokens]
+        out_view = output[:num_actual_tokens]
+        if query.shape[0] == 0:
+            return output
+
+        query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
+        query_start_loc = (
+            query_start_loc_cpu
+            if query_start_loc_cpu is not None
+            else attn_metadata.query_start_loc
+        )
+        query_start_loc = _normalize_query_start_loc_for_available_tokens(
+            query_start_loc,
+            int(query.shape[0]),
+        )
+        num_seqs = len(query_start_loc) - 1
+        query_lens = query_start_loc[1:] - query_start_loc[:-1]
+        query_lens = query_lens.to(
+            device=attn_metadata.seq_lens.device,
+            dtype=attn_metadata.seq_lens.dtype,
+        )
+        context_kv_lens = attn_metadata.seq_lens[:num_seqs] - query_lens
+        if bool(torch.any(context_kv_lens < 0).item()):
+            raise RuntimeError("FLASH_ATTN_V100 DCP prefill received negative context")
+        local_context_kv_lens = get_dcp_local_seq_lens(
+            context_kv_lens,
+            self.dcp_world_size,
+            self.dcp_rank,
+            self.cp_kv_cache_interleave_size,
+        )
+
+        dcp_group = get_dcp_group()
+        query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)
+        key_cache, _ = _split_paged_kv_cache(kv_cache)
+        block_size = key_cache.shape[1]
+        num_kv_heads = key_cache.shape[2]
+        head_dim = key_cache.shape[3]
+        causal = getattr(attn_metadata, "causal", True)
+        window_size = self._flash_v100_window_size(causal)
+
+        for i in range(num_seqs):
+            start = int(query_start_loc[i].item())
+            end = int(query_start_loc[i + 1].item())
+            if end <= start:
+                continue
+
+            q_seq = query[start:end].unsqueeze(0)
+            k_seq = key[start:end].unsqueeze(0)
+            v_seq = value[start:end].unsqueeze(0)
+            query_out, query_lse, _ = self.flash_attn_func(
+                q_seq,
+                k_seq,
+                v_seq,
+                causal=causal,
+                softmax_scale=self.scale,
+                window_size=window_size,
+                softcap=self.logits_soft_cap,
+                alibi_slopes=self.alibi_slopes,
+                return_attn_probs=True,
+            )
+
+            global_context_len = int(context_kv_lens[i].item())
+            if global_context_len == 0:
+                out_view[start:end].copy_(query_out.squeeze(0))
+                continue
+
+            local_context_len = int(local_context_kv_lens[i].item())
+            q_context = query_across_dcp[start:end].unsqueeze(0)
+            if local_context_len > 0:
+                k_context, v_context = _extract_contiguous_kv_from_paged_cache(
+                    kv_cache=kv_cache,
+                    block_table=attn_metadata.block_table[i : i + 1],
+                    seq_lens=local_context_kv_lens[i : i + 1],
+                    num_kv_heads=num_kv_heads,
+                    head_dim=head_dim,
+                    block_size=block_size,
+                    total_tokens=local_context_len,
+                )
+                k_context, v_context = _dequantize_fp8_contiguous_kv(
+                    k_context,
+                    v_context,
+                    self.kv_cache_dtype,
+                    float(layer._k_scale_float),
+                    float(layer._v_scale_float),
+                )
+                context_out, context_lse, _ = self.flash_attn_func(
+                    q_context,
+                    k_context.unsqueeze(0),
+                    v_context.unsqueeze(0),
+                    causal=False,
+                    softmax_scale=self.scale,
+                    window_size=window_size,
+                    softcap=self.logits_soft_cap,
+                    alibi_slopes=self.alibi_slopes,
+                    return_attn_probs=True,
+                )
+                context_out = context_out.squeeze(0)
+                context_lse = context_lse.squeeze(0).transpose(0, 1).contiguous()
+            else:
+                # Every rank must enter the collectives even if this rank owns
+                # no tokens from a short prefix. -inf gives the empty shard
+                # zero weight in the global LSE correction.
+                context_out = torch.zeros_like(q_context.squeeze(0))
+                context_lse = torch.full(
+                    context_out.shape[:2],
+                    -float("inf"),
+                    dtype=torch.float32,
+                    device=context_out.device,
+                )
+
+            context_out, context_lse = cp_lse_ag_out_rs(
+                context_out,
+                context_lse,
+                dcp_group,
+                return_lse=True,
+            )
+            merge_attn_states(
+                out_view[start:end],
+                context_out,
+                context_lse.transpose(0, 1).contiguous(),
+                query_out.squeeze(0),
+                query_lse.squeeze(0),
+            )
+
         return output
 
     def _flash_v100_prefill(
