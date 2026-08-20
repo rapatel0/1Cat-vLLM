@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import ast
+import os
 from pathlib import Path
 
 import torch
@@ -123,8 +124,26 @@ def _extract_kv(*, kv_cache, seq_lens, total_tokens, **_kwargs):
     )
 
 
-def _cp_lse_combine(out, lse, group, return_lse=False):
-    result = group.combine(out, lse, True)
+def _cp_lse_combine(
+    out,
+    lse,
+    group,
+    return_lse=False,
+    trace_range=None,
+):
+    if trace_range is None:
+        result = group.combine(out, lse, True)
+    else:
+        with trace_range("lse_prepare"):
+            pass
+        with trace_range(f"lse_all_gather bytes={lse.numel() * lse.element_size()}"):
+            pass
+        with trace_range("output_correction"):
+            result = group.combine(out, lse, True)
+        with trace_range(
+            f"output_reduce_scatter bytes={out.numel() * out.element_size()}"
+        ):
+            pass
     return result if return_lse else result[0]
 
 
@@ -182,7 +201,7 @@ def _load_top_level_function(path: Path, name: str):
     ):
         arg.annotation = None
     module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
-    namespace = {"torch": torch}
+    namespace = {"os": os, "torch": torch}
     exec(compile(module, str(path), "exec"), namespace)
     return namespace[name]
 
@@ -213,15 +232,34 @@ class _StubImpl:
         return (-1, -1)
 
 
+class _RecordingRange:
+    def __init__(self, stages, stage):
+        self.stages = stages
+        self.stage = stage
+
+    def __enter__(self):
+        self.stages.append(self.stage)
+
+    def __exit__(self, *_args):
+        return False
+
+
 class _StubDecodeImpl:
     dcp_world_size = 2
     cp_kv_cache_interleave_size = 1
     kv_cache_dtype = "auto"
     scale = 0.5
     use_decode_xqa = False
+    _get_dcp_decode_output_workspace = _load_method("_get_dcp_decode_output_workspace")
 
-    def __init__(self, rank):
+    def __init__(self, rank, profile=False):
         self.dcp_rank = rank
+        self._dcp_decode_profile_enabled = profile
+        self._dcp_decode_output_workspaces = {}
+        self.profile_stages = []
+
+    def _dcp_decode_profile_range(self, stage):
+        return _RecordingRange(self.profile_stages, stage)
 
     @staticmethod
     def _flash_v100_window_size(*, causal):
@@ -239,13 +277,26 @@ class _StubDecodeImpl:
     ):
         assert kwargs["return_lse"]
         assert int(seq_lens[0]) == self.expected_local_len
-        out, lse, _ = _dense_attention(
-            query.unsqueeze(0),
-            _CURRENT_GROUP.local_k.unsqueeze(0),
-            _CURRENT_GROUP.local_v.unsqueeze(0),
-            causal=False,
-            softmax_scale=self.scale,
-        )
+        trace_range = kwargs["dcp_trace_range"]
+        if trace_range is None:
+            out, lse, _ = _dense_attention(
+                query.unsqueeze(0),
+                _CURRENT_GROUP.local_k.unsqueeze(0),
+                _CURRENT_GROUP.local_v.unsqueeze(0),
+                causal=False,
+                softmax_scale=self.scale,
+            )
+        else:
+            with trace_range("local_attention"):
+                out, lse, _ = _dense_attention(
+                    query.unsqueeze(0),
+                    _CURRENT_GROUP.local_k.unsqueeze(0),
+                    _CURRENT_GROUP.local_v.unsqueeze(0),
+                    causal=False,
+                    softmax_scale=self.scale,
+                )
+            with trace_range("lse_reconstruction"):
+                lse = lse.clone()
         kwargs["out"].copy_(out.squeeze(0))
         return kwargs["out"], lse.squeeze(0).transpose(0, 1).contiguous()
 
@@ -314,7 +365,7 @@ def _run_prefill_case(method, prefix_len):
     torch.testing.assert_close(actual, expected.squeeze(0), rtol=1e-5, atol=1e-5)
 
 
-def _run_decode_case(method, prefix_len):
+def _run_decode_case(method, prefix_len, profile=False):
     global _CURRENT_GROUP
     torch.manual_seed(31 + prefix_len)
     total_heads, local_heads, dim = 4, 2, 4
@@ -322,6 +373,7 @@ def _run_decode_case(method, prefix_len):
     prefix_k = torch.randn(prefix_len, 1, dim)
     prefix_v = torch.randn(prefix_len, 1, dim)
     rank_outputs = []
+    rank_profile_stages = []
 
     for rank in range(2):
         owned = torch.arange(prefix_len) % 2 == rank
@@ -334,7 +386,7 @@ def _run_decode_case(method, prefix_len):
         metadata.num_actual_tokens = 1
         metadata.seq_lens = torch.tensor([prefix_len], dtype=torch.int32)
         metadata.block_table = torch.zeros(1, 1, dtype=torch.int32)
-        impl = _StubDecodeImpl(rank)
+        impl = _StubDecodeImpl(rank, profile=profile)
         impl.expected_local_len = local_k.shape[0]
         output = torch.empty(1, local_heads, dim)
         method(
@@ -349,6 +401,7 @@ def _run_decode_case(method, prefix_len):
         )
         assert _CURRENT_GROUP.combine_calls == 1
         rank_outputs.append(output)
+        rank_profile_stages.append(impl.profile_stages)
 
     actual = torch.cat(rank_outputs, dim=1)
     expected, _, _ = _dense_attention(
@@ -359,6 +412,7 @@ def _run_decode_case(method, prefix_len):
         softmax_scale=_StubImpl.scale,
     )
     torch.testing.assert_close(actual, expected.squeeze(0), rtol=1e-5, atol=1e-5)
+    return rank_profile_stages
 
 
 def test_rank_specific_dcp_local_seq_lens():
@@ -398,6 +452,13 @@ def test_paged_prefill_exposes_existing_lse():
     assert "return {out_fp16, softmax_lse};" in source
 
 
+def test_decode_interface_exposes_opt_in_dcp_trace_ranges():
+    source = FLASH_INTERFACE.read_text()
+    assert "dcp_trace_range" in source
+    assert 'dcp_trace_range("local_attention")' in source
+    assert 'dcp_trace_range("lse_reconstruction")' in source
+
+
 def test_decode_workspace_lse_reconstruction():
     reconstruct_lse = _load_top_level_function(
         FLASH_INTERFACE, "_decode_lse_from_workspace"
@@ -429,3 +490,43 @@ def test_dcp_decode_matches_dense_attention():
     method = _load_method("_flash_v100_decode")
     _run_decode_case(method, prefix_len=5)
     _run_decode_case(method, prefix_len=1)
+
+
+def test_dcp_decode_nvtx_is_disabled_by_default(monkeypatch):
+    monkeypatch.delenv("VLLM_FLASH_V100_DCP_DECODE_NVTX", raising=False)
+    enabled = _load_top_level_function(BACKEND, "_dcp_decode_nvtx_enabled")
+    assert not enabled()
+    monkeypatch.setenv("VLLM_FLASH_V100_DCP_DECODE_NVTX", "1")
+    assert enabled()
+
+
+def test_dcp_decode_output_workspace_reuses_stable_storage():
+    impl = _StubDecodeImpl(rank=0)
+    reference = torch.empty(3, 4, 5)
+    first = impl._get_dcp_decode_output_workspace(reference)
+    second = impl._get_dcp_decode_output_workspace(reference)
+    assert first is second
+    assert first.data_ptr() == second.data_ptr()
+
+    different_shape = impl._get_dcp_decode_output_workspace(torch.empty(2, 4, 5))
+    assert different_shape is not first
+    assert len(impl._dcp_decode_output_workspaces) == 2
+
+
+def test_dcp_decode_profile_covers_hot_path_without_changing_output():
+    method = _load_method("_flash_v100_decode")
+    rank_stages = _run_decode_case(method, prefix_len=5, profile=True)
+    expected_stages = {
+        "query_prepare",
+        "local_attention",
+        "lse_reconstruction",
+        "lse_prepare",
+        "output_correction",
+        "output_workspace_acquire",
+    }
+    for stages in rank_stages:
+        assert expected_stages.issubset(stages)
+        assert any(stage.startswith("query_all_gather bytes=") for stage in stages)
+        assert any(stage.startswith("lse_all_gather bytes=") for stage in stages)
+        assert any(stage.startswith("output_reduce_scatter bytes=") for stage in stages)
+        assert any(stage.startswith("output_copy bytes=") for stage in stages)

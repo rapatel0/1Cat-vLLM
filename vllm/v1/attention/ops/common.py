@@ -1,5 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+from collections.abc import Callable
+from contextlib import AbstractContextManager
+
 import torch
 
 from vllm.distributed.parallel_state import GroupCoordinator
@@ -184,6 +187,7 @@ def _cp_lse_common(
     cp_group: GroupCoordinator,
     ctx: CPTritonContext | None = None,
     is_lse_base_on_e=True,
+    trace_range: Callable[[str], AbstractContextManager[None]] | None = None,
 ):
     """
     cp_attn_out: [ B, H, D ]
@@ -195,17 +199,35 @@ def _cp_lse_common(
     if ctx is None:
         ctx = CPTritonContext()
 
-    cp_attn_lse = cp_attn_lse.contiguous()
-    lses = cp_group.all_gather(cp_attn_lse, dim=0).reshape(
-        (cp_group.world_size,) + cp_attn_lse.shape
-    )
-    out, lse = correct_attn_out(
-        cp_attn_out,
-        lses,
-        cp_group.rank_in_group,
-        ctx,
-        is_lse_base_on_e=is_lse_base_on_e,
-    )
+    if trace_range is None:
+        cp_attn_lse = cp_attn_lse.contiguous()
+        lses = cp_group.all_gather(cp_attn_lse, dim=0).reshape(
+            (cp_group.world_size,) + cp_attn_lse.shape
+        )
+        out, lse = correct_attn_out(
+            cp_attn_out,
+            lses,
+            cp_group.rank_in_group,
+            ctx,
+            is_lse_base_on_e=is_lse_base_on_e,
+        )
+        return out, lse
+
+    with trace_range("lse_prepare"):
+        cp_attn_lse = cp_attn_lse.contiguous()
+    lse_bytes = cp_attn_lse.numel() * cp_attn_lse.element_size()
+    with trace_range(f"lse_all_gather bytes={lse_bytes}"):
+        lses = cp_group.all_gather(cp_attn_lse, dim=0).reshape(
+            (cp_group.world_size,) + cp_attn_lse.shape
+        )
+    with trace_range("output_correction"):
+        out, lse = correct_attn_out(
+            cp_attn_out,
+            lses,
+            cp_group.rank_in_group,
+            ctx,
+            is_lse_base_on_e=is_lse_base_on_e,
+        )
     return out, lse
 
 
@@ -216,15 +238,26 @@ def cp_lse_ag_out_rs(
     ctx: CPTritonContext | None = None,
     return_lse: bool = False,
     is_lse_base_on_e=True,
+    trace_range: Callable[[str], AbstractContextManager[None]] | None = None,
 ):
     """
     cp_attn_out: [ B, H, D ]
     cp_attn_lse: [ B, H ]
     """
     out, lse = _cp_lse_common(
-        cp_attn_out, cp_attn_lse, cp_group, ctx=ctx, is_lse_base_on_e=is_lse_base_on_e
+        cp_attn_out,
+        cp_attn_lse,
+        cp_group,
+        ctx=ctx,
+        is_lse_base_on_e=is_lse_base_on_e,
+        trace_range=trace_range,
     )
-    out = cp_group.reduce_scatter(out, dim=1)
+    if trace_range is None:
+        out = cp_group.reduce_scatter(out, dim=1)
+    else:
+        output_bytes = out.numel() * out.element_size()
+        with trace_range(f"output_reduce_scatter bytes={output_bytes}"):
+            out = cp_group.reduce_scatter(out, dim=1)
 
     if return_lse:
         cp_num_heads = lse.shape[1] // cp_group.world_size

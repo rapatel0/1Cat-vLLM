@@ -6,7 +6,7 @@ try:
 except ImportError:
     import flash_attn_v100_cuda
 from dataclasses import dataclass
-from typing import Optional, Sequence, Tuple, Union
+from typing import Callable, ContextManager, Optional
 
 try:
     from torch._subclasses.fake_tensor import FakeTensor
@@ -706,6 +706,7 @@ def flash_attn_decode_paged(
     workspace_seq_capacity_hint: Optional[int] = None,
     active_num_partitions: Optional[torch.Tensor] = None,
     return_lse: bool = False,
+    dcp_trace_range: Optional[Callable[[str], ContextManager[None]]] = None,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -744,31 +745,60 @@ def flash_attn_decode_paged(
         )
     )
 
-    attn_out = flash_attn_v100_cuda.decode_paged_fwd(
-        q,
-        k_cache,
-        v_cache,
-        out,
-        block_table,
-        seq_lens,
-        tmp_out,
-        max_logits,
-        exp_sums,
-        active_num_partitions,
-        softmax_scale,
-        plan.partition_size,
-        plan.launch_num_partitions,
-        kv_cache_dtype,
-        float(k_scale),
-        float(v_scale),
-        int(window_size_left),
-        int(window_size_right),
-    )
+    if dcp_trace_range is None:
+        attn_out = flash_attn_v100_cuda.decode_paged_fwd(
+            q,
+            k_cache,
+            v_cache,
+            out,
+            block_table,
+            seq_lens,
+            tmp_out,
+            max_logits,
+            exp_sums,
+            active_num_partitions,
+            softmax_scale,
+            plan.partition_size,
+            plan.launch_num_partitions,
+            kv_cache_dtype,
+            float(k_scale),
+            float(v_scale),
+            int(window_size_left),
+            int(window_size_right),
+        )
+    else:
+        with dcp_trace_range("local_attention"):
+            attn_out = flash_attn_v100_cuda.decode_paged_fwd(
+                q,
+                k_cache,
+                v_cache,
+                out,
+                block_table,
+                seq_lens,
+                tmp_out,
+                max_logits,
+                exp_sums,
+                active_num_partitions,
+                softmax_scale,
+                plan.partition_size,
+                plan.launch_num_partitions,
+                kv_cache_dtype,
+                float(k_scale),
+                float(v_scale),
+                int(window_size_left),
+                int(window_size_right),
+            )
     if not return_lse:
         return attn_out
-    lse = _decode_lse_from_workspace(
-        max_logits, exp_sums, seq_lens, plan.partition_size
-    )
+    if dcp_trace_range is None:
+        lse = _decode_lse_from_workspace(
+            max_logits, exp_sums, seq_lens, plan.partition_size
+        )
+    else:
+        with dcp_trace_range("lse_reconstruction"):
+            lse = _decode_lse_from_workspace(
+                max_logits, exp_sums, seq_lens, plan.partition_size
+            )
     return attn_out, lse
 
 

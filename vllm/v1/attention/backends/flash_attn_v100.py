@@ -16,6 +16,7 @@ import json
 import os
 import time
 from collections.abc import Callable
+from contextlib import AbstractContextManager
 
 import torch
 
@@ -179,6 +180,11 @@ def _dflash_ddtree_triton_branch_attn_enabled() -> bool:
 
 def _dflash_ddtree_triton_branch_attn_strict() -> bool:
     return os.getenv("VLLM_DFLASH_DDTREE_TRITON_BRANCH_ATTN_STRICT", "0") == "1"
+
+
+def _dcp_decode_nvtx_enabled() -> bool:
+    """Whether to annotate the DCP decode hot path for an external profiler."""
+    return os.getenv("VLLM_FLASH_V100_DCP_DECODE_NVTX", "0") == "1"
 
 
 def _format_tensor_debug(tensor: torch.Tensor | None, name: str) -> str:
@@ -2171,6 +2177,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "workspace_seq_capacity_hint",
                 "active_num_partitions",
                 "return_lse",
+                "dcp_trace_range",
             )
             if self.flash_attn_decode_paged is not None
             and _callable_accepts_keyword(self.flash_attn_decode_paged, name)
@@ -2281,6 +2288,37 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self._decode_cache_v: torch.Tensor | None = None
         self._decode_cache_len = 0
         self._decode_cache_capacity = 0
+        self._dcp_decode_profile_enabled = _dcp_decode_nvtx_enabled()
+        self._dcp_decode_output_workspaces: dict[tuple[object, ...], torch.Tensor] = {}
+
+    def _dcp_decode_profile_range(self, stage: str):
+        return torch.cuda.nvtx.range(f"vllm.flash_v100.dcp_decode/{stage}")
+
+    def _get_dcp_decode_output_workspace(
+        self,
+        reference: torch.Tensor,
+    ) -> torch.Tensor:
+        """Return stable per-stream storage for local DCP attention output."""
+        if torch.compiler.is_compiling() or reference.is_meta:
+            return torch.empty_like(reference)
+
+        stream_id = (
+            int(torch.cuda.current_stream(reference.device).cuda_stream)
+            if reference.is_cuda
+            else -1
+        )
+        key = (
+            reference.device,
+            stream_id,
+            reference.dtype,
+            tuple(reference.shape),
+            tuple(reference.stride()),
+        )
+        workspace = self._dcp_decode_output_workspaces.get(key)
+        if workspace is None:
+            workspace = torch.empty_like(reference)
+            self._dcp_decode_output_workspaces[key] = workspace
+        return workspace
 
     def _reset_decode_cache(self) -> None:
         self._decode_cache_k = None
@@ -2853,6 +2891,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         workspace_seq_capacity_hint: int | None = None,
         active_num_partitions: int | None = None,
         return_lse: bool = False,
+        dcp_trace_range: Callable[[str], AbstractContextManager[None]] | None = None,
     ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         kwargs: dict[str, object] = {
             "softmax_scale": softmax_scale,
@@ -2882,6 +2921,12 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     "FLASH_ATTN_V100 decode op cannot return LSE required by DCP"
                 )
             kwargs["return_lse"] = True
+        if dcp_trace_range is not None:
+            if "dcp_trace_range" not in self._flash_decode_paged_kwargs:
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 decode op cannot expose DCP NVTX ranges"
+                )
+            kwargs["dcp_trace_range"] = dcp_trace_range
         return self.flash_attn_decode_paged(
             query,
             key_cache,
@@ -4089,8 +4134,22 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         if self.dcp_world_size > 1:
             dcp_group = get_dcp_group()
-            query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)
-            dcp_out = torch.empty_like(query_across_dcp)
+            trace_range = (
+                self._dcp_decode_profile_range
+                if self._dcp_decode_profile_enabled
+                else None
+            )
+            if trace_range is None:
+                query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)
+                dcp_out = self._get_dcp_decode_output_workspace(query_across_dcp)
+            else:
+                with trace_range("query_prepare"):
+                    query_for_gather = query.contiguous()
+                query_bytes = query_for_gather.numel() * query_for_gather.element_size()
+                with trace_range(f"query_all_gather bytes={query_bytes}"):
+                    query_across_dcp = dcp_group.all_gather(query_for_gather, dim=1)
+                with trace_range("output_workspace_acquire"):
+                    dcp_out = self._get_dcp_decode_output_workspace(query_across_dcp)
             local_seq_lens = get_dcp_local_seq_lens(
                 attn_metadata.seq_lens,
                 self.dcp_world_size,
@@ -4125,6 +4184,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     None,
                 ),
                 return_lse=True,
+                dcp_trace_range=trace_range,
             )
             if not isinstance(decode_result, tuple):
                 raise RuntimeError(
@@ -4135,8 +4195,14 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 dcp_out,
                 dcp_lse,
                 dcp_group,
+                trace_range=trace_range,
             )
-            out_view.copy_(corrected_out)
+            if trace_range is None:
+                out_view.copy_(corrected_out)
+            else:
+                output_bytes = corrected_out.numel() * corrected_out.element_size()
+                with trace_range(f"output_copy bytes={output_bytes}"):
+                    out_view.copy_(corrected_out)
             _record_route("decode_scalar_paged_dcp")
             return output
 
