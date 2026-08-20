@@ -664,6 +664,32 @@ def flash_attn_lse(
     return lse
 
 
+def _decode_lse_from_workspace(
+    max_logits: torch.Tensor,
+    exp_sums: torch.Tensor,
+    seq_lens: torch.Tensor,
+    partition_size: int,
+) -> torch.Tensor:
+    """Reconstruct each decode row's LSE from partition softmax statistics."""
+    num_partitions = torch.div(
+        seq_lens + partition_size - 1,
+        partition_size,
+        rounding_mode="floor",
+    )
+    partition_ids = torch.arange(
+        max_logits.shape[-1],
+        dtype=num_partitions.dtype,
+        device=max_logits.device,
+    )
+    valid = partition_ids.view(1, 1, -1) < num_partitions.view(-1, 1, 1)
+    partition_lse = torch.where(
+        (exp_sums > 0) & valid,
+        max_logits + torch.log(exp_sums),
+        torch.full_like(max_logits, -float("inf")),
+    )
+    return torch.logsumexp(partition_lse, dim=-1)
+
+
 def flash_attn_decode_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -679,6 +705,7 @@ def flash_attn_decode_paged(
     max_seq_len_hint: Optional[int] = None,
     workspace_seq_capacity_hint: Optional[int] = None,
     active_num_partitions: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -717,7 +744,7 @@ def flash_attn_decode_paged(
         )
     )
 
-    return flash_attn_v100_cuda.decode_paged_fwd(
+    attn_out = flash_attn_v100_cuda.decode_paged_fwd(
         q,
         k_cache,
         v_cache,
@@ -737,6 +764,12 @@ def flash_attn_decode_paged(
         int(window_size_left),
         int(window_size_right),
     )
+    if not return_lse:
+        return attn_out
+    lse = _decode_lse_from_workspace(
+        max_logits, exp_sums, seq_lens, plan.partition_size
+    )
+    return attn_out, lse
 
 
 def flash_attn_decode_paged_xqa_available() -> bool:
@@ -758,6 +791,7 @@ def flash_attn_decode_paged_xqa(
     max_seq_len_hint: Optional[int] = None,
     workspace_seq_capacity_hint: Optional[int] = None,
     active_num_partitions: Optional[torch.Tensor] = None,
+    return_lse: bool = False,
 ):
     if not flash_attn_decode_paged_xqa_available():
         raise RuntimeError("flash_attn_v100 CUDA extension lacks XQA decode")
@@ -798,7 +832,7 @@ def flash_attn_decode_paged_xqa(
         )
     )
 
-    return flash_attn_v100_cuda.decode_paged_xqa_fwd(
+    attn_out = flash_attn_v100_cuda.decode_paged_xqa_fwd(
         q,
         k_cache,
         v_cache,
@@ -818,6 +852,12 @@ def flash_attn_decode_paged_xqa(
         int(window_size_left),
         int(window_size_right),
     )
+    if not return_lse:
+        return attn_out
+    lse = _decode_lse_from_workspace(
+        max_logits, exp_sums, seq_lens, plan.partition_size
+    )
+    return attn_out, lse
 
 
 def flash_attn_decode_paged_wmma(

@@ -8,7 +8,9 @@ from pathlib import Path
 
 import torch
 
-BACKEND = Path(__file__).parents[3] / "vllm/v1/attention/backends/flash_attn_v100.py"
+ROOT = Path(__file__).parents[3]
+BACKEND = ROOT / "vllm/v1/attention/backends/flash_attn_v100.py"
+FLASH_INTERFACE = ROOT / "flash-attention-v100/flash_attn_v100/flash_attn_interface.py"
 
 
 def _dense_attention(q, k, v, *, causal, softmax_scale, **_kwargs):
@@ -119,6 +121,11 @@ def _extract_kv(*, kv_cache, seq_lens, total_tokens, **_kwargs):
     )
 
 
+def _cp_lse_combine(out, lse, group, return_lse=False):
+    result = group.combine(out, lse, True)
+    return result if return_lse else result[0]
+
+
 def _namespace():
     return {
         "torch": torch,
@@ -128,10 +135,9 @@ def _namespace():
         "_extract_contiguous_kv_from_paged_cache": _extract_kv,
         "_dequantize_fp8_contiguous_kv": lambda k, v, *_args: (k, v),
         "_normalize_query_start_loc_for_available_tokens": lambda qsl, _n: qsl,
-        "cp_lse_ag_out_rs": lambda out, lse, group, return_lse: group.combine(
-            out, lse, return_lse
-        ),
+        "cp_lse_ag_out_rs": _cp_lse_combine,
         "merge_attn_states": _merge_states,
+        "_record_route": lambda _route: None,
     }
 
 
@@ -157,6 +163,27 @@ def _load_method(name: str):
     return namespace[name]
 
 
+def _load_top_level_function(path: Path, name: str):
+    tree = ast.parse(path.read_text())
+    function = next(
+        node
+        for node in tree.body
+        if isinstance(node, ast.FunctionDef) and node.name == name
+    )
+    function.decorator_list = []
+    function.returns = None
+    for arg in (
+        *function.args.posonlyargs,
+        *function.args.args,
+        *function.args.kwonlyargs,
+    ):
+        arg.annotation = None
+    module = ast.fix_missing_locations(ast.Module(body=[function], type_ignores=[]))
+    namespace = {"torch": torch}
+    exec(compile(module, str(path), "exec"), namespace)
+    return namespace[name]
+
+
 class _StubImpl:
     dcp_world_size = 2
     cp_kv_cache_interleave_size = 1
@@ -169,6 +196,43 @@ class _StubImpl:
     @staticmethod
     def _flash_v100_window_size(_causal):
         return (-1, -1)
+
+
+class _StubDecodeImpl:
+    dcp_world_size = 2
+    cp_kv_cache_interleave_size = 1
+    kv_cache_dtype = "auto"
+    scale = 0.5
+    use_decode_xqa = False
+
+    def __init__(self, rank):
+        self.dcp_rank = rank
+
+    @staticmethod
+    def _flash_v100_window_size(*, causal):
+        assert causal
+        return (-1, -1)
+
+    def _call_flash_attn_decode_paged(
+        self,
+        query,
+        _key_cache,
+        _value_cache,
+        _block_table,
+        seq_lens,
+        **kwargs,
+    ):
+        assert kwargs["return_lse"]
+        assert int(seq_lens[0]) == self.expected_local_len
+        out, lse, _ = _dense_attention(
+            query.unsqueeze(0),
+            _CURRENT_GROUP.local_k.unsqueeze(0),
+            _CURRENT_GROUP.local_v.unsqueeze(0),
+            causal=False,
+            softmax_scale=self.scale,
+        )
+        kwargs["out"].copy_(out.squeeze(0))
+        return kwargs["out"], lse.squeeze(0).transpose(0, 1).contiguous()
 
 
 class _Metadata:
@@ -235,6 +299,53 @@ def _run_prefill_case(method, prefix_len):
     torch.testing.assert_close(actual, expected.squeeze(0), rtol=1e-5, atol=1e-5)
 
 
+def _run_decode_case(method, prefix_len):
+    global _CURRENT_GROUP
+    torch.manual_seed(31 + prefix_len)
+    total_heads, local_heads, dim = 4, 2, 4
+    q_all = torch.randn(1, total_heads, dim)
+    prefix_k = torch.randn(prefix_len, 1, dim)
+    prefix_v = torch.randn(prefix_len, 1, dim)
+    rank_outputs = []
+
+    for rank in range(2):
+        owned = torch.arange(prefix_len) % 2 == rank
+        local_k, local_v = prefix_k[owned], prefix_v[owned]
+        cache = torch.zeros(1, 2, max(prefix_len, 1), 1, dim)
+        _CURRENT_GROUP = _FakeGroup(
+            rank, q_all, prefix_k, prefix_v, local_k, local_v, _StubImpl.scale
+        )
+        metadata = _Metadata()
+        metadata.num_actual_tokens = 1
+        metadata.seq_lens = torch.tensor([prefix_len], dtype=torch.int32)
+        metadata.block_table = torch.zeros(1, 1, dtype=torch.int32)
+        impl = _StubDecodeImpl(rank)
+        impl.expected_local_len = local_k.shape[0]
+        output = torch.empty(1, local_heads, dim)
+        method(
+            impl,
+            _Layer(),
+            q_all[:, rank * local_heads : (rank + 1) * local_heads],
+            torch.empty(0),
+            torch.empty(0),
+            cache,
+            metadata,
+            output,
+        )
+        assert _CURRENT_GROUP.combine_calls == 1
+        rank_outputs.append(output)
+
+    actual = torch.cat(rank_outputs, dim=1)
+    expected, _, _ = _dense_attention(
+        q_all.unsqueeze(0),
+        prefix_k.unsqueeze(0),
+        prefix_v.unsqueeze(0),
+        causal=False,
+        softmax_scale=_StubImpl.scale,
+    )
+    torch.testing.assert_close(actual, expected.squeeze(0), rtol=1e-5, atol=1e-5)
+
+
 def test_dcp_prefill_matches_dense_attention():
     source = BACKEND.read_text()
     assert "from vllm.distributed.parallel_state import get_dcp_group" in source
@@ -244,3 +355,36 @@ def test_dcp_prefill_matches_dense_attention():
     _run_prefill_case(method, prefix_len=0)
     _run_prefill_case(method, prefix_len=5)
     _run_prefill_case(method, prefix_len=1)
+
+
+def test_decode_workspace_lse_reconstruction():
+    reconstruct_lse = _load_top_level_function(
+        FLASH_INTERFACE, "_decode_lse_from_workspace"
+    )
+    max_logits = torch.tensor(
+        [
+            [[2.0, -1.0, 99.0], [0.5, 3.0, -88.0]],
+            [[-2.0, 1.0, 5.0], [4.0, -7.0, 12.0]],
+        ]
+    )
+    exp_sums = torch.tensor(
+        [
+            [[3.0, 4.0, 1000.0], [2.0, 5.0, 0.0]],
+            [[1.5, 2.5, 3.5], [4.0, 0.0, 9.0]],
+        ]
+    )
+    seq_lens = torch.tensor([5, 2], dtype=torch.int32)
+    actual = reconstruct_lse(max_logits, exp_sums, seq_lens, partition_size=2)
+
+    expected = torch.empty(2, 2)
+    expected[0] = torch.logsumexp(
+        max_logits[0, :, :3] + torch.log(exp_sums[0, :, :3]), dim=-1
+    )
+    expected[1] = max_logits[1, :, 0] + torch.log(exp_sums[1, :, 0])
+    torch.testing.assert_close(actual, expected)
+
+
+def test_dcp_decode_matches_dense_attention():
+    method = _load_method("_flash_v100_decode")
+    _run_decode_case(method, prefix_len=5)
+    _run_decode_case(method, prefix_len=1)

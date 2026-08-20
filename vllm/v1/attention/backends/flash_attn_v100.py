@@ -2135,8 +2135,8 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
 class FlashAttnV100Impl(TritonAttentionImpl):
     """Flash Attention V100 implementation with explicit fallback policy."""
 
-    # The V100 decode workspace computes the local LSE components. The actual
-    # DCP LSE return/reduction path is added separately.
+    # The paged decode wrapper returns LSE reconstructed from its partition
+    # workspace, allowing exact cross-rank DCP output correction.
     can_return_lse_for_decode: bool = True
 
     def __init__(self, *args, **kwargs):
@@ -2170,6 +2170,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 "max_seq_len_hint",
                 "workspace_seq_capacity_hint",
                 "active_num_partitions",
+                "return_lse",
             )
             if self.flash_attn_decode_paged is not None
             and _callable_accepts_keyword(self.flash_attn_decode_paged, name)
@@ -2851,7 +2852,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         max_seq_len_hint: int | None = None,
         workspace_seq_capacity_hint: int | None = None,
         active_num_partitions: int | None = None,
-    ) -> None:
+        return_lse: bool = False,
+    ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
         kwargs: dict[str, object] = {
             "softmax_scale": softmax_scale,
             "out": out,
@@ -2874,7 +2876,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         for name, value in optional_kwargs.items():
             if name in self._flash_decode_paged_kwargs:
                 kwargs[name] = value
-        self.flash_attn_decode_paged(
+        if return_lse:
+            if "return_lse" not in self._flash_decode_paged_kwargs:
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 decode op cannot return LSE required by DCP"
+                )
+            kwargs["return_lse"] = True
+        return self.flash_attn_decode_paged(
             query,
             key_cache,
             value_cache,
@@ -3324,7 +3332,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
 
         if (
-            self.use_decode_paged_prefill
+            self.dcp_world_size == 1
+            and self.use_decode_paged_prefill
             and self.use_flash_v100_prefill_paged
             and not is_capturing
         ):
@@ -3356,7 +3365,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
             _record_route("decode_paged_prefill")
             return result
-        if self.use_decode_dense_cache and not is_capturing:
+        if (
+            self.dcp_world_size == 1
+            and self.use_decode_dense_cache
+            and not is_capturing
+        ):
             _log_fp8_kv_cache_route(
                 "decode", self.kv_cache_dtype, "dense_cache_bridge"
             )
@@ -3387,7 +3400,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
             _record_route("decode_dense_cache")
             return result
-        if self.use_decode_dense_reference and not is_capturing:
+        if (
+            self.dcp_world_size == 1
+            and self.use_decode_dense_reference
+            and not is_capturing
+        ):
             _log_fp8_kv_cache_route(
                 "decode", self.kv_cache_dtype, "dense_reference_bridge"
             )
@@ -4084,6 +4101,60 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             return output
 
         key_cache, value_cache = _split_paged_kv_cache(kv_cache)
+
+        if self.dcp_world_size > 1:
+            dcp_group = get_dcp_group()
+            query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)
+            dcp_out = torch.empty_like(query_across_dcp)
+            local_seq_lens = get_dcp_local_seq_lens(
+                attn_metadata.seq_lens,
+                self.dcp_world_size,
+                self.dcp_rank,
+                self.cp_kv_cache_interleave_size,
+            )
+            decode_result = self._call_flash_attn_decode_paged(
+                query_across_dcp,
+                key_cache,
+                value_cache,
+                attn_metadata.block_table,
+                local_seq_lens,
+                softmax_scale=self.scale,
+                out=dcp_out,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=float(layer._k_scale_float),
+                v_scale=float(layer._v_scale_float),
+                window_size=window_size,
+                max_seq_len_hint=getattr(
+                    attn_metadata,
+                    "flash_v100_decode_max_seq_len_hint",
+                    None,
+                ),
+                workspace_seq_capacity_hint=getattr(
+                    attn_metadata,
+                    "flash_v100_decode_workspace_seq_capacity_hint",
+                    None,
+                ),
+                active_num_partitions=getattr(
+                    attn_metadata,
+                    "flash_v100_decode_active_num_partitions",
+                    None,
+                ),
+                return_lse=True,
+            )
+            if not isinstance(decode_result, tuple):
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 decode did not return LSE required by DCP"
+                )
+            dcp_out, dcp_lse = decode_result
+            corrected_out = cp_lse_ag_out_rs(
+                dcp_out,
+                dcp_lse,
+                dcp_group,
+            )
+            out_view.copy_(corrected_out)
+            _record_route("decode_scalar_paged_dcp")
+            return output
+
         q_per_kv = (
             query.shape[1] // key_cache.shape[2]
             if key_cache.shape[2] > 0 and query.shape[1] % key_cache.shape[2] == 0
