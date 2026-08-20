@@ -587,7 +587,7 @@ def _run_multi_request_prefill_case(
         method(
             impl,
             _Layer(),
-            query_flat[:, rank * local_heads : (rank + 1) * local_heads].contiguous(),
+            query_flat[:, rank * local_heads : (rank + 1) * local_heads],
             key_flat,
             value_flat,
             cache,

@@ -4030,7 +4030,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         # The paged-prefix kernel accepts a batch with row-specific block tables
         # and sequence lengths, but the raw suffix kernel requires one common
         # query length. Restrict this route to the exact uniform verifier layout
-        # so reshape operations remain views and graph replay sees stable shapes.
+        # so reshapes preserve request ordering and graph replay sees stable shapes.
         query_lens_host = query_start_loc_host[1:] - query_start_loc_host[:-1]
         uniform_query_len = (
             int(query_lens_host[0].item()) if num_seqs > 0 else 0
@@ -4046,10 +4046,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and int(key.shape[0]) == int(query.shape[0])
             and int(value.shape[0]) == int(query.shape[0])
             and int(out_view.shape[0]) == int(query.shape[0])
-            and query.is_contiguous()
-            and key.is_contiguous()
-            and value.is_contiguous()
-            and out_view.is_contiguous()
             and attn_metadata.block_table.ndim == 2
             and int(attn_metadata.block_table.shape[0]) >= num_seqs
             and int(attn_metadata.seq_lens.numel()) >= num_seqs
@@ -4084,10 +4080,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         )
 
             batch_shape = (num_seqs, uniform_query_len)
-            q_suffix = query.view(*batch_shape, query.shape[1], query.shape[2])
-            k_suffix = key.view(*batch_shape, key.shape[1], key.shape[2])
-            v_suffix = value.view(*batch_shape, value.shape[1], value.shape[2])
-            q_context = query_across_dcp.view(
+            q_suffix = query.reshape(*batch_shape, query.shape[1], query.shape[2])
+            k_suffix = key.reshape(*batch_shape, key.shape[1], key.shape[2])
+            v_suffix = value.reshape(*batch_shape, value.shape[1], value.shape[2])
+            q_context = query_across_dcp.reshape(
                 *batch_shape,
                 query_across_dcp.shape[1],
                 query_across_dcp.shape[2],
