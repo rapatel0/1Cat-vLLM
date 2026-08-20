@@ -148,6 +148,26 @@ def _cp_lse_combine(
     return result if return_lse else result[0]
 
 
+def _a2a_lse_combine(
+    out,
+    lse,
+    group,
+    return_lse=False,
+    trace_range=None,
+):
+    payload_bytes = (out.numel() + 2 * lse.numel()) * out.element_size()
+    if trace_range is None:
+        result = group.combine(out, lse, True)
+    else:
+        with trace_range(f"a2a_pack bytes={payload_bytes}"):
+            pass
+        with trace_range(f"a2a_all_to_all bytes={payload_bytes}"):
+            result = group.combine(out, lse, True)
+        with trace_range(f"a2a_unpack bytes={payload_bytes}"):
+            pass
+    return result if return_lse else result[0]
+
+
 def _namespace():
     return {
         "torch": torch,
@@ -158,6 +178,7 @@ def _namespace():
         "_dequantize_fp8_contiguous_kv": lambda k, v, *_args: (k, v),
         "_normalize_query_start_loc_for_available_tokens": lambda qsl, _n: qsl,
         "cp_lse_ag_out_rs": _cp_lse_combine,
+        "dcp_a2a_lse_reduce": _a2a_lse_combine,
         "merge_attn_states": _merge_states,
         "_record_route": lambda _route: None,
         "_is_cuda_graph_capturing": lambda _query: False,
@@ -209,6 +230,7 @@ def _load_top_level_function(path: Path, name: str):
 
 class _StubImpl:
     dcp_world_size = 2
+    dcp_comm_backend = "ag_rs"
     cp_kv_cache_interleave_size = 1
     kv_cache_dtype = "auto"
     scale = 0.5
@@ -253,8 +275,9 @@ class _StubDecodeImpl:
     use_decode_xqa = False
     _get_dcp_decode_output_workspace = _load_method("_get_dcp_decode_output_workspace")
 
-    def __init__(self, rank, profile=False):
+    def __init__(self, rank, profile=False, backend="ag_rs"):
         self.dcp_rank = rank
+        self.dcp_comm_backend = backend
         self._dcp_decode_profile_enabled = profile
         self._dcp_decode_output_workspaces = {}
         self.profile_stages = []
@@ -309,7 +332,7 @@ class _Layer:
     _v_scale_float = 1.0
 
 
-def _run_prefill_case(method, prefix_len):
+def _run_prefill_case(method, prefix_len, backend="ag_rs"):
     global _CURRENT_GROUP
     torch.manual_seed(7 + prefix_len)
     query_len, total_heads, local_heads, dim = 3, 4, 2, 4
@@ -337,6 +360,7 @@ def _run_prefill_case(method, prefix_len):
         )
         impl = _StubImpl()
         impl.dcp_rank = rank
+        impl.dcp_comm_backend = backend
         output = torch.empty(query_len, local_heads, dim)
         method(
             impl,
@@ -364,7 +388,7 @@ def _run_prefill_case(method, prefix_len):
     torch.testing.assert_close(actual, expected.squeeze(0), rtol=1e-5, atol=1e-5)
 
 
-def _run_decode_case(method, prefix_len, profile=False):
+def _run_decode_case(method, prefix_len, profile=False, backend="ag_rs"):
     global _CURRENT_GROUP
     torch.manual_seed(31 + prefix_len)
     total_heads, local_heads, dim = 4, 2, 4
@@ -385,7 +409,7 @@ def _run_decode_case(method, prefix_len, profile=False):
         metadata.num_actual_tokens = 1
         metadata.seq_lens = torch.tensor([prefix_len], dtype=torch.int32)
         metadata.block_table = torch.zeros(1, 1, dtype=torch.int32)
-        impl = _StubDecodeImpl(rank, profile=profile)
+        impl = _StubDecodeImpl(rank, profile=profile, backend=backend)
         impl.expected_local_len = local_k.shape[0]
         output = torch.empty(1, local_heads, dim)
         method(
@@ -437,6 +461,12 @@ def test_dcp_prefill_matches_dense_attention():
     _run_prefill_case(method, prefix_len=1)
 
 
+def test_dcp_prefix_prefill_a2a_matches_dense_attention():
+    method = _load_method("_forward_with_dcp")
+    _run_prefill_case(method, prefix_len=5, backend="a2a")
+    _run_prefill_case(method, prefix_len=1, backend="a2a")
+
+
 def test_dense_flash_exposes_existing_lse():
     source = FUSED_MHA_FORWARD.read_text()
     assert 'TORCH_CHECK(!return_softmax, "return_softmax not supported")' not in source
@@ -476,6 +506,22 @@ def test_dcp_decode_matches_dense_attention():
     _run_decode_case(method, prefix_len=1)
 
 
+def test_dcp_decode_a2a_matches_dense_attention():
+    method = _load_method("_flash_v100_decode")
+    _run_decode_case(method, prefix_len=5, backend="a2a")
+    _run_decode_case(method, prefix_len=1, backend="a2a")
+
+
+def test_dcp_decode_rejects_unknown_communication_backend():
+    method = _load_method("_flash_v100_decode")
+    try:
+        _run_decode_case(method, prefix_len=5, backend="invalid")
+    except RuntimeError as error:
+        assert "unsupported communication backend" in str(error)
+    else:
+        raise AssertionError("unknown DCP communication backend was accepted")
+
+
 def test_dcp_decode_nvtx_is_disabled_by_default(monkeypatch):
     monkeypatch.delenv("VLLM_FLASH_V100_DCP_DECODE_NVTX", raising=False)
     enabled = _load_top_level_function(BACKEND, "_dcp_decode_nvtx_enabled")
@@ -513,3 +559,17 @@ def test_dcp_decode_profile_covers_hot_path_without_changing_output():
         assert any(stage.startswith("lse_all_gather bytes=") for stage in stages)
         assert any(stage.startswith("output_reduce_scatter bytes=") for stage in stages)
         assert any(stage.startswith("output_copy bytes=") for stage in stages)
+        assert not any(stage.startswith("a2a_") for stage in stages)
+
+
+def test_dcp_decode_a2a_profile_has_one_packed_collective():
+    method = _load_method("_flash_v100_decode")
+    rank_stages = _run_decode_case(method, prefix_len=5, profile=True, backend="a2a")
+    for stages in rank_stages:
+        assert any(stage.startswith("query_all_gather bytes=") for stage in stages)
+        assert any(stage.startswith("a2a_pack bytes=") for stage in stages)
+        assert any(stage.startswith("a2a_all_to_all bytes=") for stage in stages)
+        assert any(stage.startswith("a2a_unpack bytes=") for stage in stages)
+        assert any(stage.startswith("output_copy bytes=") for stage in stages)
+        assert not any(stage.startswith("lse_all_gather") for stage in stages)
+        assert not any(stage.startswith("output_reduce_scatter") for stage in stages)

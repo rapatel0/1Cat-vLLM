@@ -20,6 +20,8 @@ Reference: https://arxiv.org/abs/2507.07120
 
 from __future__ import annotations
 
+from collections.abc import Callable
+from contextlib import AbstractContextManager
 from typing import TYPE_CHECKING
 
 import torch
@@ -128,6 +130,39 @@ def _dcp_a2a_send_recv_buffers(
         torch.empty(shape, device=device, dtype=dtype),
         torch.empty(shape, device=device, dtype=dtype),
     )
+
+
+def _dcp_a2a_call_buffers(
+    comm_shape: tuple[int, ...],
+    out_shape: tuple[int, ...],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    return_lse: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Allocate all live A2A buffers together so graph views never alias."""
+    lse_shape = out_shape[:-1]
+    if is_workspace_manager_initialized():
+        specs = [
+            (comm_shape, dtype),
+            (comm_shape, dtype),
+            (out_shape, dtype),
+        ]
+        if return_lse:
+            specs.append((lse_shape, torch.float32))
+        buffers = current_workspace_manager().get_simultaneous(*specs)
+        out_lse = buffers[3] if return_lse else None
+        return buffers[0], buffers[1], buffers[2], out_lse
+
+    send_buffer = torch.empty(comm_shape, device=device, dtype=dtype)
+    recv_buffer = torch.empty(comm_shape, device=device, dtype=dtype)
+    out = torch.empty(out_shape, device=device, dtype=dtype)
+    out_lse = (
+        torch.empty(lse_shape, device=device, dtype=torch.float32)
+        if return_lse
+        else None
+    )
+    return send_buffer, recv_buffer, out, out_lse
 
 
 @triton.jit
@@ -353,18 +388,38 @@ def _dcp_a2a_unpack_combine(
     lse_pack_dim: int,
     return_lse: bool,
     is_lse_base_on_e: bool,
+    *,
+    out: torch.Tensor | None = None,
+    out_lse: torch.Tensor | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     world_size, num_tokens, h_per_rank, _ = recv_buffer.shape
-    out = torch.empty(
-        (num_tokens, h_per_rank, head_dim),
-        device=recv_buffer.device,
-        dtype=recv_buffer.dtype,
-    )
-    out_lse = torch.empty(
-        (num_tokens, h_per_rank) if return_lse else (1, 1),
-        device=recv_buffer.device,
-        dtype=torch.float32 if return_lse else recv_buffer.dtype,
-    )
+    expected_out_shape = (num_tokens, h_per_rank, head_dim)
+    if out is None:
+        out = torch.empty(
+            expected_out_shape,
+            device=recv_buffer.device,
+            dtype=recv_buffer.dtype,
+        )
+    elif out.shape != expected_out_shape:
+        raise ValueError(
+            f"A2A output shape {tuple(out.shape)} does not match {expected_out_shape}."
+        )
+    if return_lse:
+        if out_lse is None:
+            out_lse = torch.empty(
+                (num_tokens, h_per_rank),
+                device=recv_buffer.device,
+                dtype=torch.float32,
+            )
+        elif out_lse.shape != (num_tokens, h_per_rank):
+            raise ValueError(
+                f"A2A LSE output shape {tuple(out_lse.shape)} does not match "
+                f"{(num_tokens, h_per_rank)}."
+            )
+    else:
+        # The Triton signature still requires a pointer, but RETURN_LSE=False
+        # proves it is never dereferenced.
+        out_lse = out.view(-1)[:1].view(1, 1)
     grid = (num_tokens, h_per_rank, 1)
     _dcp_a2a_unpack_combine_kernel[grid](
         recv_buffer,
@@ -397,6 +452,7 @@ def dcp_a2a_lse_reduce(
     ctx: CPTritonContext | None = None,
     return_lse: bool = False,
     is_lse_base_on_e: bool = True,
+    trace_range: Callable[[str], AbstractContextManager[None]] | None = None,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Combine partial attention outputs across DCP ranks using All-to-All.
@@ -423,36 +479,96 @@ def dcp_a2a_lse_reduce(
             return cp_attn_out, cp_attn_lse
         return cp_attn_out
 
+    if cp_attn_out.ndim != 3:
+        raise ValueError(
+            "DCP A2A attention output must have shape [B, H, D], got "
+            f"{tuple(cp_attn_out.shape)}."
+        )
     B, H, D = cp_attn_out.shape
+    if cp_attn_lse.shape != (B, H):
+        raise ValueError(
+            f"DCP A2A LSE shape {tuple(cp_attn_lse.shape)} does not match "
+            f"attention output prefix {(B, H)}."
+        )
+    if cp_attn_lse.dtype != torch.float32:
+        raise ValueError(f"DCP A2A requires fp32 LSE, got {cp_attn_lse.dtype}.")
+    if cp_attn_lse.device != cp_attn_out.device:
+        raise ValueError("DCP A2A output and LSE must be on the same device.")
+    if cp_attn_out.dtype not in (torch.float16, torch.bfloat16, torch.float32):
+        raise ValueError(f"DCP A2A does not support output dtype {cp_attn_out.dtype}.")
     if H % world_size != 0:
         raise ValueError(f"H={H} must be divisible by DCP world size {world_size}.")
     H_per_rank = H // world_size
     lse_pack_dim = _dcp_a2a_lse_pack_dim(cp_attn_out.dtype)
 
-    send_buffer, recv_buffer = _dcp_a2a_send_recv_buffers(
-        (world_size, B, H_per_rank, D + lse_pack_dim),
+    comm_shape = (world_size, B, H_per_rank, D + lse_pack_dim)
+    out_shape = (B, H_per_rank, D)
+    send_buffer, recv_buffer, out, out_lse = _dcp_a2a_call_buffers(
+        comm_shape,
+        out_shape,
         device=cp_attn_out.device,
         dtype=cp_attn_out.dtype,
+        return_lse=return_lse,
     )
+    payload_bytes = send_buffer.numel() * send_buffer.element_size()
 
-    _dcp_a2a_pack_send(
-        cp_attn_out,
-        cp_attn_lse,
-        send_buffer,
-        world_size,
-        H_per_rank,
-        D,
-        lse_pack_dim,
-    )
+    if trace_range is None:
+        _dcp_a2a_pack_send(
+            cp_attn_out,
+            cp_attn_lse,
+            send_buffer,
+            world_size,
+            H_per_rank,
+            D,
+            lse_pack_dim,
+        )
+    else:
+        with trace_range(f"a2a_pack bytes={payload_bytes}"):
+            _dcp_a2a_pack_send(
+                cp_attn_out,
+                cp_attn_lse,
+                send_buffer,
+                world_size,
+                H_per_rank,
+                D,
+                lse_pack_dim,
+            )
 
-    work = dist.all_to_all_single(
-        recv_buffer.view(-1),
-        send_buffer.view(-1),
-        group=cp_group.device_group,
-        async_op=True,
-    )
-    work.wait()
+    if trace_range is None:
+        work = dist.all_to_all_single(
+            recv_buffer.view(-1),
+            send_buffer.view(-1),
+            group=cp_group.device_group,
+            async_op=True,
+        )
+        work.wait()
+    else:
+        with trace_range(f"a2a_all_to_all bytes={payload_bytes}"):
+            work = dist.all_to_all_single(
+                recv_buffer.view(-1),
+                send_buffer.view(-1),
+                group=cp_group.device_group,
+                async_op=True,
+            )
+            work.wait()
 
-    return _dcp_a2a_unpack_combine(
-        recv_buffer, D, lse_pack_dim, return_lse, is_lse_base_on_e
-    )
+    if trace_range is None:
+        return _dcp_a2a_unpack_combine(
+            recv_buffer,
+            D,
+            lse_pack_dim,
+            return_lse,
+            is_lse_base_on_e,
+            out=out,
+            out_lse=out_lse,
+        )
+    with trace_range(f"a2a_unpack bytes={payload_bytes}"):
+        return _dcp_a2a_unpack_combine(
+            recv_buffer,
+            D,
+            lse_pack_dim,
+            return_lse,
+            is_lse_base_on_e,
+            out=out,
+            out_lse=out_lse,
+        )

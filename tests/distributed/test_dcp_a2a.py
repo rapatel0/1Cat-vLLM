@@ -318,6 +318,28 @@ class TestLSEWeightedCombine:
         assert _dcp_a2a_lse_pack_dim(torch.float32) == 1
 
 
+class TestA2AValidation:
+    def test_rejects_mismatched_lse_shape(self):
+        from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+
+        with pytest.raises(ValueError, match="LSE shape"):
+            dcp_a2a_lse_reduce(
+                torch.empty(2, 4, 8),
+                torch.empty(2, 3),
+                _FakeCPGroup(2, None),  # type: ignore[arg-type]
+            )
+
+    def test_rejects_non_fp32_lse(self):
+        from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
+
+        with pytest.raises(ValueError, match="requires fp32 LSE"):
+            dcp_a2a_lse_reduce(
+                torch.empty(2, 4, 8),
+                torch.empty(2, 4, dtype=torch.float16),
+                _FakeCPGroup(2, None),  # type: ignore[arg-type]
+            )
+
+
 class TestPackedA2AKernels:
     @pytest.mark.skipif(
         torch.accelerator.device_count() < 1, reason="CUDA is required."
@@ -373,6 +395,83 @@ class TestPackedA2AKernels:
             torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-4, atol=1e-4)
         else:
             _assert_packed_a2a_close(actual, expected_out, dtype)
+
+    @pytest.mark.skipif(
+        torch.accelerator.device_count() < 1, reason="CUDA is required."
+    )
+    def test_empty_shards_produce_zero_output_and_negative_infinite_lse(self):
+        from vllm.v1.attention.ops.dcp_alltoall import (
+            _dcp_a2a_pack_send,
+            _dcp_a2a_unpack_combine,
+        )
+
+        world_size, batch, h_per_rank, head_dim = 2, 3, 2, 32
+        outputs = torch.randn(
+            batch,
+            world_size * h_per_rank,
+            head_dim,
+            device="cuda",
+            dtype=torch.float16,
+        )
+        lses = torch.full(
+            (batch, world_size * h_per_rank),
+            -float("inf"),
+            device="cuda",
+            dtype=torch.float32,
+        )
+        packed = torch.empty(
+            (world_size, batch, h_per_rank, head_dim + 2),
+            device="cuda",
+            dtype=torch.float16,
+        )
+        _dcp_a2a_pack_send(outputs, lses, packed, world_size, h_per_rank, head_dim, 2)
+        actual_out, actual_lse = _dcp_a2a_unpack_combine(
+            packed, head_dim, 2, True, True
+        )
+        assert torch.count_nonzero(actual_out) == 0
+        assert torch.isneginf(actual_lse).all()
+
+    @pytest.mark.skipif(
+        torch.accelerator.device_count() < 1, reason="CUDA is required."
+    )
+    def test_call_workspace_buffers_are_stable_and_non_aliasing(self):
+        from vllm.v1.attention.ops.dcp_alltoall import _dcp_a2a_call_buffers
+        from vllm.v1.worker.workspace import (
+            init_workspace_manager,
+            reset_workspace_manager,
+        )
+
+        reset_workspace_manager()
+        init_workspace_manager(torch.device("cuda"))
+        try:
+            args = ((2, 5, 3, 258), (5, 3, 256))
+            first = _dcp_a2a_call_buffers(
+                *args,
+                device=torch.device("cuda"),
+                dtype=torch.float16,
+                return_lse=True,
+            )
+            second = _dcp_a2a_call_buffers(
+                *args,
+                device=torch.device("cuda"),
+                dtype=torch.float16,
+                return_lse=True,
+            )
+            assert all(a is not None and b is not None for a, b in zip(first, second))
+            assert [tensor.data_ptr() for tensor in first if tensor is not None] == [
+                tensor.data_ptr() for tensor in second if tensor is not None
+            ]
+            spans = sorted(
+                (
+                    tensor.data_ptr(),
+                    tensor.data_ptr() + tensor.numel() * tensor.element_size(),
+                )
+                for tensor in first
+                if tensor is not None
+            )
+            assert all(left[1] <= right[0] for left, right in zip(spans, spans[1:]))
+        finally:
+            reset_workspace_manager()
 
 
 def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:

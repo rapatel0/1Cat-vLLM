@@ -34,6 +34,7 @@ from vllm.v1.attention.backends.triton_attn import (
 )
 from vllm.v1.attention.backends.utils import get_dcp_local_seq_lens
 from vllm.v1.attention.ops.common import cp_lse_ag_out_rs
+from vllm.v1.attention.ops.dcp_alltoall import dcp_a2a_lse_reduce
 from vllm.v1.attention.ops.merge_attn_states import merge_attn_states
 
 logger = init_logger(__name__)
@@ -2153,6 +2154,16 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if vllm_config is not None
             else 1
         )
+        self.dcp_comm_backend = (
+            vllm_config.parallel_config.dcp_comm_backend
+            if vllm_config is not None
+            else "ag_rs"
+        )
+        if self.dcp_comm_backend not in ("ag_rs", "a2a"):
+            raise ValueError(
+                "FLASH_ATTN_V100 received unsupported DCP communication backend "
+                f"{self.dcp_comm_backend!r}; expected 'ag_rs' or 'a2a'."
+            )
         (
             self.flash_attn_func,
             self.flash_attn_bhmd_func,
@@ -4065,12 +4076,27 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 torch.full_like(context_lse, -float("inf")),
             ).squeeze(0).transpose(0, 1).contiguous()
 
-            context_out, context_lse = cp_lse_ag_out_rs(
-                context_out,
-                context_lse,
-                dcp_group,
-                return_lse=True,
-            )
+            if self.dcp_comm_backend == "a2a":
+                context_out, context_lse = dcp_a2a_lse_reduce(
+                    context_out,
+                    context_lse,
+                    dcp_group,
+                    return_lse=True,
+                )
+                _record_route("prefill_prefix_dcp_a2a")
+            elif self.dcp_comm_backend == "ag_rs":
+                context_out, context_lse = cp_lse_ag_out_rs(
+                    context_out,
+                    context_lse,
+                    dcp_group,
+                    return_lse=True,
+                )
+                _record_route("prefill_prefix_dcp_ag_rs")
+            else:
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 DCP prefix prefill cannot execute unsupported "
+                    f"communication backend {self.dcp_comm_backend!r}."
+                )
             merge_attn_states(
                 out_view[start:end],
                 context_out,
@@ -4191,12 +4217,27 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     "FLASH_ATTN_V100 decode did not return LSE required by DCP"
                 )
             dcp_out, dcp_lse = decode_result
-            corrected_out = cp_lse_ag_out_rs(
-                dcp_out,
-                dcp_lse,
-                dcp_group,
-                trace_range=trace_range,
-            )
+            if self.dcp_comm_backend == "a2a":
+                corrected_out = dcp_a2a_lse_reduce(
+                    dcp_out,
+                    dcp_lse,
+                    dcp_group,
+                    trace_range=trace_range,
+                )
+                _record_route("decode_scalar_paged_dcp_a2a")
+            elif self.dcp_comm_backend == "ag_rs":
+                corrected_out = cp_lse_ag_out_rs(
+                    dcp_out,
+                    dcp_lse,
+                    dcp_group,
+                    trace_range=trace_range,
+                )
+                _record_route("decode_scalar_paged_dcp_ag_rs")
+            else:
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 DCP decode cannot execute unsupported "
+                    f"communication backend {self.dcp_comm_backend!r}."
+                )
             if trace_range is None:
                 out_view.copy_(corrected_out)
             else:
