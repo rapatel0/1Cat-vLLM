@@ -1,0 +1,134 @@
+{
+  "date": "2026-08-20",
+  "canonical_commit": "53893bfb47c847aa0e4fe5d01ff77b560516223d",
+  "hardware": "gpu-01: 8 x Tesla V100-SXM2-32GB",
+  "runtime": {
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 2,
+    "speculative_mode": "native MTP4",
+    "target_attention_backend": "FLASH_ATTN_V100",
+    "draft_attention_backend": "FLASH_ATTN_V100",
+    "max_model_len": 262144,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384,
+    "gpu_memory_utilization": 0.78,
+    "cuda_device_order": "PCI_BUS_ID",
+    "dcp_comm_backend": "ag_rs"
+  },
+  "projection": {
+    "path": "/localpool/onecat-vllm-hy3-sm70/dcp2-branch-53893bfb47",
+    "container_path": "/workspace/dcp2-branch-53893bfb47",
+    "build_source": "/localpool/onecat-vllm-hy3-sm70/direct-lse-53893bfb47-src",
+    "torch": "2.10.0+cu128",
+    "cuda_toolkit": "12.8.93",
+    "source_sha256": {
+      "flash-attention-v100/flash_attn_v100/flash_attn_interface.py": "c639d26bdb7b9a09c2369e2b654796f623d89974f8b8ff9fe96d41084ff0f93b",
+      "flash-attention-v100/kernel/flash_decode_paged.cu": "08b7eee89903d25172b47bd9565717718bfd42124d2c03fd46a4a23a0795efcc",
+      "flash-attention-v100/include/fused_mha.h": "ff0d3449958fc5c15586523c9c7a07f3e796bb2323b49be3140d3b529d6701b9",
+      "flash-attention-v100/kernel/fused_mha_api.cpp": "60ad8e3d99abcbd84db30c50c555738d37739383d64af3c7fd08256801143222",
+      "vllm/v1/attention/backends/flash_attn_v100.py": "8b9a1c34e73a85d0ef8d334e386f5cd9e84ea8136b00cc39edfa2c40242d6789",
+      "vllm/v1/attention/ops/common.py": "0607a65b87041b5f70ab244af681bca8d19e945a8816a3cbda2d6cce48ddf56d"
+    },
+    "binary_sha256": {
+      "flash_attn_v100_cuda.cpython-312-x86_64-linux-gnu.so": "ad5a8d31cab8a6ebfecd13bd5b13d0ff2e5d0ddddf0a00685ae69f6f7cee42b0",
+      "paged_kv_utils.cpython-312-x86_64-linux-gnu.so": "fab66ab5d8235c42563684e478b120dc231d6693a7f9e37249c8fc5228e55f08"
+    },
+    "abi_import_passed": true,
+    "shared_venv_modified": false
+  },
+  "gpu_direct_lse_tests": {
+    "passed": 4,
+    "failed": 0,
+    "selected": [
+      "scalar direct LSE versus workspace and dense reference",
+      "XQA direct LSE versus workspace and dense reference",
+      "return_lse=false leaves workspace untouched",
+      "extension writes a strided FP32 LSE view"
+    ],
+    "coverage": "empty/uneven sequence lengths [0,257,513], scalar, XQA, strided output"
+  },
+  "mtp4": {
+    "correctness": {
+      "needle_8k": {"prompt_tokens": 7984, "passed": true, "elapsed_s": 5.859746282920241},
+      "needle_32k": {"prompt_tokens": 31988, "passed": true, "elapsed_s": 9.229896882548928},
+      "needle_128k": {"prompt_tokens": 127493, "passed": true, "elapsed_s": 66.2422500345856},
+      "repeated_prefix_32k": {
+        "prompt_tokens": 31987,
+        "passed": [true, true],
+        "elapsed_s": [9.046583929099143, 9.039163708686829]
+      }
+    },
+    "capacity": {
+      "qualified_startup_kv_tokens": 2090088,
+      "final_active_kv_tokens": 2097152,
+      "available_kv_memory_gib": 18.02,
+      "cuda_graph_gib": 4.88
+    },
+    "benchmark": {
+      "single_median_tok_s": 50.69507185622528,
+      "single_runs_tok_s": [52.64511642449567, 47.52253821408146, 50.69507185622528],
+      "single_accepted_drafts_per_step": 1.414442700156986,
+      "c32_median_aggregate_tok_s": 360.0947758988268,
+      "c32_cohorts_tok_s": [310.0406653865046, 360.0947758988268, 378.9248530451382],
+      "c32_accepted_drafts_per_step": 1.5199958982772765,
+      "prior_same_harness_single_median_tok_s": 51.46405522304799,
+      "prior_same_harness_c32_median_tok_s": 377.00459559245843,
+      "single_change_pct": -1.4942144832736037,
+      "c32_change_pct": -4.485308638494989
+    }
+  },
+  "no_mtp": {
+    "correctness_smoke": {"needle_8k_prompt_tokens": 7985, "passed": true, "elapsed_s": 3.3032044833526015},
+    "capacity": {"kv_tokens": 2326331, "available_kv_memory_gib": 18.09, "cuda_graph_gib": 0.46},
+    "benchmark": {
+      "single_median_tok_s": 55.19225057827876,
+      "single_runs_tok_s": [55.17621186131725, 55.19225057827876, 55.304895500687245],
+      "c32_median_aggregate_tok_s": 430.50893710483143,
+      "c32_cohorts_tok_s": [415.8892723192084, 430.50893710483143, 435.01012507148283]
+    }
+  },
+  "profile": {
+    "nvtx_enabled_only_for_profile": true,
+    "custom_ranges": 58968,
+    "calls_per_stage_per_rank": 819,
+    "lse_reconstruction_count": 0,
+    "stage_host_spans_us": {
+      "local_attention": {"mean": 132.72580296092795, "median": 22.5355, "p90": 26.6671},
+      "query_all_gather": {"mean": 174.7026166056166, "median": 167.4065},
+      "lse_all_gather": {"mean": 160.5995666971917, "median": 155.6105},
+      "output_reduce_scatter": {"mean": 134.85249557387058, "median": 122.154},
+      "output_correction": {"mean": 78.54613583638583, "median": 76.0805}
+    },
+    "collective_mean_total_us": 470.1546788766789,
+    "prior_lse_reconstruction_mean_us": 306.227,
+    "prior_local_attention_mean_us": 22.867,
+    "direct_local_attention_median_us": 22.5355,
+    "cuda_kernel_tables_present": false,
+    "trace": {
+      "nsys_rep": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/direct-lse-53893bfb47-all-ranks.nsys-rep",
+      "nsys_rep_sha256": "ab974500c6013c41d1fd7402fdbc8a5fde5a98eeaaf817f2d00eb786ff5b6bfa",
+      "sqlite": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/direct-lse-53893bfb47-all-ranks.sqlite",
+      "sqlite_sha256": "2f5ef368fd40fec958690e78f06ef70343b4c3713e143c132be781b324c0d483"
+    }
+  },
+  "artifacts": {
+    "correctness_json_sha256": "cb953bd0b449bcd4f59494f731f1bc2f7e7c9ae18c9fb963b84fd1dfe7b6de18",
+    "mtp4_benchmark_json_sha256": "7d36882f4f1232667870e801a019d4413459494f971b950f8543173b3bd721ae",
+    "no_mtp_benchmark_json_sha256": "a3f0855af229aa4c5945a67dbd5fed710d1b0e9797233daec7a47f2a151e47c2",
+    "nvtx_analysis_json_sha256": "f960ea54a2a8ae9f801bf194919d9c8f7d2fc60d8c2f279a0f944bca6c440402"
+  },
+  "verdict": {
+    "correctness": "qualified",
+    "component": "qualified: the separate LSE reconstruction range was eliminated",
+    "overall_performance": "inconclusive/not promoted: c1 was within 2% of the prior median but c32 was 4.49% lower with high cohort variance",
+    "next_bottleneck": "query all-gather + LSE all-gather + output reduce-scatter, 470.15 us mean host span per call in aggregate; then q>1 per-request correction scaling",
+    "capacity_note": "MTP4 passes the 2.0M floor; no-MTP at utilization 0.78 measured 2.326M and does not meet the plan's 2.48M floor"
+  },
+  "final_state": {
+    "qwen38-27b-fp8-tp8": "0/0",
+    "qwen38-27b-fp8-tp8-dcp2": "1/1 healthy, native MTP4, NVTX disabled",
+    "gateway_changed": false,
+    "gateway_yaml_sha256": "adedf22babdc6478f33ab1d6b0d74e37991aeac517abe50e8f89808f82f146b7",
+    "gateway_target": "http://qwen38-27b-fp8-tp8.llm.svc.cluster.local/v1"
+  }
+}

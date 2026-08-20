@@ -2,9 +2,10 @@
 
 ## Decision
 
-Keep TP8+DCP2 as the architecture.  Optimize the correctness-qualified DCP
-path for both native MTP4 and no-speculation operation, while retaining the
-known TP8+DCP1 service as the rollback target.
+Keep TP8+DCP2 as the architecture. Optimize the correctness-qualified DCP
+path for both native MTP4 and no-speculation operation. TP8+DCP1 is a
+historical control, not a mandatory live rollback target on experimental
+gpu-01.
 
 Native **MTP4 is the standard speculative configuration** for this campaign.
 MTP3 is not an experimental axis: if MTP4 becomes fast, MTP3 is expected to
@@ -59,7 +60,7 @@ wrong.
 - TP4×CP2 external context parallelism.
 - MTP3 tuning or MTP3-vs-MTP4 selection.
 - Approximate acceptance policies or any target-distribution change.
-- Gateway changes or production promotion without explicit approval.
+- Gateway changes or traffic retargeting without explicit approval.
 
 ## Execution sequence
 
@@ -139,9 +140,12 @@ footprint <=5.12 GiB.  The final goal is >=85% of the appropriate same-commit
 DCP1 control.  If the published anchors are reproduced under the same harness,
 use 107 tok/s single and 1,470 tok/s c32 as absolute promotion floors.
 
-The production TP8+MTP4 deployment stays the rollback target.  One all-GPU
-canary may replace it only after manifest/config capture; the gateway remains
-unchanged and production is restored after every failed gate.
+gpu-01 is an experimentation node. Keep the current TP8+DCP2 candidate active
+between successful iterations so the next focused fix can use it directly;
+leave the old TP8 control scaled to zero unless an experiment specifically
+needs it. The gateway remains unchanged unless the operator explicitly asks to
+retarget it. A technically broken candidate must be stopped, but there is no
+mandatory end-of-run restoration to TP8+DCP1.
 
 ## DFlash2 decision gate
 
