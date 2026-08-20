@@ -12,6 +12,7 @@ from __future__ import annotations
 import argparse
 import hashlib
 import json
+import re
 import statistics
 import time
 import urllib.request
@@ -31,6 +32,48 @@ def post_json(base_url: str, path: str, payload: dict[str, Any]) -> dict[str, An
     )
     with urllib.request.urlopen(request, timeout=1800) as response:
         return json.load(response)
+
+
+def get_spec_metrics(base_url: str) -> dict[str, float]:
+    with urllib.request.urlopen(f"{base_url}/metrics", timeout=30) as response:
+        text = response.read().decode()
+    names = {
+        "vllm:spec_decode_num_drafts_total",
+        "vllm:spec_decode_num_draft_tokens_total",
+        "vllm:spec_decode_num_accepted_tokens_total",
+    }
+    values: dict[str, float] = {}
+    for line in text.splitlines():
+        if not line or line.startswith("#"):
+            continue
+        name = line.split("{", 1)[0]
+        if name in names:
+            values[name] = float(line.rsplit(" ", 1)[1])
+        elif name == "vllm:spec_decode_num_accepted_tokens_per_pos_total":
+            match = re.search(r'position="(\d+)"', line)
+            if match:
+                values[f"accepted_position_{match.group(1)}"] = float(
+                    line.rsplit(" ", 1)[1]
+                )
+    return values
+
+
+def metric_delta(before: dict[str, float], after: dict[str, float]) -> dict[str, Any]:
+    delta = {
+        key: after.get(key, 0.0) - before.get(key, 0.0)
+        for key in before.keys() | after.keys()
+    }
+    drafts = delta.get("vllm:spec_decode_num_draft_tokens_total", 0.0)
+    steps = delta.get("vllm:spec_decode_num_drafts_total", 0.0)
+    accepted = delta.get("vllm:spec_decode_num_accepted_tokens_total", 0.0)
+    return {
+        "raw_delta": delta,
+        "draft_steps": steps,
+        "draft_tokens": drafts,
+        "accepted_tokens": accepted,
+        "acceptance": accepted / drafts if drafts else None,
+        "accepted_per_step": accepted / steps if steps else None,
+    }
 
 
 def tokenize_chat(base_url: str, model: str, content: str) -> list[int]:
@@ -203,6 +246,7 @@ def run_single(
     )
     warmup = run_completion(base_url, model, warmup_prompt, 32)
 
+    metrics_before = get_spec_metrics(base_url)
     results = []
     for run_index in range(runs):
         prompt = render_fixed_prompt(
@@ -229,6 +273,52 @@ def run_single(
         "mean_tok_s": statistics.mean(rates),
         "min_tok_s": min(rates),
         "max_tok_s": max(rates),
+        "spec_decode": metric_delta(metrics_before, get_spec_metrics(base_url)),
+    }
+
+
+def run_aggregate_cohort(
+    base_url: str,
+    model: str,
+    concurrency: int,
+    prompt_tokens: int,
+    output_tokens: int,
+    label: str,
+) -> dict[str, Any]:
+    prompts = [
+        render_fixed_prompt(
+            base_url,
+            model,
+            prompt_tokens,
+            f"{label}-{i}-{uuid.uuid4().hex}",
+        )
+        for i in range(concurrency)
+    ]
+    started = time.perf_counter()
+    results: list[RequestResult] = []
+    with ThreadPoolExecutor(max_workers=concurrency) as executor:
+        futures = [
+            executor.submit(
+                run_completion,
+                base_url,
+                model,
+                prompt,
+                output_tokens,
+            )
+            for prompt in prompts
+        ]
+        for future in as_completed(futures):
+            results.append(future.result())
+    wall_s = time.perf_counter() - started
+    total_tokens = sum(result.completion_tokens for result in results)
+    return {
+        "wall_s": wall_s,
+        "completion_tokens": total_tokens,
+        "aggregate_tok_s": total_tokens / wall_s,
+        "request_tok_s_mean": statistics.mean(result.tok_s for result in results),
+        "request_elapsed_s_min": min(result.elapsed_s for result in results),
+        "request_elapsed_s_max": max(result.elapsed_s for result in results),
+        "requests": [asdict(result) for result in results],
     }
 
 
@@ -240,47 +330,28 @@ def run_aggregate(
     output_tokens: int,
     runs: int,
 ) -> dict[str, Any]:
-    cohorts = []
-    for cohort_index in range(runs):
-        prompts = [
-            render_fixed_prompt(
-                base_url,
-                model,
-                prompt_tokens,
-                f"c{concurrency}-{cohort_index}-{i}-{uuid.uuid4().hex}",
-            )
-            for i in range(concurrency)
-        ]
-        started = time.perf_counter()
-        results: list[RequestResult] = []
-        with ThreadPoolExecutor(max_workers=concurrency) as executor:
-            futures = [
-                executor.submit(
-                    run_completion,
-                    base_url,
-                    model,
-                    prompt,
-                    output_tokens,
-                )
-                for prompt in prompts
-            ]
-            for future in as_completed(futures):
-                results.append(future.result())
-        wall_s = time.perf_counter() - started
-        total_tokens = sum(result.completion_tokens for result in results)
-        cohorts.append(
-            {
-                "wall_s": wall_s,
-                "completion_tokens": total_tokens,
-                "aggregate_tok_s": total_tokens / wall_s,
-                "request_tok_s_mean": statistics.mean(
-                    result.tok_s for result in results
-                ),
-                "request_elapsed_s_min": min(result.elapsed_s for result in results),
-                "request_elapsed_s_max": max(result.elapsed_s for result in results),
-                "requests": [asdict(result) for result in results],
-            }
+    # Warm the exact c=N scheduler/graph shape separately. This cohort is
+    # retained for diagnostics but excluded from measured summaries.
+    warmup = run_aggregate_cohort(
+        base_url,
+        model,
+        concurrency,
+        prompt_tokens,
+        min(64, output_tokens),
+        f"c{concurrency}-warmup",
+    )
+    metrics_before = get_spec_metrics(base_url)
+    cohorts = [
+        run_aggregate_cohort(
+            base_url,
+            model,
+            concurrency,
+            prompt_tokens,
+            output_tokens,
+            f"c{concurrency}-{cohort_index}",
         )
+        for cohort_index in range(runs)
+    ]
     rates = [cohort["aggregate_tok_s"] for cohort in cohorts]
     return {
         "settings": {
@@ -292,11 +363,13 @@ def run_aggregate(
             "ignore_eos": True,
             "unique_prompts": True,
         },
+        "warmup": warmup,
         "cohorts": cohorts,
         "median_aggregate_tok_s": statistics.median(rates),
         "mean_aggregate_tok_s": statistics.mean(rates),
         "min_aggregate_tok_s": min(rates),
         "max_aggregate_tok_s": max(rates),
+        "spec_decode": metric_delta(metrics_before, get_spec_metrics(base_url)),
     }
 
 

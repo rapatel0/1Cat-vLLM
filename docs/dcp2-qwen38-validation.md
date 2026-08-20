@@ -78,8 +78,89 @@ could OOM. At `0.78`:
 - 31,683-token prefix request repeated twice returned
   `PREFIX32_DCP2_4C91` exactly both times (10.10 s and 9.79 s).
 
-MTP4 at 128K and aggregate-concurrency throughput were not rerun before the
-maintenance window ended. Consequently the canary was not promoted.
+### Final MTP4 promotion gate (2026-08-20)
+
+The remaining gate was run from the direct canary service with the
+commit-labelled `18dd13ac6e` implementation overlay. The deployment retained
+TP8, DCP2, MTP4, `max-num-seqs=32`, `max-num-batched-tokens=16384`, and
+`gpu-memory-utilization=0.78`. This start reported 2,090,088 KV-cache tokens
+(`7.97x` 262K concurrency) and the same 4.88 GiB CUDA-graph footprint.
+
+The durable machine-readable summary is
+[`dcp2-qwen38-final-benchmark.json`](dcp2-qwen38-final-benchmark.json). The
+full temporary result was
+`/tmp/dcp2-mtp4-final-artifacts/dcp2-mtp4-final-v2.json`, SHA256
+`344250da2b3ca3483a0de6ff1274b8e4b7f1e32ba6663b5fa54e8789aa08a831`.
+
+#### Correctness
+
+The exact needle gate passed at 127,496 server-reported prompt tokens. The
+secret `DCP2_MTP4_128K_7C653486A1` was returned exactly in 66.5687 seconds
+(23 completion tokens, stop finish reason). This closes the remaining MTP4
+128K correctness item.
+
+#### Cache-safe throughput methodology
+
+All measured requests went directly to vLLM, not through the LiteLLM/Redis
+router. They were non-streaming, counted from server
+`usage.completion_tokens`, used an early unique nonce in every prompt, and
+therefore could not be response-cache hits or long shared-prefix hits. Greedy
+sampling (`temperature=0`, `top_p=1`, `ignore_eos=true`) made every measured
+request return its full token budget. A separate warmup preceded both shapes.
+
+Single stream used approximately 1,024 prompt tokens and 512 completion tokens:
+
+| Run | Completion tokens | API wall (s) | tok/s |
+|---:|---:|---:|---:|
+| 1 | 512 | 9.9487 | 51.4641 |
+| 2 | 512 | 9.2901 | 55.1125 |
+| 3 | 512 | 9.9513 | 51.4507 |
+| **median** | — | — | **51.4641** |
+
+The measured single-stream MTP draft acceptance was 36.03% (908 accepted of
+2,520 drafted tokens; 1.441 accepted tokens per verifier step).
+
+Aggregate throughput used 32 concurrent requests, each with approximately 256
+prompt tokens and exactly 256 completion tokens. A separate c32 warmup produced
+2,048 tokens in 7.0769 seconds and was excluded:
+
+| Cohort | Requests | Completion tokens | Cohort wall (s) | Aggregate tok/s |
+|---:|---:|---:|---:|---:|
+| 1 | 32 | 8,192 | 22.1466 | 369.8982 |
+| 2 | 32 | 8,192 | 21.1593 | 387.1580 |
+| 3 | 32 | 8,192 | 21.7292 | 377.0046 |
+| **median** | — | — | — | **377.0046** |
+
+Measured c32 draft acceptance was 37.39% (14,726 accepted of 39,388 drafted
+tokens; 1.495 accepted tokens per verifier step).
+
+#### Baseline comparison and decision
+
+The historical TP8+MTP4 anchors are 126 tok/s single and 1,730 tok/s at c32.
+Their original prompt lengths, output lengths, exact warmup policy, and whether
+prefill was excluded were not retained, so this is not a perfectly matched
+A/B. The final gate includes API wall time and uses explicitly unique prompts;
+those choices make it stricter than a decode-only or repeated-prefix test.
+However, the gaps are too large to attribute to that methodological difference:
+51.4641 is 40.84% of the single anchor (-59.16%), and 377.0046 is 21.79% of the
+c32 anchor (-78.21%). The DCP cross-rank query/LSE output correction remains a
+large throughput tax, and low MTP acceptance on this workload compounds it.
+
+**Promotion gate: failed on performance.** Correctness and memory capacity
+passed, but traffic was not moved to DCP2. The canary was scaled back to zero
+and the TP8+MTP4 baseline was restored.
+
+Exact benchmark command inside the canary pod:
+
+```bash
+/opt/venv/bin/python /tmp/benchmark_qwen38_dcp2_service.py \
+  --base-url http://127.0.0.1:8000 \
+  --output /tmp/dcp2-mtp4-final-v2.json \
+  --needle-target-tokens 127500 \
+  --single-prompt-tokens 1024 --single-output-tokens 512 --single-runs 3 \
+  --aggregate-concurrency 32 --aggregate-prompt-tokens 256 \
+  --aggregate-output-tokens 256 --aggregate-runs 3
+```
 
 ## Final live state
 
