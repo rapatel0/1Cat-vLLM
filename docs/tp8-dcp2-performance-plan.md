@@ -101,6 +101,10 @@ Implement and validate one focused change per commit, in this order:
    avoiding redundant tensor materialization or reduction kernels.
 3. Honor and benchmark the configured DCP communication backend at the real
    V100 DCP2 shapes; compare AG+RS and packed A2A only where both are exact.
+   **Completed:** packed A2A is correctness/graph-qualified at `b996cc4a39`,
+   removes one collective and 28.57% of the median annotated combine envelope,
+   improves no-MTP, and keeps MTP4 within the 2% regression bound. See
+   `docs/tp8-dcp2-a2a-live-qualification.md`.
 4. Restore an eligible small-query/XQA route under DCP only if exact LSE,
    uneven local lengths, prefix cache, and graph replay are preserved.
 5. Overlap query all-gather with independent replicated causal-suffix work,

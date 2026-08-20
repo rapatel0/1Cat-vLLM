@@ -1,0 +1,121 @@
+{
+  "date": "2026-08-20",
+  "hardware": "gpu-01: 8 x Tesla V100-SXM2-32GB",
+  "source": {
+    "final_commit": "b996cc4a393459075317d2d8fa24227612c003d9",
+    "implementation_commits": [
+      "fd35ee3ebc1a0b0511cedbf8d575557eefdee901",
+      "c871231ce0c7e92d70f859b38fd79a4866883e63",
+      "b90526dda6ba64dd7d2be7391df628f40b2257b4",
+      "afd63b96f5463e5d2b42a9e880eb3151a036f681",
+      "b996cc4a393459075317d2d8fa24227612c003d9"
+    ],
+    "direct_lse_binary_source_commit": "53893bfb47c847aa0e4fe5d01ff77b560516223d"
+  },
+  "projection": {
+    "host_path": "/localpool/onecat-vllm-hy3-sm70/dcp2-branch-b996cc4a39",
+    "container_path": "/workspace/dcp2-branch-b996cc4a39",
+    "sha256sums_sha256": "275acce27affb78cd772a7a846f612634d6fedcdd200657fe80966ca3bae5c64",
+    "flash_v100_binary_sha256": "ad5a8d31cab8a6ebfecd13bd5b13d0ff2e5d0ddddf0a00685ae69f6f7cee42b0",
+    "shared_venv_modified": false
+  },
+  "configuration": {
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 2,
+    "dcp_comm_backend": "a2a",
+    "speculator": "native MTP4",
+    "attention_backend": "FLASH_ATTN_V100",
+    "gpu_memory_utilization": 0.78,
+    "max_model_len": 262144,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384
+  },
+  "tests": {
+    "cpu_source_dcp": "13 passed",
+    "v100_a2a": "32 passed, 4 skipped",
+    "v100_a2a_coverage": [
+      "fp16/bf16/fp32 packed LSE round trip",
+      "base-e/base-2 combine",
+      "empty shard semantics",
+      "stable non-aliasing workspace and persistent buffers",
+      "two-rank NCCL all_to_all with workspace"
+    ],
+    "needle_8k": true,
+    "needle_32k": true,
+    "needle_128k": true,
+    "repeated_prefix_32k": [true, true]
+  },
+  "mtp4": {
+    "a2a": {
+      "single_median_tok_s": 50.75348508323885,
+      "single_runs_tok_s": [50.281704492449336, 52.24764000214805, 50.75348508323885],
+      "c32_median_tok_s": 356.4300767168394,
+      "c32_cohorts_tok_s": [356.3245441774181, 356.4300767168394, 391.03705711042915],
+      "single_accepted_drafts_per_step": 1.352760736196319,
+      "c32_accepted_drafts_per_step": 1.5017815331365163
+    },
+    "ag_rs_direct_lse": {
+      "single_median_tok_s": 50.6951,
+      "c32_median_tok_s": 360.0948
+    },
+    "a2a_change_pct": {
+      "single": 0.11516908584627839,
+      "c32": -1.0177106926177903
+    }
+  },
+  "no_mtp": {
+    "a2a": {
+      "single_median_tok_s": 55.80016734619536,
+      "single_runs_tok_s": [55.86439598444924, 55.791486197955344, 55.80016734619536],
+      "c32_median_tok_s": 441.3469767163283,
+      "c32_cohorts_tok_s": [441.3469767163283, 443.981251314419, 435.82871095040525]
+    },
+    "ag_rs_direct_lse": {
+      "single_median_tok_s": 55.1923,
+      "c32_median_tok_s": 430.5089
+    },
+    "a2a_change_pct": {
+      "single": 1.1013625925996084,
+      "c32": 2.517503521141684
+    }
+  },
+  "profile": {
+    "calls_per_stage_all_ranks": 6384,
+    "query_all_gather_median_us": 165.4815,
+    "a2a_pack_median_us": 61.507,
+    "a2a_all_to_all_median_us": 118.917,
+    "a2a_unpack_median_us": 74.3495,
+    "a2a_combine_median_host_envelope_us": 254.7735,
+    "ag_rs_combine_median_host_envelope_us": 356.678,
+    "combine_host_envelope_change_pct": -28.57044729419812,
+    "lse_all_gather_occurrences": 0,
+    "output_reduce_scatter_occurrences": 0,
+    "collectives_per_decode_attention_call": {
+      "ag_rs": 3,
+      "a2a": 2
+    },
+    "nsys_report": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/a2a-b996cc4a39-all-ranks.nsys-rep",
+    "nsys_report_sha256": "7c816e474c690d383ebb81a880c7831dcba8c98b50b5ba4491ef62d214a3872d",
+    "sqlite": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/a2a-b996cc4a39-all-ranks.sqlite",
+    "sqlite_sha256": "de223333b5e1ba675f22907ab9666042b5170724b0791969f86c9812e3fd11cc",
+    "device_kernel_tables_available": false
+  },
+  "raw_artifacts": {
+    "mtp4_benchmark_sha256": "d3ca0dfb08ccd25f3f96b162867816489d94378cb801a99f4d922f1e6710b815",
+    "long_gates_sha256": "faf68035453271569acc7e1162b16d38322fad74970608aa041b0c13623c380d",
+    "no_mtp_benchmark_sha256": "d4524558293453248f7d38c391a9f05cea5824fca57e3a063e29054d844b1d0b"
+  },
+  "final_live_state": {
+    "dcp2_replicas_ready": "1/1",
+    "old_tp8_replicas": "0/0",
+    "backend": "a2a",
+    "speculator": "native MTP4",
+    "kv_cache_tokens": 2090088,
+    "cuda_graph_gib": 4.13,
+    "health": true,
+    "gateway_modified": false,
+    "gateway_target": "http://qwen38-27b-fp8-tp8.llm.svc.cluster.local/v1"
+  },
+  "decision": "retain a2a on the experimental DCP2 service",
+  "decision_reason": "A2A passed all correctness and graph gates, removes one collective and 28.57% of the median annotated combine envelope, improves no-MTP throughput, and keeps MTP4 within the 2% regression bound."
+}
