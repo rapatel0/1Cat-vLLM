@@ -998,6 +998,7 @@ def flash_attn_prefill_paged(
     v_scale: float = 1.0,
     causal: bool = True,
     window_size: tuple = (-1, -1),
+    return_lse: bool = False,
 ):
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
@@ -1014,7 +1015,7 @@ def flash_attn_prefill_paged(
     q_ = q.permute(0, 2, 1, 3).contiguous()
     out_ = out.permute(0, 2, 1, 3).contiguous() if out is not None else None
 
-    out_ = flash_attn_v100_cuda.prefill_paged_fwd(
+    out_, lse = flash_attn_v100_cuda.prefill_paged_fwd(
         q_,
         k_cache,
         v_cache,
@@ -1029,7 +1030,8 @@ def flash_attn_prefill_paged(
         int(window_size_left),
         int(window_size_right),
     )
-    return _copy_bhmd_to_bmhd_out(out_, out_original)
+    out = _copy_bhmd_to_bmhd_out(out_, out_original)
+    return (out, lse) if return_lse else out
 
 
 def flash_attn_prefill_paged_bfla(

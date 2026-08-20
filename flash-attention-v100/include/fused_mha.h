@@ -113,7 +113,7 @@ at::Tensor flash_attention_turboquant_decode_paged(
     const bool norm_correction
 );
 
-at::Tensor flash_attention_prefill_paged(
+std::vector<at::Tensor> flash_attention_prefill_paged(
     const at::Tensor& q,
     const at::Tensor& k_cache,
     const at::Tensor& v_cache,

@@ -3958,10 +3958,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         dcp_group = get_dcp_group()
         query_across_dcp = dcp_group.all_gather(query.contiguous(), dim=1)
-        key_cache, _ = _split_paged_kv_cache(kv_cache)
+        key_cache, value_cache = _split_paged_kv_cache(kv_cache)
         block_size = key_cache.shape[1]
-        num_kv_heads = key_cache.shape[2]
-        head_dim = key_cache.shape[3]
         causal = getattr(attn_metadata, "causal", True)
         window_size = self._flash_v100_window_size(causal)
 
@@ -4007,32 +4005,19 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         f"block table for sequence {i}: local_context_len="
                         f"{local_context_len}, required_blocks={required_blocks}"
                     )
-                k_context, v_context = _extract_contiguous_kv_from_paged_cache(
-                    kv_cache=kv_cache,
-                    block_table=context_block_table,
-                    seq_lens=local_context_kv_lens[i : i + 1],
-                    num_kv_heads=num_kv_heads,
-                    head_dim=head_dim,
-                    block_size=block_size,
-                    total_tokens=local_context_len,
-                )
-                k_context, v_context = _dequantize_fp8_contiguous_kv(
-                    k_context,
-                    v_context,
-                    self.kv_cache_dtype,
-                    float(layer._k_scale_float),
-                    float(layer._v_scale_float),
-                )
-                context_out, context_lse, _ = self.flash_attn_func(
+                context_out, context_lse = self.flash_attn_prefill_paged(
                     q_context,
-                    k_context.unsqueeze(0),
-                    v_context.unsqueeze(0),
-                    causal=False,
+                    key_cache,
+                    value_cache,
+                    context_block_table,
+                    local_context_kv_lens[i : i + 1],
                     softmax_scale=self.scale,
+                    kv_cache_dtype=self.kv_cache_dtype,
+                    k_scale=float(layer._k_scale_float),
+                    v_scale=float(layer._v_scale_float),
+                    causal=False,
                     window_size=window_size,
-                    softcap=self.logits_soft_cap,
-                    alibi_slopes=self.alibi_slopes,
-                    return_attn_probs=True,
+                    return_lse=True,
                 )
                 context_out = context_out.squeeze(0)
                 context_lse = context_lse.squeeze(0).transpose(0, 1).contiguous()

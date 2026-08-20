@@ -1828,7 +1828,7 @@ at::Tensor flash_attention_prefill_paged_splitkv(
     return out_fp16;
 }
 
-at::Tensor flash_attention_prefill_paged(
+std::vector<at::Tensor> flash_attention_prefill_paged(
     const at::Tensor& q,
     const at::Tensor& k_cache,
     const at::Tensor& v_cache,
@@ -1936,7 +1936,7 @@ at::Tensor flash_attention_prefill_paged(
     #undef LAUNCH_PAGED_BY_KV
     #undef LAUNCH_PAGED_TYPED
 
-    return out_fp16;
+    return {out_fp16, softmax_lse};
 }
 
 at::Tensor flash_attention_prefill_paged_bfla(

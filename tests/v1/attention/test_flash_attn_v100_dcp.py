@@ -196,6 +196,18 @@ class _StubImpl:
     flash_attn_func = staticmethod(_dense_attention)
 
     @staticmethod
+    def flash_attn_prefill_paged(q, *_args, **kwargs):
+        out, lse, _ = _dense_attention(
+            q,
+            _CURRENT_GROUP.local_k.unsqueeze(0),
+            _CURRENT_GROUP.local_v.unsqueeze(0),
+            causal=kwargs["causal"],
+            softmax_scale=kwargs["softmax_scale"],
+        )
+        assert kwargs["return_lse"]
+        return out, lse
+
+    @staticmethod
     def _flash_v100_window_size(_causal):
         return (-1, -1)
 
@@ -375,6 +387,14 @@ def test_dense_flash_exposes_existing_lse():
     source = FUSED_MHA_FORWARD.read_text()
     assert 'TORCH_CHECK(!return_softmax, "return_softmax not supported")' not in source
     assert "return {out_fp16, softmax_lse, p, rng_state};" in source
+
+
+def test_paged_prefill_exposes_existing_lse():
+    source = (
+        ROOT / "flash-attention-v100/kernel/fused_mha_forward_paged.cu"
+    ).read_text()
+    assert "std::vector<at::Tensor> flash_attention_prefill_paged(" in source
+    assert "return {out_fp16, softmax_lse};" in source
 
 
 def test_decode_workspace_lse_reconstruction():
