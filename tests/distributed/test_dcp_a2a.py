@@ -736,8 +736,10 @@ def _distributed_direct_query_gather_worker(env: dict[str, str]) -> None:
             local_heads, device=f"cuda:{local_rank}", dtype=torch.float16
         ).view(1, local_heads, 1)
         dim_values = (
-            torch.arange(head_dim, device=f"cuda:{local_rank}") % 7
-        ).to(torch.float16).view(1, 1, head_dim)
+            (torch.arange(head_dim, device=f"cuda:{local_rank}") % 7)
+            .to(torch.float16)
+            .view(1, 1, head_dim)
+        )
         local = token_values + 10 * head_values + dim_values + 1000 * rank
         backing = torch.empty(
             tokens,
@@ -799,9 +801,7 @@ def _distributed_direct_query_gather_worker(env: dict[str, str]) -> None:
                 )
                 for tensor in buffers
             )
-            assert all(
-                left[1] <= right[0] for left, right in zip(spans, spans[1:])
-            )
+            assert all(left[1] <= right[0] for left, right in zip(spans, spans[1:]))
             spans_by_key.append(spans)
         assert len(spans_by_key) >= 3
     finally:

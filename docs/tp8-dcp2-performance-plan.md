@@ -95,8 +95,13 @@ and collective counts are recorded; instrumentation is disabled by default.
 Implement and validate one focused change per commit, in this order:
 
 1. Reuse graph-stable query-gather, LSE, correction, output, and collective
-   work buffers.  Remove avoidable `contiguous`, temporary allocation, and
+   work buffers. Remove avoidable `contiguous`, temporary allocation, and
    Python-side workspace reconstruction in the hot decode path.
+   **Query gather completed:** runtime source `e276623a92` uses persistent
+   rank-major and head-major buffers with direct PyNCCL output. It preserves an
+   explicit coordinator fallback. The median annotated query-gather component
+   fell 37.81%, and c32 increased 7.01% to 637.5508 tok/s. See
+   `docs/tp8-dcp2-query-gather-workspace.md`.
 2. Return/write final local LSE directly from the decode reduction workspace,
    avoiding redundant tensor materialization or reduction kernels.
 3. Honor and benchmark the configured DCP communication backend at the real

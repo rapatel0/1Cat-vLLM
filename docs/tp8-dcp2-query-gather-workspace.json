@@ -1,0 +1,162 @@
+{
+  "date": "2026-08-20",
+  "branch": "experiment/qwen38-mtp-dcp2",
+  "runtime_source_commit": "e276623a9238ffd29a7b8258ebceae3384b4d101",
+  "projection_tip": "601f574e99d88bb1ca3274d689287e291738ee4c",
+  "baseline_tip": "ad7e729b680fb6922db9cecff2046b84ac0a0c59",
+  "configuration": {
+    "hardware": "gpu-01: 8 x Tesla V100-SXM2-32GB",
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 2,
+    "dcp_comm_backend": "a2a",
+    "speculator": "native MTP4",
+    "max_model_len": 262144,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384,
+    "gpu_memory_utilization": 0.78,
+    "direct_query_gather": true
+  },
+  "implementation": {
+    "input": "[tokens, local_heads, head_dim]",
+    "collect_buffer": "[dcp_rank, tokens, local_heads, head_dim]",
+    "output": "[tokens, dcp_rank * local_heads, head_dim]",
+    "communicator": "DCP GroupCoordinator device_communicator.pynccl_comm",
+    "workspace_key": [
+      "group name",
+      "device",
+      "CUDA stream",
+      "DCP world size",
+      "dtype",
+      "shape",
+      "stride"
+    ],
+    "fallback": "GroupCoordinator.all_gather(query.contiguous(), dim=1)",
+    "fallback_conditions": [
+      "feature disabled",
+      "torch.compile",
+      "meta or fake tensor",
+      "non-CUDA tensor",
+      "unsupported query rank",
+      "missing or disabled PyNCCL communicator",
+      "communicator world-size, rank, or device mismatch"
+    ],
+    "nvtx_stages": [
+      "query_gather_cache_acquire",
+      "query_gather_prepare_direct",
+      "query_all_gather_direct",
+      "query_gather_reformat",
+      "query_gather_prepare_fallback",
+      "query_all_gather_fallback"
+    ],
+    "route_counters": [
+      "dcp_query_gather_direct",
+      "dcp_query_gather_fallback"
+    ]
+  },
+  "tests": {
+    "cpu_source": "19 passed",
+    "distributed_direct_query_gather": "1 passed, 37 deselected",
+    "distributed_shape": {
+      "tokens": 160,
+      "local_heads": 3,
+      "head_dim": 256,
+      "ranks": 2,
+      "input": "strided"
+    },
+    "distributed_coverage": [
+      "rank and head order",
+      "numerical equivalence",
+      "same-stream pointer reuse",
+      "shape separation",
+      "stream separation",
+      "workspace non-aliasing",
+      "CUDA graph capture and replay with changed input"
+    ],
+    "correctness": {
+      "needle_8k": true,
+      "needle_32k": true,
+      "needle_128k": true,
+      "repeated_prefix_32k": [true, true],
+      "no_mtp_8k_smoke": true
+    }
+  },
+  "mtp4_performance": {
+    "direct": {
+      "single_median_tok_s": 51.017440116097376,
+      "single_runs_tok_s": [
+        54.55653714427609,
+        51.017440116097376,
+        50.711612616217465
+      ],
+      "c32_median_tok_s": 637.5508201431851,
+      "c32_cohorts_tok_s": [
+        637.5508201431851,
+        626.3068105917969,
+        677.9984008121563
+      ],
+      "accepted_drafts_per_step_c1": 1.373456790123457,
+      "accepted_drafts_per_step_c32": 1.5257806080525884
+    },
+    "qualified_a2a_batch_baseline": {
+      "single_three_run_median_tok_s": 49.41948787790178,
+      "single_seven_run_median_tok_s": 52.93403721070713,
+      "c32_median_tok_s": 595.8024159287131
+    },
+    "change_pct": {
+      "single_vs_official_three_run": 3.2334455633040493,
+      "single_vs_seven_run_followup": -3.620727221278486,
+      "c32": 7.007088776133319
+    }
+  },
+  "query_gather_profile": {
+    "direct_calls": 9856,
+    "fallback_calls": 0,
+    "worker_threads": 8,
+    "calls_per_worker": 1232,
+    "new_median_host_us": {
+      "cache_acquire": 25.5155,
+      "collective": 61.0155,
+      "reformat": 38.2355,
+      "prepare": 0.0,
+      "component_sum": 124.7665
+    },
+    "old_group_coordinator_median_host_us": 200.63,
+    "median_component_change_pct": -37.81264018342222,
+    "note": "Nsight exported NVTX host spans but no CUDA kernel tables."
+  },
+  "capacity": {
+    "mtp4_kv_tokens": 2097152,
+    "mtp4_cuda_graph_gib": 2.04,
+    "no_mtp_kv_tokens": 2326331,
+    "no_mtp_cuda_graph_gib": 0.46
+  },
+  "no_mtp_smoke": {
+    "needle_8k": true,
+    "single_128_output_tok_s": 50.26422974584816,
+    "c32_64_output_tok_s": 314.48616946384686,
+    "note": "Short smoke shapes are not comparable with retained full benchmarks."
+  },
+  "artifacts": {
+    "projection": "/localpool/onecat-vllm-hy3-sm70/dcp2-branch-e276623a92",
+    "projection_manifest_sha256": "bdf0ba5c098558158623d3ab7bd38beb3c0b5a3c78200e1e0bddac51db45af21",
+    "benchmark_sha256": "92dff2cad875cd1058944d63a537647fc19e2b686700635cdcda67132cf54387",
+    "long_correctness_sha256": "d14e4d8fd33d3bed7b94e75a835efad5189fe1f06d8f842c79a9b78dc6dc5dec",
+    "no_mtp_smoke_sha256": "cc27a9b442ce5726c3b6dde15dbfc8b4821381818eb72643a5a61d28f7eff035",
+    "nvtx_analysis_sha256": "3225ddf7d518890a0759850e1cefe81a15595d5df378d81e4e686e22fcbc6708",
+    "nsys": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/query-gather-direct-601f574e99-all-ranks.nsys-rep",
+    "nsys_sha256": "5e4ab0c344b568683445e83a2589ddf6af19aa1b7d07127fe413c6a0d8d45ca3",
+    "sqlite": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/query-gather-direct-601f574e99-all-ranks.sqlite",
+    "sqlite_sha256": "568277e33261c2299806b9c79b9e871ac922df0cf14c483185a994516be5b9c4"
+  },
+  "source_hashes": {
+    "vllm/v1/attention/backends/flash_attn_v100.py": "c4ce8928a8c83a3e86cb56bdbeb7c9d5621837aa05227be89d6e08a51d2a1c3c",
+    "vllm/v1/attention/ops/dcp_query_gather.py": "727b2ce92fab052bfb6a1f16ba650f2451eecda43b1d8e93ff770f84fcb48994"
+  },
+  "active_state": {
+    "qwen38-27b-fp8-tp8": "0/0",
+    "qwen38-27b-fp8-tp8-dcp2": "1/1 healthy",
+    "mode": "TP8+DCP2+A2A+native MTP4+uniform correction+direct query gather",
+    "nvtx": false,
+    "gateway_changed": false
+  }
+}

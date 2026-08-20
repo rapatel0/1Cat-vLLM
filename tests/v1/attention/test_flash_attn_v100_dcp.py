@@ -831,9 +831,7 @@ def test_dcp_decode_output_workspace_reuses_stable_storage():
 
 
 def test_dcp_query_gather_reformat_preserves_rank_head_order():
-    reformat = _load_top_level_function(
-        DCP_QUERY_GATHER, "_reformat_rank_major_query"
-    )
+    reformat = _load_top_level_function(DCP_QUERY_GATHER, "_reformat_rank_major_query")
     world_size, tokens, local_heads, head_dim = 2, 3, 2, 4
     rank_major = torch.empty(world_size, tokens, local_heads, head_dim)
     for rank in range(world_size):
@@ -898,12 +896,10 @@ def test_dcp_decode_profile_covers_hot_path_without_changing_output():
     for stages in rank_stages:
         assert expected_stages.issubset(stages)
         assert any(
-            stage.startswith("query_gather_prepare_fallback bytes=")
-            for stage in stages
+            stage.startswith("query_gather_prepare_fallback bytes=") for stage in stages
         )
         assert any(
-            stage.startswith("query_all_gather_fallback bytes=")
-            for stage in stages
+            stage.startswith("query_all_gather_fallback bytes=") for stage in stages
         )
         assert any(stage.startswith("lse_all_gather bytes=") for stage in stages)
         assert any(stage.startswith("output_reduce_scatter bytes=") for stage in stages)
@@ -916,8 +912,7 @@ def test_dcp_decode_a2a_profile_has_one_packed_collective():
     rank_stages = _run_decode_case(method, prefix_len=5, profile=True, backend="a2a")
     for stages in rank_stages:
         assert any(
-            stage.startswith("query_all_gather_fallback bytes=")
-            for stage in stages
+            stage.startswith("query_all_gather_fallback bytes=") for stage in stages
         )
         assert any(stage.startswith("a2a_pack bytes=") for stage in stages)
         assert any(stage.startswith("a2a_all_to_all bytes=") for stage in stages)
