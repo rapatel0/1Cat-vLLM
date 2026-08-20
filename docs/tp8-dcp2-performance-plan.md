@@ -126,6 +126,13 @@ Implement and validate one focused change per commit, in this order:
    z/b/a projection-slice copy by default. The seven-run c32 median increased
    from 678.638 to 734.934 tok/s, while completion tokens per verifier step
    stayed at 2.503 and KV capacity stayed at 2,097,152 tokens.
+7. **Audited, no candidate retained:** TP8 q=5 all-reduce uses PyNCCL because
+   the physical eight-GPU group lacks direct all-to-all NVLink. The custom
+   all-reduce route rejects this topology. NCCL already selects twelve
+   topology-aware ring channels. A graph microbenchmark favored Ring/LL with
+   24 channels, but the global setting reduced live c32 throughput to 614.622
+   tok/s. The qualified automatic PyNCCL policy remains active. See
+   `docs/tp8-dcp2-mtp4-tp-collective-campaign.md`.
 
 Each change first passes targeted unit/kernel tests and no-MTP/MTP4 graph and
 numerical tests, then a direct canary S1/c32 candidate gate.  Keep a change
