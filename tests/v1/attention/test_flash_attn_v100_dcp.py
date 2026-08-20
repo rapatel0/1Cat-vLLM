@@ -140,6 +140,7 @@ def _namespace():
         "cp_lse_ag_out_rs": _cp_lse_combine,
         "merge_attn_states": _merge_states,
         "_record_route": lambda _route: None,
+        "_is_cuda_graph_capturing": lambda _query: False,
     }
 
 
@@ -297,7 +298,7 @@ def _run_prefill_case(method, prefix_len):
             metadata,
             output,
         )
-        assert _CURRENT_GROUP.combine_calls == (1 if prefix_len else 0)
+        assert _CURRENT_GROUP.combine_calls == 1
         rank_outputs.append(output)
 
     actual = torch.cat(rank_outputs, dim=1)

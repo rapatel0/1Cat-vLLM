@@ -3931,24 +3931,19 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             return output
 
         query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
-        query_start_loc = (
+        query_start_loc_host = (
             query_start_loc_cpu
             if query_start_loc_cpu is not None
             else attn_metadata.query_start_loc
         )
-        query_start_loc = _normalize_query_start_loc_for_available_tokens(
-            query_start_loc,
+        query_start_loc_host = _normalize_query_start_loc_for_available_tokens(
+            query_start_loc_host,
             int(query.shape[0]),
         )
-        num_seqs = len(query_start_loc) - 1
+        num_seqs = len(query_start_loc_host) - 1
+        query_start_loc = attn_metadata.query_start_loc[: num_seqs + 1]
         query_lens = query_start_loc[1:] - query_start_loc[:-1]
-        query_lens = query_lens.to(
-            device=attn_metadata.seq_lens.device,
-            dtype=attn_metadata.seq_lens.dtype,
-        )
         context_kv_lens = attn_metadata.seq_lens[:num_seqs] - query_lens
-        if bool(torch.any(context_kv_lens < 0).item()):
-            raise RuntimeError("FLASH_ATTN_V100 DCP prefill received negative context")
         local_context_kv_lens = get_dcp_local_seq_lens(
             context_kv_lens,
             self.dcp_world_size,
@@ -3963,9 +3958,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         causal = getattr(attn_metadata, "causal", True)
         window_size = self._flash_v100_window_size(causal)
 
+        is_capturing = _is_cuda_graph_capturing(query)
         for i in range(num_seqs):
-            start = int(query_start_loc[i].item())
-            end = int(query_start_loc[i + 1].item())
+            start = int(query_start_loc_host[i].item())
+            end = int(query_start_loc_host[i + 1].item())
             if end <= start:
                 continue
 
@@ -3984,20 +3980,13 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 return_attn_probs=True,
             )
 
-            global_context_len = int(context_kv_lens[i].item())
-            if global_context_len == 0:
-                out_view[start:end].copy_(query_out.squeeze(0))
-                continue
-
-            local_context_len = int(local_context_kv_lens[i].item())
             q_context = query_across_dcp[start:end].unsqueeze(0)
-            if local_context_len > 0:
+            context_block_table = attn_metadata.block_table[i : i + 1]
+            if not is_capturing:
+                local_context_len = int(local_context_kv_lens[i].item())
                 required_blocks = (local_context_len + block_size - 1) // block_size
-                context_block_table = attn_metadata.block_table[
-                    i : i + 1, :required_blocks
-                ]
-                invalid_blocks = (context_block_table < 0) | (
-                    context_block_table >= key_cache.shape[0]
+                invalid_blocks = (context_block_table[:, :required_blocks] < 0) | (
+                    context_block_table[:, :required_blocks] >= key_cache.shape[0]
                 )
                 if bool(torch.any(invalid_blocks).item()):
                     raise RuntimeError(
@@ -4005,33 +3994,31 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                         f"block table for sequence {i}: local_context_len="
                         f"{local_context_len}, required_blocks={required_blocks}"
                     )
-                context_out, context_lse = self.flash_attn_prefill_paged(
-                    q_context,
-                    key_cache,
-                    value_cache,
-                    context_block_table,
-                    local_context_kv_lens[i : i + 1],
-                    softmax_scale=self.scale,
-                    kv_cache_dtype=self.kv_cache_dtype,
-                    k_scale=float(layer._k_scale_float),
-                    v_scale=float(layer._v_scale_float),
-                    causal=False,
-                    window_size=window_size,
-                    return_lse=True,
-                )
-                context_out = context_out.squeeze(0)
-                context_lse = context_lse.squeeze(0).transpose(0, 1).contiguous()
-            else:
-                # Every rank must enter the collectives even if this rank owns
-                # no tokens from a short prefix. -inf gives the empty shard
-                # zero weight in the global LSE correction.
-                context_out = torch.zeros_like(q_context.squeeze(0))
-                context_lse = torch.full(
-                    context_out.shape[:2],
-                    -float("inf"),
-                    dtype=torch.float32,
-                    device=context_out.device,
-                )
+            context_out, context_lse = self.flash_attn_prefill_paged(
+                q_context,
+                key_cache,
+                value_cache,
+                context_block_table,
+                local_context_kv_lens[i : i + 1],
+                softmax_scale=self.scale,
+                kv_cache_dtype=self.kv_cache_dtype,
+                k_scale=float(layer._k_scale_float),
+                v_scale=float(layer._v_scale_float),
+                causal=False,
+                window_size=window_size,
+                return_lse=True,
+            )
+            has_local_context = local_context_kv_lens[i : i + 1] > 0
+            context_out = torch.where(
+                has_local_context.view(1, 1, 1, 1),
+                context_out,
+                torch.zeros_like(context_out),
+            ).squeeze(0)
+            context_lse = torch.where(
+                has_local_context.view(1, 1, 1),
+                context_lse,
+                torch.full_like(context_lse, -float("inf")),
+            ).squeeze(0).transpose(0, 1).contiguous()
 
             context_out, context_lse = cp_lse_ag_out_rs(
                 context_out,
