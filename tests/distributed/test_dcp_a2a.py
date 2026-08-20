@@ -651,6 +651,15 @@ def _distributed_packed_a2a_worker(env: dict[str, str]) -> None:
             torch.testing.assert_close(actual_lse, expected_lse, rtol=1e-4, atol=1e-4)
         else:
             _assert_packed_a2a_close(actual, expected_out, dtype)
+
+        if use_graph:
+            from vllm.v1.attention.ops.dcp_alltoall import (
+                _dcp_a2a_persistent_buffer_cache,
+            )
+
+            del actual, graph, capture_stream
+            _dcp_a2a_persistent_buffer_cache.clear()
+            torch.cuda.synchronize()
     finally:
         if use_workspace:
             from vllm.v1.worker.workspace import reset_workspace_manager
