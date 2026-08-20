@@ -1,0 +1,133 @@
+{
+  "date": "2026-08-20",
+  "canonical_commit": "a6c7d817816cf6fc9289a1d00c117e19afbcb421",
+  "hardware": "gpu-01, 8 x Tesla V100-SXM2-32GB",
+  "runtime": {
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 2,
+    "speculative_method": "mtp",
+    "num_speculative_tokens": 4,
+    "target_attention_backend": "FLASH_ATTN_V100",
+    "draft_attention_backend": "FLASH_ATTN_V100",
+    "max_model_len": 262144,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384,
+    "gpu_memory_utilization": 0.78,
+    "cuda_device_order": "PCI_BUS_ID",
+    "dcp_comm_backend": "ag_rs",
+    "nvtx_enabled": true,
+    "nsys_version": "2025.6.3.541-256337736014v0"
+  },
+  "source_projection": {
+    "path": "/localpool/onecat-vllm-hy3-sm70/dcp2-branch-a6c7d81781",
+    "read_only": true,
+    "backend_sha256": "8b9a1c34e73a85d0ef8d334e386f5cd9e84ea8136b00cc39edfa2c40242d6789",
+    "common_sha256": "0607a65b87041b5f70ab244af681bca8d19e945a8816a3cbda2d6cce48ddf56d",
+    "interface_sha256": "95d399a079606907c25b80a4f72361efb58ca31dafff4623d3fd3e98daae634a"
+  },
+  "correctness": {
+    "needle_8k": {
+      "passed": true,
+      "prompt_tokens": 7983,
+      "elapsed_s": 13.1864
+    },
+    "needle_32k": {
+      "passed": true,
+      "prompt_tokens": 31986,
+      "elapsed_s": 9.2350
+    },
+    "needle_128k": {
+      "passed": true,
+      "prompt_tokens": 127496,
+      "elapsed_s": 66.5068
+    },
+    "repeated_prefix_32k": {
+      "passed": true,
+      "prompt_tokens": 31983,
+      "elapsed_s": [9.0093, 8.9694]
+    }
+  },
+  "capacity": {
+    "kv_cache_tokens": 2097152,
+    "cuda_graph_gib": 5.10,
+    "available_kv_cache_gib": 18.02,
+    "per_gpu_memory_used_mib_after_c32": [31880, 31880, 31958, 31958, 31880, 31880, 31958, 31958]
+  },
+  "candidate_sanity": {
+    "single": {
+      "prompt_tokens": 1024,
+      "completion_tokens": 512,
+      "runs": 1,
+      "tok_s": 49.4826,
+      "draft_steps": 211,
+      "accepted_draft_tokens": 300,
+      "accepted_per_step": 1.4218
+    },
+    "c32": {
+      "prompt_tokens_per_request": 256,
+      "completion_tokens_per_request": 256,
+      "cohorts": 1,
+      "aggregate_tok_s": 317.2760,
+      "draft_steps": 3227,
+      "accepted_draft_tokens": 4969,
+      "accepted_per_step": 1.5398
+    },
+    "performance_claim": "none: this was an unmatched one-run sanity check with NVTX and an idle Nsight wrapper enabled"
+  },
+  "profile": {
+    "workload": {
+      "single_completion_tokens": 384,
+      "single_verifier_steps": 173,
+      "c32_completion_tokens_total": 4096,
+      "c32_verifier_steps_sum": 1658
+    },
+    "all_eight_workers_present": true,
+    "annotated_dcp_calls_per_rank": 714,
+    "custom_ranges_per_rank": 7140,
+    "stage_host_spans": [
+      {"stage": "lse_reconstruction", "avg_us": 306.227, "share_pct": 32.37},
+      {"stage": "query_all_gather", "avg_us": 174.583, "share_pct": 18.45},
+      {"stage": "lse_all_gather", "avg_us": 169.379, "share_pct": 17.90},
+      {"stage": "output_reduce_scatter", "avg_us": 131.803, "share_pct": 13.93},
+      {"stage": "output_correction", "avg_us": 79.147, "share_pct": 8.37},
+      {"stage": "output_workspace_acquire", "avg_us": 29.420, "share_pct": 3.11},
+      {"stage": "output_copy", "avg_us": 25.338, "share_pct": 2.68},
+      {"stage": "local_attention", "avg_us": 22.867, "share_pct": 2.42},
+      {"stage": "query_prepare", "avg_us": 4.420, "share_pct": 0.47},
+      {"stage": "lse_prepare", "avg_us": 2.832, "share_pct": 0.30}
+    ],
+    "combined_collective_host_span_us": 475.765,
+    "combined_collective_share_pct": 50.28,
+    "annotated_dcp_host_span_sum_us": 946.016,
+    "largest_rank_skew": {
+      "stage": "lse_reconstruction",
+      "fastest_avg_us": 285.485,
+      "slowest_avg_us": 403.219,
+      "ratio": 1.412,
+      "slowest_pid": 649,
+      "slowest_rank": "TP1_DCP1"
+    },
+    "limitation": "Nsight captured NVTX on all ranks but no CUDA API or GPU kernel records; the same failure reproduced in a standalone torch CUDA self-test. Stage values are host range spans, not device kernel timings, and do not satisfy the plan's 90% device-time attribution exit gate.",
+    "artifacts": [
+      {
+        "path": "/srv/dev/dcp2-phase1-profile-a6c7d81781/dcp2-a6c7d81781-all-ranks.nsys-rep",
+        "sha256": "8bccdeb0fb297f33bc8e039cf6ed7a8fb40acda0e04b01414dadb59c21fb171b"
+      },
+      {
+        "path": "/srv/dev/dcp2-phase1-profile-a6c7d81781/dcp2-a6c7d81781-all-ranks.sqlite",
+        "sha256": "2352ca1ea84a26cab6f4e19be5512f69d475a366746750561a024f03c102f358"
+      },
+      {
+        "path": "/srv/dev/dcp2-phase1-profile-a6c7d81781/nsys-cuda-selftest.nsys-rep",
+        "sha256": "8aca7efcec5b72af6eb0c47b5f852967563a3e3cefa3b433c4e72401380a89a9"
+      }
+    ]
+  },
+  "final_cluster_state": {
+    "production": "qwen38-27b-fp8-tp8 1/1 ready",
+    "canary": "qwen38-27b-fp8-tp8-dcp2 0/0",
+    "production_health": "passed",
+    "gateway_sha256_before_after": "55af22359c276978d00015be45310e09156c8c0195a9a798ef4ffac209a74cb6",
+    "gateway_target": "http://qwen38-27b-fp8-tp8.llm.svc.cluster.local/v1"
+  }
+}
