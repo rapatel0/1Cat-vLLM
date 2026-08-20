@@ -11,6 +11,7 @@ import torch
 ROOT = Path(__file__).parents[3]
 BACKEND = ROOT / "vllm/v1/attention/backends/flash_attn_v100.py"
 FLASH_INTERFACE = ROOT / "flash-attention-v100/flash_attn_v100/flash_attn_interface.py"
+ATTENTION_UTILS = ROOT / "vllm/v1/attention/backends/utils.py"
 
 
 def _dense_attention(q, k, v, *, causal, softmax_scale, **_kwargs):
@@ -344,6 +345,18 @@ def _run_decode_case(method, prefix_len):
         softmax_scale=_StubImpl.scale,
     )
     torch.testing.assert_close(actual, expected.squeeze(0), rtol=1e-5, atol=1e-5)
+
+
+def test_rank_specific_dcp_local_seq_lens():
+    get_local_lens = _load_top_level_function(ATTENTION_UTILS, "get_dcp_local_seq_lens")
+    seq_lens = torch.tensor([0, 1, 2, 3, 7, 8, 9], dtype=torch.int64)
+    rank0 = get_local_lens(seq_lens, 2, 0, 2)
+    rank1 = get_local_lens(seq_lens, 2, 1, 2)
+    expected_rank0 = torch.tensor([0, 1, 2, 2, 4, 4, 5], dtype=torch.int32)
+    expected_rank1 = torch.tensor([0, 0, 0, 1, 3, 4, 4], dtype=torch.int32)
+    torch.testing.assert_close(rank0, expected_rank0)
+    torch.testing.assert_close(rank1, expected_rank1)
+    torch.testing.assert_close(rank0 + rank1, seq_lens.to(torch.int32))
 
 
 def test_dcp_prefill_matches_dense_attention():
