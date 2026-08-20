@@ -4224,6 +4224,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     dcp_lse,
                     dcp_group,
                     trace_range=trace_range,
+                    use_persistent_buffers=True,
                 )
                 _record_route("decode_scalar_paged_dcp_a2a")
             elif self.dcp_comm_backend == "ag_rs":

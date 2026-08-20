@@ -38,6 +38,12 @@ if TYPE_CHECKING:
     from vllm.v1.attention.ops.common import CPTritonContext
 
 
+_dcp_a2a_persistent_buffer_cache: dict[
+    tuple[object, ...],
+    tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None],
+] = {}
+
+
 def _lse_weighted_combine(
     outputs: torch.Tensor,
     lses: torch.Tensor,
@@ -176,6 +182,42 @@ def _dcp_a2a_call_buffers(
         else None
     )
     return send_buffer, recv_buffer, out, out_lse
+
+
+def _dcp_a2a_persistent_call_buffers(
+    comm_shape: tuple[int, ...],
+    out_shape: tuple[int, ...],
+    *,
+    device: torch.device,
+    dtype: torch.dtype,
+    return_lse: bool,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor | None]:
+    """Return per-stream, per-shape storage with CUDA-graph-stable addresses."""
+    if torch.compiler.is_compiling():
+        raise RuntimeError(
+            "DCP A2A persistent buffers must be acquired outside torch.compile."
+        )
+    stream_id = (
+        int(torch.cuda.current_stream(device).cuda_stream)
+        if device.type == "cuda"
+        else -1
+    )
+    key = (device, stream_id, comm_shape, out_shape, dtype, return_lse)
+    buffers = _dcp_a2a_persistent_buffer_cache.get(key)
+    if buffers is None:
+        lse_shape = out_shape[:-1]
+        buffers = (
+            torch.empty(comm_shape, device=device, dtype=dtype),
+            torch.empty(comm_shape, device=device, dtype=dtype),
+            torch.empty(out_shape, device=device, dtype=dtype),
+            (
+                torch.empty(lse_shape, device=device, dtype=torch.float32)
+                if return_lse
+                else None
+            ),
+        )
+        _dcp_a2a_persistent_buffer_cache[key] = buffers
+    return buffers
 
 
 @triton.jit
@@ -467,6 +509,7 @@ def dcp_a2a_lse_reduce(
     is_lse_base_on_e: bool = True,
     trace_range: Callable[[str], AbstractContextManager[None]] | None = None,
     allow_unmanaged_buffers: bool = False,
+    use_persistent_buffers: bool = False,
 ) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor]:
     """
     Combine partial attention outputs across DCP ranks using All-to-All.
@@ -517,14 +560,27 @@ def dcp_a2a_lse_reduce(
 
     comm_shape = (world_size, B, H_per_rank, D + lse_pack_dim)
     out_shape = (B, H_per_rank, D)
-    send_buffer, recv_buffer, out, out_lse = _dcp_a2a_call_buffers(
-        comm_shape,
-        out_shape,
-        device=cp_attn_out.device,
-        dtype=cp_attn_out.dtype,
-        return_lse=return_lse,
-        allow_unmanaged_buffers=allow_unmanaged_buffers,
-    )
+    if allow_unmanaged_buffers and use_persistent_buffers:
+        raise ValueError(
+            "DCP A2A cannot request both unmanaged and persistent buffers."
+        )
+    if use_persistent_buffers:
+        send_buffer, recv_buffer, out, out_lse = _dcp_a2a_persistent_call_buffers(
+            comm_shape,
+            out_shape,
+            device=cp_attn_out.device,
+            dtype=cp_attn_out.dtype,
+            return_lse=return_lse,
+        )
+    else:
+        send_buffer, recv_buffer, out, out_lse = _dcp_a2a_call_buffers(
+            comm_shape,
+            out_shape,
+            device=cp_attn_out.device,
+            dtype=cp_attn_out.dtype,
+            return_lse=return_lse,
+            allow_unmanaged_buffers=allow_unmanaged_buffers,
+        )
     payload_bytes = send_buffer.numel() * send_buffer.element_size()
 
     if trace_range is None:

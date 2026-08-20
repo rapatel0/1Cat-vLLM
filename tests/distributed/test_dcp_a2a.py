@@ -476,6 +476,41 @@ class TestPackedA2AKernels:
     @pytest.mark.skipif(
         torch.accelerator.device_count() < 1, reason="CUDA is required."
     )
+    def test_persistent_decode_buffers_are_stable_and_non_aliasing(self):
+        from vllm.v1.attention.ops.dcp_alltoall import (
+            _dcp_a2a_persistent_buffer_cache,
+            _dcp_a2a_persistent_call_buffers,
+        )
+
+        _dcp_a2a_persistent_buffer_cache.clear()
+        args = ((2, 32, 3, 258), (32, 3, 256))
+        first = _dcp_a2a_persistent_call_buffers(
+            *args,
+            device=torch.device("cuda"),
+            dtype=torch.float16,
+            return_lse=False,
+        )
+        second = _dcp_a2a_persistent_call_buffers(
+            *args,
+            device=torch.device("cuda"),
+            dtype=torch.float16,
+            return_lse=False,
+        )
+        assert all(left is right for left, right in zip(first, second))
+        spans = sorted(
+            (
+                tensor.data_ptr(),
+                tensor.data_ptr() + tensor.numel() * tensor.element_size(),
+            )
+            for tensor in first
+            if tensor is not None
+        )
+        assert all(left[1] <= right[0] for left, right in zip(spans, spans[1:]))
+        _dcp_a2a_persistent_buffer_cache.clear()
+
+    @pytest.mark.skipif(
+        torch.accelerator.device_count() < 1, reason="CUDA is required."
+    )
     def test_locked_workspace_allows_explicit_eager_prefill_buffers(self):
         from vllm.v1.attention.ops.dcp_alltoall import _dcp_a2a_call_buffers
         from vllm.v1.worker.workspace import (
