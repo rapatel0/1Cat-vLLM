@@ -112,6 +112,11 @@ Implement and validate one focused change per commit, in this order:
    `docs/tp8-dcp2-a2a-live-qualification.md`.
 4. Restore an eligible small-query/XQA route under DCP only if exact LSE,
    uneven local lengths, prefix cache, and graph replay are preserved.
+   **Tested and rejected:** source `deb0fa7da1` selected XQA only for exact DCP
+   q=1 shapes and passed all correctness/graph gates. However, MTP4 c1/c32
+   regressed 6.17%/6.50%, no-MTP c32 regressed 12.02%, and the annotated local
+   attention span did not improve. The qualified scalar route remains active.
+   See `docs/tp8-dcp2-xqa-decode.md`.
 5. Overlap query all-gather with independent replicated causal-suffix work,
    using graph-safe streams/events, only if the trace shows useful overlap.
 

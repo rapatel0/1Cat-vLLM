@@ -1,0 +1,140 @@
+{
+  "date": "2026-08-20",
+  "branch": "experiment/qwen38-mtp-dcp2",
+  "candidate_source_commit": "deb0fa7da1e1d6fc2a7ce69c274108b659ffcf7e",
+  "verdict": "rejected for performance; scalar DCP decode restored",
+  "configuration": {
+    "hardware": "gpu-01: 8 x Tesla V100-SXM2-32GB",
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 2,
+    "dcp_comm_backend": "a2a",
+    "speculator": "native MTP4",
+    "max_model_len": 262144,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384,
+    "gpu_memory_utilization": 0.78
+  },
+  "implementation": {
+    "scope": "DCP q=1 decode only",
+    "gathered_shape": "6 Q heads over 1 local KV head, head_dim 256",
+    "xqa_q_per_kv": 6,
+    "required_lse": "direct FP32 LSE from the existing XQA split-KV reduction",
+    "combine": "unchanged exact packed output/LSE A2A",
+    "fallback": "explicit scalar DCP paged decode",
+    "mtp_q_gt_1": "unchanged uniform prefix/suffix batch route"
+  },
+  "tests": {
+    "cpu_source": "22 passed",
+    "distributed_q1_xqa_a2a_graph": "1 passed, 38 deselected",
+    "correctness": {
+      "needle_8k": true,
+      "needle_32k": true,
+      "needle_128k": true,
+      "repeat_32k": [true, true],
+      "empty_uneven_local_lengths": true,
+      "strided_lse": true,
+      "prefix_cache": true,
+      "mtp_q_gt_1_excluded": true
+    }
+  },
+  "mtp4_performance": {
+    "candidate": {
+      "single_median_tok_s": 47.8690567382589,
+      "single_runs_tok_s": [
+        47.8690567382589,
+        47.83242168931135,
+        50.05757142472837
+      ],
+      "c32_median_tok_s": 596.0861947753866,
+      "c32_cohorts_tok_s": [
+        505.4918404481518,
+        596.0861947753866,
+        676.0369569057715
+      ],
+      "accepted_drafts_per_step_c1": 1.356814701378254,
+      "accepted_drafts_per_step_c32": 1.5084175084175084
+    },
+    "qualified_scalar_baseline": {
+      "single_median_tok_s": 51.0174,
+      "c32_median_tok_s": 637.5508
+    },
+    "change_pct": {
+      "single": -6.1711,
+      "c32": -6.5037
+    }
+  },
+  "no_mtp_performance": {
+    "candidate": {
+      "single_median_tok_s": 55.45407753847824,
+      "single_runs_tok_s": [
+        55.45407753847824,
+        55.322514965626084,
+        55.500478389731455
+      ],
+      "c32_median_tok_s": 388.29601748396084,
+      "c32_cohorts_tok_s": [
+        388.29601748396084,
+        383.7657118513122,
+        393.66125928052077
+      ]
+    },
+    "qualified_a2a_baseline": {
+      "single_median_tok_s": 55.8002,
+      "c32_median_tok_s": 441.347
+    },
+    "change_pct": {
+      "single": -0.6203,
+      "c32": -12.0202
+    },
+    "kv_tokens": 2326331,
+    "cuda_graph_gib": 0.46
+  },
+  "mtp4_capacity": {
+    "kv_tokens": 2097152,
+    "cuda_graph_gib": 2.04
+  },
+  "profile": {
+    "xqa_calls": 6744,
+    "xqa_calls_per_worker": 843,
+    "workers": 8,
+    "scalar_local_attention_calls": 0,
+    "xqa_local_attention_median_host_us": 22.7845,
+    "xqa_local_attention_p90_host_us": 27.614,
+    "qualified_scalar_local_attention_median_host_us": 22.59,
+    "qualified_scalar_local_attention_p90_host_us": 27.3895,
+    "median_change_pct": 0.861,
+    "uniform_q_gt_1_prefix_calls": 720,
+    "uniform_q_gt_1_suffix_calls": 720,
+    "note": "Nsight exported NVTX host spans but no CUDA kernel tables."
+  },
+  "projection": {
+    "path": "/localpool/onecat-vllm-hy3-sm70/dcp2-branch-deb0fa7da1",
+    "manifest_sha256": "594ae367f62cbb44a9f63ce3231965b419580348b9d77c85d77061e6d606cf82",
+    "flash_v100_binary_sha256": "ad5a8d31cab8a6ebfecd13bd5b13d0ff2e5d0ddddf0a00685ae69f6f7cee42b0"
+  },
+  "artifacts": {
+    "correctness_sha256": "7a42c206fcff53c5f48451c3acd05a73875f1825c83993c8ca55997fcb565ee0",
+    "mtp4_benchmark_sha256": "9c0edb6b1f29c31dc8156edfc714b139c674275da1aea1c9de7e098718d93bf0",
+    "no_mtp_benchmark_sha256": "cb90e62ae8bbc3c91032b5c69b3266161c86325d243fda9b7428fe5627c2cea9",
+    "profile_analysis_sha256": "78844682c3708b2bfedb65a95542eaf952810799d6ea4f1775b6fcf80a1bd7aa",
+    "nsys_path": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/xqa-deb0fa7da1-all-ranks.nsys-rep",
+    "nsys_sha256": "345817f8b9ad32df340e796da2e0db01a5a7dabb5e6b055e1ee491432f40645c",
+    "sqlite_path": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/xqa-deb0fa7da1-all-ranks.sqlite",
+    "sqlite_sha256": "01187fce6e9977c332608ce599c1c79f2c1ba1ee9ab65a4a75ab8d079e38729f"
+  },
+  "source_hashes": {
+    "flash-attention-v100/flash_attn_v100/flash_attn_interface.py": "b05b1abc24a7b12495f9da2149b1e659d4282bc70fecff04bdb196bf75a4926c",
+    "vllm/v1/attention/backends/flash_attn_v100.py": "b8d3a1c318ae176a3cf94c1bd847a64238d49e80b24e1adbb0cc7ba155c3c770",
+    "tests/v1/attention/test_flash_attn_v100_dcp.py": "c91aadeb40729c6e3c2b87a6f265bd59ae1991e8da26e14786ff1ff8c52ce862",
+    "tests/distributed/test_dcp_a2a.py": "f0ec78c014301b4f75909f88129ed30a4aa1fab5baad04611f68053e85ddedfa"
+  },
+  "final_active_state": {
+    "qwen38_27b_fp8_tp8": "0/0",
+    "qwen38_27b_fp8_tp8_dcp2": "1/1 healthy",
+    "mode": "TP8+DCP2+A2A+native MTP4+uniform correction+direct query gather+scalar q1 decode",
+    "projection": "/localpool/onecat-vllm-hy3-sm70/dcp2-branch-e276623a92",
+    "nvtx": false,
+    "gateway_changed": false,
+    "shared_venv_changed": false
+  }
+}
