@@ -48,7 +48,8 @@ at::Tensor flash_attention_decode_paged(
     const float k_scale,
     const float v_scale,
     const int window_size_left,
-    const int window_size_right
+    const int window_size_right,
+    std::optional<at::Tensor>& final_lse_
 );
 
 at::Tensor flash_attention_decode_paged_xqa(
@@ -69,7 +70,8 @@ at::Tensor flash_attention_decode_paged_xqa(
     const float k_scale,
     const float v_scale,
     const int window_size_left,
-    const int window_size_right
+    const int window_size_right,
+    std::optional<at::Tensor>& final_lse_
 );
 
 at::Tensor flash_attention_decode_paged_wmma(

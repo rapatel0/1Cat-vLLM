@@ -14,6 +14,7 @@ BACKEND = ROOT / "vllm/v1/attention/backends/flash_attn_v100.py"
 FLASH_INTERFACE = ROOT / "flash-attention-v100/flash_attn_v100/flash_attn_interface.py"
 ATTENTION_UTILS = ROOT / "vllm/v1/attention/backends/utils.py"
 FUSED_MHA_FORWARD = ROOT / "flash-attention-v100/kernel/fused_mha_forward.cu"
+FLASH_DECODE = ROOT / "flash-attention-v100/kernel/flash_decode_paged.cu"
 
 
 def _dense_attention(q, k, v, *, causal, softmax_scale, **_kwargs):
@@ -295,8 +296,6 @@ class _StubDecodeImpl:
                     causal=False,
                     softmax_scale=self.scale,
                 )
-            with trace_range("lse_reconstruction"):
-                lse = lse.clone()
         kwargs["out"].copy_(out.squeeze(0))
         return kwargs["out"], lse.squeeze(0).transpose(0, 1).contiguous()
 
@@ -452,38 +451,23 @@ def test_paged_prefill_exposes_existing_lse():
     assert "return {out_fp16, softmax_lse};" in source
 
 
-def test_decode_interface_exposes_opt_in_dcp_trace_ranges():
-    source = FLASH_INTERFACE.read_text()
-    assert "dcp_trace_range" in source
-    assert 'dcp_trace_range("local_attention")' in source
-    assert 'dcp_trace_range("lse_reconstruction")' in source
+def test_decode_interface_uses_direct_reduction_lse():
+    interface_source = FLASH_INTERFACE.read_text()
+    kernel_source = FLASH_DECODE.read_text()
 
+    assert "dcp_trace_range" in interface_source
+    assert 'dcp_trace_range("local_attention")' in interface_source
+    assert 'dcp_trace_range("lse_reconstruction")' not in interface_source
+    assert "_decode_lse_from_workspace" not in interface_source
+    assert "final_lse if return_lse else None" in interface_source
+    assert "return attn_out, final_lse" in interface_source
 
-def test_decode_workspace_lse_reconstruction():
-    reconstruct_lse = _load_top_level_function(
-        FLASH_INTERFACE, "_decode_lse_from_workspace"
-    )
-    max_logits = torch.tensor(
-        [
-            [[2.0, -1.0, 99.0], [0.5, 3.0, -88.0]],
-            [[-2.0, 1.0, 5.0], [4.0, -7.0, 12.0]],
-        ]
-    )
-    exp_sums = torch.tensor(
-        [
-            [[3.0, 4.0, 1000.0], [2.0, 5.0, 0.0]],
-            [[1.5, 2.5, 3.5], [4.0, 0.0, 9.0]],
-        ]
-    )
-    seq_lens = torch.tensor([5, 2], dtype=torch.int32)
-    actual = reconstruct_lse(max_logits, exp_sums, seq_lens, partition_size=2)
-
-    expected = torch.empty(2, 2)
-    expected[0] = torch.logsumexp(
-        max_logits[0, :, :3] + torch.log(exp_sums[0, :, :3]), dim=-1
-    )
-    expected[1] = max_logits[1, :, 0] + torch.log(exp_sums[1, :, 0])
-    torch.testing.assert_close(actual, expected)
+    assert "float* __restrict__ final_lse" in kernel_source
+    assert "global_max + logf(global_sum)" in kernel_source
+    assert "global_sum > 0.f" in kernel_source
+    assert "kNegativeInfinity" in kernel_source
+    assert kernel_source.count("final_lse->stride(0)") == 2
+    assert kernel_source.count("final_lse->stride(1)") == 2
 
 
 def test_dcp_decode_matches_dense_attention():
@@ -519,7 +503,6 @@ def test_dcp_decode_profile_covers_hot_path_without_changing_output():
     expected_stages = {
         "query_prepare",
         "local_attention",
-        "lse_reconstruction",
         "lse_prepare",
         "output_correction",
         "output_workspace_acquire",

@@ -3,6 +3,7 @@
 #include <cuda_fp16.h>
 #include <mma.h>
 #include <torch/extension.h>
+#include <limits>
 #include <string>
 
 #include <ATen/ATen.h>
@@ -38,6 +39,7 @@ constexpr int kXQATC256WideThreads = kXQATC256WideWarpCount * kWarpSize;
 constexpr int kXQATC256WideBlockM = 8;
 constexpr int kXQATC256WideThreadsPerRow = kWarpSize;
 constexpr float kXQANegInf = -1.0e30f;
+constexpr float kNegativeInfinity = -std::numeric_limits<float>::infinity();
 
 struct alignas(256) XQATCSmem256Wide {
   alignas(16) __half q[kXQATC256WideBlockM * 256];
@@ -713,6 +715,7 @@ __global__ void flash_attention_decode_reduce_kernel(
     const int* __restrict__ seq_lens,
     const int* __restrict__ active_num_partitions,
     __half* __restrict__ out,
+    float* __restrict__ final_lse,
     const int batch_size,
     const int max_num_partitions,
     const int num_heads_q,
@@ -722,7 +725,9 @@ __global__ void flash_attention_decode_reduce_kernel(
     const int64_t stats_stride0,
     const int64_t stats_stride1,
     const int64_t out_stride0,
-    const int64_t out_stride1) {
+    const int64_t out_stride1,
+    const int64_t lse_stride0,
+    const int64_t lse_stride1) {
   const int batch_idx = blockIdx.x;
   const int head_idx = blockIdx.y;
 
@@ -741,6 +746,11 @@ __global__ void flash_attention_decode_reduce_kernel(
       out[static_cast<int64_t>(batch_idx) * out_stride0 +
           static_cast<int64_t>(head_idx) * out_stride1 + d] =
           __float2half(0.f);
+    }
+    if (final_lse != nullptr && threadIdx.x == 0) {
+      final_lse[static_cast<int64_t>(batch_idx) * lse_stride0 +
+                static_cast<int64_t>(head_idx) * lse_stride1] =
+          kNegativeInfinity;
     }
     return;
   }
@@ -771,6 +781,11 @@ __global__ void flash_attention_decode_reduce_kernel(
   }
   const float global_sum = block_reduce_sum<kWarpsPerBlock>(local_sum);
   const float inv_global_sum = global_sum > 0.f ? 1.f / global_sum : 0.f;
+  if (final_lse != nullptr && threadIdx.x == 0) {
+    final_lse[static_cast<int64_t>(batch_idx) * lse_stride0 +
+              static_cast<int64_t>(head_idx) * lse_stride1] =
+        global_sum > 0.f ? global_max + logf(global_sum) : kNegativeInfinity;
+  }
   __syncthreads();
 
   const int64_t out_base =
@@ -896,6 +911,7 @@ void launch_flash_attention_decode_paged(
     const float v_scale,
     const int window_size_left,
     const int window_size_right,
+    at::Tensor* final_lse,
     cudaStream_t stream) {
   const int batch_size = q.size(0);
   const int num_heads_q = q.size(1);
@@ -953,6 +969,7 @@ void launch_flash_attention_decode_paged(
       seq_lens.data_ptr<int>(),
       active_num_partitions.data_ptr<int>(),
       reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+      final_lse == nullptr ? nullptr : final_lse->data_ptr<float>(),
       batch_size,
       max_num_partitions,
       num_heads_q,
@@ -962,7 +979,9 @@ void launch_flash_attention_decode_paged(
       max_logits.stride(0),
       max_logits.stride(1),
       out.stride(0),
-      out.stride(1));
+      out.stride(1),
+      final_lse == nullptr ? 0 : final_lse->stride(0),
+      final_lse == nullptr ? 0 : final_lse->stride(1));
 }
 
 template<int PARTITION_SIZE, int GROUP_SIZE>
@@ -979,6 +998,7 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     const at::Tensor& active_num_partitions,
     const float softmax_scale,
     const int launch_num_partitions,
+    at::Tensor* final_lse,
     cudaStream_t stream) {
   const int batch_size = q.size(0);
   const int num_heads_q = q.size(1);
@@ -1040,6 +1060,7 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
           seq_lens.data_ptr<int>(),
           active_num_partitions.data_ptr<int>(),
           reinterpret_cast<__half*>(out.data_ptr<at::Half>()),
+          final_lse == nullptr ? nullptr : final_lse->data_ptr<float>(),
           batch_size,
           launch_num_partitions,
           num_heads_q,
@@ -1049,7 +1070,9 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
           max_logits.stride(0),
           max_logits.stride(1),
           out.stride(0),
-          out.stride(1));
+          out.stride(1),
+          final_lse == nullptr ? 0 : final_lse->stride(0),
+          final_lse == nullptr ? 0 : final_lse->stride(1));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 
@@ -1118,7 +1141,8 @@ at::Tensor flash_attention_decode_paged(
     const float k_scale,
     const float v_scale,
     const int window_size_left,
-    const int window_size_right) {
+    const int window_size_right,
+    std::optional<at::Tensor>& final_lse_) {
   TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
   TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(), "k/v cache must be on CUDA");
   TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda(), "block_table and seq_lens must be on CUDA");
@@ -1193,6 +1217,19 @@ at::Tensor flash_attention_decode_paged(
   TORCH_CHECK(out.sizes() == q.sizes(), "out must have same shape as q");
   TORCH_CHECK(out.stride(-1) == 1, "out last dim must be contiguous");
 
+  at::Tensor* final_lse = nullptr;
+  if (final_lse_.has_value()) {
+    at::Tensor& lse = final_lse_.value();
+    TORCH_CHECK(lse.is_cuda(), "final_lse must be on CUDA");
+    TORCH_CHECK(lse.device() == q.device(),
+                "final_lse must be on the same device as q");
+    TORCH_CHECK(lse.dtype() == torch::kFloat32, "final_lse must be fp32");
+    TORCH_CHECK(lse.dim() == 2, "final_lse must have shape [B, H]");
+    TORCH_CHECK(lse.size(0) >= batch_size && lse.size(1) >= num_heads_q,
+                "final_lse shape must cover q batch and heads");
+    final_lse = &lse;
+  }
+
   auto stream = at::cuda::getCurrentCUDAStream().stream();
   c10::cuda::CUDAGuard device_guard(q.device());
 
@@ -1201,7 +1238,7 @@ at::Tensor flash_attention_decode_paged(
         q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,   \
         exp_sums, active_num_partitions, softmax_scale,                         \
         launch_num_partitions, k_scale, v_scale, window_size_left,              \
-        window_size_right, stream)
+        window_size_right, final_lse, stream)
 
   #define LAUNCH_BY_KV_DTYPE(HDIM, PARTITION)                                   \
     do {                                                                        \
@@ -1286,7 +1323,8 @@ at::Tensor flash_attention_decode_paged_xqa(
     const float k_scale,
     const float v_scale,
     const int window_size_left,
-    const int window_size_right) {
+    const int window_size_right,
+    std::optional<at::Tensor>& final_lse_) {
   (void)k_scale;
   (void)v_scale;
   TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
@@ -1363,13 +1401,27 @@ at::Tensor flash_attention_decode_paged_xqa(
   TORCH_CHECK(out.dtype() == torch::kFloat16, "out must be fp16");
   TORCH_CHECK(out.sizes() == q.sizes(), "out must have same shape as q");
   TORCH_CHECK(out.stride(-1) == 1, "out last dim must be contiguous");
+
+  at::Tensor* final_lse = nullptr;
+  if (final_lse_.has_value()) {
+    at::Tensor& lse = final_lse_.value();
+    TORCH_CHECK(lse.is_cuda(), "final_lse must be on CUDA");
+    TORCH_CHECK(lse.device() == q.device(),
+                "final_lse must be on the same device as q");
+    TORCH_CHECK(lse.dtype() == torch::kFloat32, "final_lse must be fp32");
+    TORCH_CHECK(lse.dim() == 2, "final_lse must have shape [B, H]");
+    TORCH_CHECK(lse.size(0) >= q.size(0) && lse.size(1) >= q.size(1),
+                "final_lse shape must cover q batch and heads");
+    final_lse = &lse;
+  }
+
   auto stream = at::cuda::getCurrentCUDAStream().stream();
 
   #define LAUNCH_XQA_WIDE(GROUP_SIZE, PARTITION)                               \
     launch_flash_attention_decode_paged_xqa_tc_256_wide<PARTITION, GROUP_SIZE>(\
         q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits,  \
         exp_sums, active_num_partitions, softmax_scale, launch_num_partitions, \
-        stream)
+        final_lse, stream)
 
   #define DISPATCH_PARTITION(GROUP_SIZE)                                       \
     do {                                                                       \

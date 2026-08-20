@@ -33,6 +33,7 @@ class _DecodeWorkspace:
     tmp_out: torch.Tensor
     max_logits: torch.Tensor
     exp_sums: torch.Tensor
+    final_lse: torch.Tensor
     active_num_partitions: torch.Tensor
     max_num_partitions: int
 
@@ -113,6 +114,11 @@ def _allocate_decode_workspace(
         ),
         exp_sums=torch.empty(
             (batch_capacity, num_heads, max_num_partitions),
+            dtype=torch.float32,
+            device=q.device,
+        ),
+        final_lse=torch.empty(
+            (batch_capacity, num_heads),
             dtype=torch.float32,
             device=q.device,
         ),
@@ -252,6 +258,7 @@ def _get_decode_workspace_for_plan(
         workspace.tmp_out[:, :, :workspace.max_num_partitions, :],
         workspace.max_logits[:, :, :workspace.max_num_partitions],
         workspace.exp_sums[:, :, :workspace.max_num_partitions],
+        workspace.final_lse,
         active_num_partitions,
     )
 
@@ -664,32 +671,6 @@ def flash_attn_lse(
     return lse
 
 
-def _decode_lse_from_workspace(
-    max_logits: torch.Tensor,
-    exp_sums: torch.Tensor,
-    seq_lens: torch.Tensor,
-    partition_size: int,
-) -> torch.Tensor:
-    """Reconstruct each decode row's LSE from partition softmax statistics."""
-    num_partitions = torch.div(
-        seq_lens + partition_size - 1,
-        partition_size,
-        rounding_mode="floor",
-    )
-    partition_ids = torch.arange(
-        max_logits.shape[-1],
-        dtype=num_partitions.dtype,
-        device=max_logits.device,
-    )
-    valid = partition_ids.view(1, 1, -1) < num_partitions.view(-1, 1, 1)
-    partition_lse = torch.where(
-        (exp_sums > 0) & valid,
-        max_logits + torch.log(exp_sums),
-        torch.full_like(max_logits, -float("inf")),
-    )
-    return torch.logsumexp(partition_lse, dim=-1)
-
-
 def flash_attn_decode_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -734,7 +715,7 @@ def flash_attn_decode_paged(
         workspace_seq_capacity_hint=workspace_seq_capacity_hint,
         active_num_partitions=active_num_partitions,
     )
-    tmp_out, max_logits, exp_sums, active_num_partitions = (
+    tmp_out, max_logits, exp_sums, final_lse, active_num_partitions = (
         _get_decode_workspace_for_plan(
             q,
             batch_capacity=batch_capacity,
@@ -744,6 +725,7 @@ def flash_attn_decode_paged(
             active_num_partitions=active_num_partitions,
         )
     )
+    lse_out = final_lse if return_lse else None
 
     if dcp_trace_range is None:
         attn_out = flash_attn_v100_cuda.decode_paged_fwd(
@@ -765,6 +747,7 @@ def flash_attn_decode_paged(
             float(v_scale),
             int(window_size_left),
             int(window_size_right),
+            lse_out,
         )
     else:
         with dcp_trace_range("local_attention"):
@@ -787,19 +770,11 @@ def flash_attn_decode_paged(
                 float(v_scale),
                 int(window_size_left),
                 int(window_size_right),
+                lse_out,
             )
     if not return_lse:
         return attn_out
-    if dcp_trace_range is None:
-        lse = _decode_lse_from_workspace(
-            max_logits, exp_sums, seq_lens, plan.partition_size
-        )
-    else:
-        with dcp_trace_range("lse_reconstruction"):
-            lse = _decode_lse_from_workspace(
-                max_logits, exp_sums, seq_lens, plan.partition_size
-            )
-    return attn_out, lse
+    return attn_out, final_lse
 
 
 def flash_attn_decode_paged_xqa_available() -> bool:
@@ -851,7 +826,7 @@ def flash_attn_decode_paged_xqa(
         workspace_seq_capacity_hint=workspace_seq_capacity_hint,
         active_num_partitions=active_num_partitions,
     )
-    tmp_out, max_logits, exp_sums, active_num_partitions = (
+    tmp_out, max_logits, exp_sums, final_lse, active_num_partitions = (
         _get_decode_workspace_for_plan(
             q,
             batch_capacity=batch_capacity,
@@ -881,13 +856,11 @@ def flash_attn_decode_paged_xqa(
         float(v_scale),
         int(window_size_left),
         int(window_size_right),
+        final_lse if return_lse else None,
     )
     if not return_lse:
         return attn_out
-    lse = _decode_lse_from_workspace(
-        max_logits, exp_sums, seq_lens, plan.partition_size
-    )
-    return attn_out, lse
+    return attn_out, final_lse
 
 
 def flash_attn_decode_paged_wmma(
