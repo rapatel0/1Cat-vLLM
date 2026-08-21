@@ -225,6 +225,7 @@ def test_direct_route_removes_64_copies_without_more_projections():
 
 def test_qwen_gdn_direct_custom_op_returns_projection_allocation():
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        qwen_gdn_full_forward_direct,
         qwen_gdn_full_forward_direct_fake,
     )
 
@@ -247,7 +248,7 @@ def test_qwen_gdn_direct_custom_op_returns_projection_allocation():
             "_log_runtime_route_once"
         ),
     ):
-        output = torch.ops.vllm.qwen_gdn_full_forward_direct(
+        output = qwen_gdn_full_forward_direct(
             hidden_states,
             conv_cache,
             ssm_cache,
