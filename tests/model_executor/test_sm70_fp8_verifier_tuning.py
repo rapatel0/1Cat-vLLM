@@ -43,6 +43,7 @@ def test_fp8_warmup_adds_only_captured_tune_endpoint():
     from vllm.model_executor.warmup.awq_sm70_warmup import (
         _get_decode_m_values,
         _get_fp8_dense_m_values,
+        _should_warmup_fp8_dense_shape,
     )
 
     compilation_config = SimpleNamespace(
@@ -66,3 +67,9 @@ def test_fp8_warmup_adds_only_captured_tune_endpoint():
 
         compilation_config.cudagraph_capture_sizes = [1, 2, 4, 8, 12, 16]
         assert _get_fp8_dense_m_values(worker) == [1, 2, 4, 8, 12, 16]
+
+        assert _should_warmup_fp8_dense_shape(128, 2176, 5120, False)
+        assert _should_warmup_fp8_dense_shape(128, 768, 5120, False)
+        assert not _should_warmup_fp8_dense_shape(128, 5120, 4352, True)
+        assert not _should_warmup_fp8_dense_shape(128, 5120, 2560, False)
+        assert _should_warmup_fp8_dense_shape(16, 5120, 2560, False)

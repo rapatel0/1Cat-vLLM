@@ -300,6 +300,19 @@ def _warmup_dense_layers(
     return calls
 
 
+def _should_warmup_fp8_dense_shape(
+    m_dim: int, k_dim: int, n_dim: int, gated_silu: bool
+) -> bool:
+    if m_dim <= int(envs.VLLM_SM70_AWQ_WARMUP_MAX_M):
+        return True
+    return (
+        m_dim == int(envs.VLLM_SM70_FP8_DENSE_TUNE_MAX_M)
+        and not gated_silu
+        and n_dim == 5120
+        and k_dim in (768, 2176)
+    )
+
+
 def _warmup_fp8_dense_layers(
     dense_layers: list[tuple[torch.nn.Module, bool]],
     m_values: list[int],
@@ -331,6 +344,10 @@ def _warmup_fp8_dense_layers(
         device = weight.device
         k_dim = int(weight.shape[0])
         for m_dim in m_values:
+            if not _should_warmup_fp8_dense_shape(
+                m_dim, k_dim, n_dim, gated_silu
+            ):
+                continue
             x = torch.empty((m_dim, k_dim), dtype=torch.float16, device=device)
             out = torch.empty((m_dim, n_dim), dtype=torch.float16, device=device)
             sm70_ops.fp8_gemm_sm70_out(
