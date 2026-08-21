@@ -386,6 +386,17 @@ class CudaCommunicator(DeviceCommunicatorBase):
             _trace_all_reduce_path(self, "pynccl", input_)
         return out
 
+    def all_reduce_inplace(self, input_):
+        pynccl_comm = self.pynccl_comm
+        if pynccl_comm is not None and not pynccl_comm.disabled:
+            out = pynccl_comm.all_reduce(input_, out_tensor=input_)
+            assert out is input_
+            _trace_all_reduce_path(self, "pynccl_inplace", input_)
+            return input_
+        torch.distributed.all_reduce(input_, group=self.device_group)
+        _trace_all_reduce_path(self, "torch_distributed_inplace", input_)
+        return input_
+
     def all_reduce_sum2(self, input_a, input_b):
         ca_comm = self.ca_comm
         if (

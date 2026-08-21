@@ -181,6 +181,10 @@ class DeviceCommunicatorBase:
         dist.all_reduce(input_, group=self.device_group)
         return input_
 
+    def all_reduce_inplace(self, input_: torch.Tensor) -> torch.Tensor:
+        dist.all_reduce(input_, group=self.device_group)
+        return input_
+
     def all_reduce_sum2(
         self, input_a: torch.Tensor, input_b: torch.Tensor
     ) -> torch.Tensor:

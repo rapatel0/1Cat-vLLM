@@ -627,7 +627,10 @@ class Qwen3NextAttention(nn.Module):
                 attn_output,
             )
 
-        proj_out, _ = self.o_proj(attn_output)
+        proj_out, _ = self.o_proj(
+            attn_output,
+            reduce_inplace=output is None,
+        )
         if output is None:
             attention_output = proj_out
         else:

@@ -26,9 +26,11 @@ class _Projection:
     def __init__(self, output: torch.Tensor) -> None:
         self.output = output
         self.calls = 0
+        self.reduce_inplace: list[bool] = []
 
-    def __call__(self, _input: torch.Tensor):
+    def __call__(self, _input: torch.Tensor, *, reduce_inplace: bool = False):
         self.calls += 1
+        self.reduce_inplace.append(reduce_inplace)
         return self.output, None
 
 
@@ -54,7 +56,9 @@ def _full_attention_harness(projection: _Projection):
 def _gdn_projection_harness(projection: _Projection):
     return SimpleNamespace(
         prefix="model.layers.0.linear_attn",
-        _compute_output_projection=lambda _core, _z, _tokens: projection(_core)[0],
+        _compute_output_projection=lambda _core, _z, _tokens, direct_output=False: (
+            projection(_core, reduce_inplace=direct_output)[0]
+        ),
     )
 
 
@@ -161,6 +165,7 @@ def test_full_attention_direct_output_matches_preallocated_buffer():
     assert fallback.data_ptr() != direct.data_ptr()
     torch.testing.assert_close(direct, fallback, rtol=0, atol=0)
     assert projection.calls == 2
+    assert projection.reduce_inplace == [True, False]
 
 
 def test_gdn_direct_output_matches_preallocated_buffer_and_padding():
@@ -182,6 +187,7 @@ def test_gdn_direct_output_matches_preallocated_buffer_and_padding():
     torch.testing.assert_close(padded_output[:4], direct, rtol=0, atol=0)
     assert torch.all(padded_output[4:] == -17.0)
     assert projection.calls == 2
+    assert projection.reduce_inplace == [True, False]
 
 
 def test_direct_route_removes_64_copies_without_more_projections():
@@ -227,6 +233,26 @@ def test_direct_route_removes_64_copies_without_more_projections():
     assert direct_copies.allocations == 0
     assert gdn_projection.calls + full_projection.calls == 64
     assert direct_gdn_projection.calls + direct_full_projection.calls == 64
+
+
+def test_cuda_communicator_inplace_pynccl_reuses_input_allocation():
+    from vllm.distributed.device_communicators.cuda_communicator import (
+        CudaCommunicator,
+    )
+
+    tensor = torch.randn(4, 8)
+    pynccl_comm = Mock(disabled=False)
+    pynccl_comm.all_reduce.side_effect = lambda input_, out_tensor: out_tensor
+    communicator = SimpleNamespace(pynccl_comm=pynccl_comm)
+    with patch(
+        "vllm.distributed.device_communicators.cuda_communicator."
+        "_trace_all_reduce_path"
+    ) as trace:
+        output = CudaCommunicator.all_reduce_inplace(communicator, tensor)
+
+    assert output is tensor
+    pynccl_comm.all_reduce.assert_called_once_with(tensor, out_tensor=tensor)
+    trace.assert_called_once_with(communicator, "pynccl_inplace", tensor)
 
 
 def test_qwen_gdn_direct_custom_op_returns_projection_allocation():

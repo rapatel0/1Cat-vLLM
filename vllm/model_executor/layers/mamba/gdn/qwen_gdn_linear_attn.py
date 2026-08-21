@@ -3092,6 +3092,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out: torch.Tensor,
         z: torch.Tensor,
         num_tokens: int,
+        direct_output: bool = False,
     ) -> torch.Tensor:
         """Part 3: RMSNormGated + output linear projection.
 
@@ -3121,7 +3122,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         core_attn_out = core_attn_out.reshape(z_shape_og)
         core_attn_out = core_attn_out.flatten(-2)  # ... h d -> ... (h d)
         profile_start = _sm70_gdn_prefill_profile_start()
-        proj_out, _ = self.out_proj(core_attn_out)
+        proj_out, _ = self.out_proj(
+            core_attn_out,
+            reduce_inplace=direct_output,
+        )
         _sm70_gdn_prefill_profile_end(
             layer_name,
             "projection_out_proj",
@@ -3147,7 +3151,12 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         num_tokens: int,
     ) -> torch.Tensor:
         layer_name = _encode_layer_name(self.prefix)
-        proj_out = self._compute_output_projection(core_attn_out, z, num_tokens)
+        proj_out = self._compute_output_projection(
+            core_attn_out,
+            z,
+            num_tokens,
+            direct_output=output is None,
+        )
         if output is None:
             projection_output = proj_out
         else:

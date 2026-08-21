@@ -139,6 +139,18 @@ def all_reduce_fake(tensor: torch.Tensor, group_name: str) -> torch.Tensor:
     return torch.empty_like(tensor)
 
 
+def all_reduce_inplace(tensor: torch.Tensor, group_name: str) -> None:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    group._all_reduce_in_place(tensor)
+
+
+def all_reduce_inplace_fake(tensor: torch.Tensor, group_name: str) -> None:
+    return None
+
+
 def all_reduce_sum2(
     tensor_a: torch.Tensor, tensor_b: torch.Tensor, group_name: str
 ) -> torch.Tensor:
@@ -330,6 +342,13 @@ direct_register_custom_op(
     op_name="all_reduce",
     op_func=all_reduce,
     fake_impl=all_reduce_fake,
+)
+
+direct_register_custom_op(
+    op_name="all_reduce_inplace",
+    op_func=all_reduce_inplace,
+    mutates_args=["tensor"],
+    fake_impl=all_reduce_inplace_fake,
 )
 
 direct_register_custom_op(
@@ -624,6 +643,23 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce(input_)
+
+    def all_reduce_inplace(self, input_: torch.Tensor) -> torch.Tensor:
+        if self.world_size == 1:
+            return input_
+        if self.use_custom_op_call:
+            torch.ops.vllm.all_reduce_inplace(
+                input_,
+                group_name=self.unique_name,
+            )
+        else:
+            self._all_reduce_in_place(input_)
+        return input_
+
+    def _all_reduce_in_place(self, input_: torch.Tensor) -> None:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        self.device_communicator.all_reduce_inplace(input_)
 
     def all_reduce_sum2(
         self, input_a: torch.Tensor, input_b: torch.Tensor

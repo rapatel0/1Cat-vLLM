@@ -16,6 +16,7 @@ from vllm.distributed import (
     split_tensor_along_last_dim,
     tensor_model_parallel_all_gather,
     tensor_model_parallel_all_reduce,
+    tensor_model_parallel_all_reduce_inplace,
     tensor_model_parallel_sm70_awq_mlp_down_tile_all_reduce,
     tensor_model_parallel_sm70_awq_mlp_down_tile_gemm_reduce,
 )
@@ -1783,6 +1784,7 @@ class RowParallelLinear(LinearBase):
     def forward(
         self,
         input_,
+        reduce_inplace: bool = False,
     ) -> torch.Tensor | tuple[torch.Tensor, Parameter | None]:
         if self.input_is_parallel:
             input_parallel = input_
@@ -1797,7 +1799,7 @@ class RowParallelLinear(LinearBase):
         # bias will not get added more than once in TP>1 case)
         bias_ = None if (self.tp_rank > 0 or self.skip_bias_add) else self.bias
         output = None
-        if self.reduce_results and self.tp_size > 1:
+        if self.reduce_results and self.tp_size > 1 and not reduce_inplace:
             output = _maybe_sm70_awq_mlp_down_tile_gemm_reduce(
                 self, input_parallel, bias_
             )
@@ -1809,11 +1811,16 @@ class RowParallelLinear(LinearBase):
                 )
 
             if self.reduce_results and self.tp_size > 1:
-                output = _maybe_sm70_awq_mlp_down_tile_all_reduce(
-                    self, output_parallel
-                )
-                if output is None:
-                    output = tensor_model_parallel_all_reduce(output_parallel)
+                if reduce_inplace:
+                    output = tensor_model_parallel_all_reduce_inplace(
+                        output_parallel
+                    )
+                else:
+                    output = _maybe_sm70_awq_mlp_down_tile_all_reduce(
+                        self, output_parallel
+                    )
+                    if output is None:
+                        output = tensor_model_parallel_all_reduce(output_parallel)
             else:
                 output = output_parallel
 
