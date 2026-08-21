@@ -642,7 +642,43 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
-        common_buffers: _GDNUniformSpecCommonBuffers | None = None
+        self.spec_sequence_masks: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs,),
+            dtype=torch.bool,
+            device=device,
+        )
+        self.spec_token_indx: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs * (self.num_spec_state_tokens + 1),),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.non_spec_token_indx: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs * (self.num_spec_state_tokens + 1),),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.spec_query_start_loc: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs + 1,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.non_spec_query_start_loc: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs + 1,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.num_accepted_tokens: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs,),
+            dtype=torch.int32,
+            device=device,
+        )
+        self.spec_state_slot_selectors: torch.Tensor = torch.empty(
+            (self.decode_cudagraph_max_bs,),
+            dtype=torch.int32,
+            device=device,
+        )
+
+        self._uniform_spec_common_buffers: _GDNUniformSpecCommonBuffers | None = None
         if (
             self.use_spec_decode
             and self.num_spec == 3
@@ -656,71 +692,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 self.decode_cudagraph_max_bs,
                 self.num_spec_state_tokens + 1,
             )
-        self._uniform_spec_common_buffers = common_buffers
-
-        self.spec_sequence_masks: torch.Tensor = (
-            common_buffers.spec_sequence_masks
-            if common_buffers is not None
-            else torch.empty(
-                (self.decode_cudagraph_max_bs,),
-                dtype=torch.bool,
-                device=device,
-            )
-        )
-        self.spec_token_indx: torch.Tensor = (
-            common_buffers.spec_token_indx
-            if common_buffers is not None
-            else torch.empty(
-                (self.decode_cudagraph_max_bs * (self.num_spec_state_tokens + 1),),
-                dtype=torch.int32,
-                device=device,
-            )
-        )
-        self.non_spec_token_indx: torch.Tensor = (
-            common_buffers.non_spec_token_indx
-            if common_buffers is not None
-            else torch.empty(
-                (self.decode_cudagraph_max_bs * (self.num_spec_state_tokens + 1),),
-                dtype=torch.int32,
-                device=device,
-            )
-        )
-        self.spec_query_start_loc: torch.Tensor = (
-            common_buffers.spec_query_start_loc
-            if common_buffers is not None
-            else torch.empty(
-                (self.decode_cudagraph_max_bs + 1,),
-                dtype=torch.int32,
-                device=device,
-            )
-        )
-        self.non_spec_query_start_loc: torch.Tensor = (
-            common_buffers.non_spec_query_start_loc
-            if common_buffers is not None
-            else torch.empty(
-                (self.decode_cudagraph_max_bs + 1,),
-                dtype=torch.int32,
-                device=device,
-            )
-        )
-        self.num_accepted_tokens: torch.Tensor = (
-            common_buffers.num_accepted_tokens
-            if common_buffers is not None
-            else torch.empty(
-                (self.decode_cudagraph_max_bs,),
-                dtype=torch.int32,
-                device=device,
-            )
-        )
-        self.spec_state_slot_selectors: torch.Tensor = (
-            common_buffers.spec_state_slot_selectors
-            if common_buffers is not None
-            else torch.empty(
-                (self.decode_cudagraph_max_bs,),
-                dtype=torch.int32,
-                device=device,
-            )
-        )
+            self._uniform_spec_common_buffers = common_buffers
+            self.spec_sequence_masks = common_buffers.spec_sequence_masks
+            self.spec_token_indx = common_buffers.spec_token_indx
+            self.non_spec_token_indx = common_buffers.non_spec_token_indx
+            self.spec_query_start_loc = common_buffers.spec_query_start_loc
+            self.non_spec_query_start_loc = common_buffers.non_spec_query_start_loc
+            self.num_accepted_tokens = common_buffers.num_accepted_tokens
+            self.spec_state_slot_selectors = common_buffers.spec_state_slot_selectors
         if self.use_spec_decode and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
             placeholder_rows = max(
                 1, min(self.num_spec_state_tokens + 1, self.decode_cudagraph_max_bs)
