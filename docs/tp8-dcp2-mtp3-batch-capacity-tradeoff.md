@@ -180,6 +180,22 @@ The c96 profile trades KV capacity and latency for 25.79% more aggregate through
 
 Do not use c128 with this 32 GiB memory budget.
 
+## Configuration fingerprints
+
+The hash input contains the sorted image, command, environment, resources, node selector, volumes, and security context.
+
+| Profile | SHA256 |
+|---|---|
+| Baseline c32, initial and final | `79b427cb9c7243485a940a33983792115919a2cec768211bde7ba59a3b7d4bc0` |
+| C96, utilization 0.67, tokens 16,384 | `fc5bbd8c0618fc689be6c385412f16373fcd2ce1a1abf35f3ccca287af79a409` |
+| C96, utilization 0.67, tokens 32,768 | `79e1be9654297e25b5a3685cf2d9591c4d2cd09b2f12ef4b8601262c6ff6b1ee` |
+| C128, utilization 0.58 | `d7d9333de08580917189339a4243ac93c0e7448bba3d9a6933010dab5e291d48` |
+| C128, utilization 0.60 | `93ab7ec2e93bdd2357066214b4dc4c6a0372266ee58e8cfbb285e95944304238` |
+| C128, utilization 0.61 | `54ca46921ed771c8868027a35c70a0492e0c5b503799ed3eb61b625d5e7ff66f` |
+| C128, utilization 0.62 | `5240933eebf8df7ca4c68ec019dd8280b647778bf95a5a14b317bb840e2f52ca` |
+
+The initial and final c32 hashes match.
+
 ## Final state
 
 - TP8+DCP2 is healthy at `1/1`.

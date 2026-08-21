@@ -212,6 +212,16 @@
       "reason": "c128 appeared only transiently and the minimum margin fell below 1 GiB"
     }
   ],
+  "config_fingerprints": {
+    "method": "SHA256 of sorted image, args, env, resources, node selector, volumes, and security context",
+    "baseline_c32_initial_and_final": "79b427cb9c7243485a940a33983792115919a2cec768211bde7ba59a3b7d4bc0",
+    "c96_u067_b16384": "fc5bbd8c0618fc689be6c385412f16373fcd2ce1a1abf35f3ccca287af79a409",
+    "c96_u067_b32768": "79e1be9654297e25b5a3685cf2d9591c4d2cd09b2f12ef4b8601262c6ff6b1ee",
+    "c128_u058_b32768": "d7d9333de08580917189339a4243ac93c0e7448bba3d9a6933010dab5e291d48",
+    "c128_u060_b32768": "93ab7ec2e93bdd2357066214b4dc4c6a0372266ee58e8cfbb285e95944304238",
+    "c128_u061_b32768": "54ca46921ed771c8868027a35c70a0492e0c5b503799ed3eb61b625d5e7ff66f",
+    "c128_u062_b32768": "5240933eebf8df7ca4c68ec019dd8280b647778bf95a5a14b317bb840e2f52ca"
+  },
   "final_state": {
     "service_ready": "1/1",
     "max_num_seqs": 32,
