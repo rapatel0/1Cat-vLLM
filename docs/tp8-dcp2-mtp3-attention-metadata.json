@@ -1,0 +1,167 @@
+{
+  "date": "2026-08-21",
+  "branch": "experiment/qwen38-mtp-dcp2",
+  "baseline_runtime_commit": "59a5fa11f0a1e872197a4c4715353109ab0d7601",
+  "baseline_docs_commit": "d738a8d28ed17ef1c89485d65be53e18e030827d",
+  "configuration": {
+    "hardware": "gpu-01: 8 x Tesla V100-SXM2-32GB",
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 2,
+    "dcp_comm_backend": "a2a",
+    "dcp_query_gather": "direct PyNCCL",
+    "tp_backend": "automatic PyNCCL",
+    "speculator": "native MTP3",
+    "num_speculative_tokens": 3,
+    "verifier_query_width": 4,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384,
+    "gpu_memory_utilization": 0.78,
+    "fused_gdn_zba": true
+  },
+  "workloads": {
+    "c1": {
+      "concurrency": 1,
+      "prompt_tokens": 304,
+      "output_tokens": 256,
+      "complete_all_rank_steps": 111,
+      "scheduled_tokens_filter": 4
+    },
+    "c32": {
+      "concurrency": 32,
+      "prompt_token_range": [306, 308],
+      "output_tokens_per_request": 256,
+      "complete_all_rank_steps": 93,
+      "scheduled_tokens_filter": 128
+    },
+    "sampling": {
+      "temperature": 0.0,
+      "ignore_eos": true,
+      "unique_prompts": true,
+      "direct_service": true
+    }
+  },
+  "critical_rank_step_medians_ms": {
+    "c1": {
+      "preprocess": 7.103,
+      "prepare_inputs": 2.139,
+      "mamba_preprocess": 0.082,
+      "slot_mapping": 0.061,
+      "attention_metadata": 4.194,
+      "model_preprocess": 0.415,
+      "forward_submit": 0.632
+    },
+    "c32": {
+      "preprocess": 10.291,
+      "prepare_inputs": 2.733,
+      "mamba_preprocess": 0.127,
+      "slot_mapping": 0.057,
+      "attention_metadata": 6.579,
+      "model_preprocess": 0.449,
+      "forward_submit": 0.668
+    }
+  },
+  "builder_critical_rank_step_medians_ms": {
+    "c1": {
+      "gdn_kv0_build": 1.121,
+      "gdn_kv1_build": 1.094,
+      "gdn_kv2_build": 1.088,
+      "flash_v100_kv3_build": 0.307
+    },
+    "c32": {
+      "gdn_kv0_build": 1.899,
+      "gdn_kv1_build": 1.748,
+      "gdn_kv2_build": 1.71,
+      "flash_v100_kv3_build": 0.586
+    },
+    "all_paths": "build",
+    "cached_paths_observed": 0
+  },
+  "gdn_existing_subphase_profile_c32_all_rank_medians_ms": {
+    "filter": {
+      "num_spec_decodes": 32,
+      "num_spec_decode_tokens": 128,
+      "num_actual_tokens": 128
+    },
+    "kv0": {
+      "total": 0.978,
+      "state_contract": 0.368,
+      "graph_buffers": 0.175,
+      "register": 0.0,
+      "other": 0.435
+    },
+    "kv1": {
+      "total": 0.954,
+      "state_contract": 0.357,
+      "graph_buffers": 0.176,
+      "register": 0.0,
+      "other": 0.419
+    },
+    "kv2": {
+      "total": 0.938,
+      "state_contract": 0.352,
+      "graph_buffers": 0.175,
+      "register": 0.0,
+      "other": 0.41
+    },
+    "interpretation": "No single measured subphase supplies a clear exact replacement worth at least 0.4 ms. The outer-minus-inner timer difference does not isolate current state-ID materialization because the windows and scopes differ."
+  },
+  "rejected_candidate": {
+    "change": "Remove the unconditional GPU scalar assertion on spec_query_start_loc[-1].",
+    "component_replays": 100,
+    "component_output_hashes_equal": true,
+    "focused_tests_passed": 9,
+    "c1_attention_metadata_baseline_ms": 4.194,
+    "c1_attention_metadata_candidate_ms": 4.2505,
+    "c1_attention_metadata_change_ms": 0.0565,
+    "c32_attention_metadata_baseline_ms": 6.579,
+    "c32_attention_metadata_candidate_ms": 6.6765,
+    "c32_attention_metadata_change_ms": 0.0975,
+    "c32_preprocess_baseline_ms": 10.291,
+    "c32_preprocess_candidate_ms": 10.464,
+    "c32_preprocess_change_ms": 0.173,
+    "promotion_threshold_ms": -0.4,
+    "retained": false,
+    "reason": "The candidate did not reduce the full q=4 step."
+  },
+  "corrected_overlap_result": {
+    "root_causes": [
+      "The prototype dropped the graph-local producer buffer lifetime reference.",
+      "The prototype recorded events on a stream cached before CUDA graph capture selected its stream."
+    ],
+    "changed_input_replays_per_rank": 100,
+    "rank_count": 8,
+    "matrix_routes_exact": 5,
+    "serial_control_ms": 18.9154,
+    "corrected_split_ms": 20.1086,
+    "change_pct": 6.31,
+    "candidate_gemms": 254,
+    "candidate_reductions": 254,
+    "retained": false
+  },
+  "decision": {
+    "source_candidate_retained": false,
+    "state_id_vectorization_implemented": false,
+    "next_measurable_target": "One exact common uniform-q4 GDN metadata boundary across KV groups, with group-specific state IDs and block tables preserved.",
+    "promotion_gate": "At least 0.4 ms from the full q=4 step or at least 1.5% c32 throughput."
+  },
+  "artifacts": {
+    "root": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/mtp3-attention-metadata",
+    "manifest_sha256": "1f89391ccf36a7acd66cd5c7b8cf4c1eeec724afaf35ac13629d8a322b919d8b",
+    "candidate_projection_manifest_sha256": "8a90b1677bdcbbe935f978b36032e082c20be007dfd5cccad6d015057a387927"
+  },
+  "active_state": {
+    "qwen38-27b-fp8-tp8": "0/0",
+    "qwen38-27b-fp8-tp8-dcp2": "1/1 healthy",
+    "runtime_commit": "59a5fa11f0a1e872197a4c4715353109ab0d7601",
+    "kv_tokens": 2123901,
+    "cuda_graph_gib": 1.99,
+    "profiler_variables_enabled": false,
+    "gateway_changed": false,
+    "shared_venv_changed": false
+  },
+  "residual_risks": [
+    "The current-state ID path lacks an isolated timer, so the profile does not justify its vectorization.",
+    "The existing GDN subphase profile uses broad buckets; the 0.410-0.435 ms remaining bucket is not one replaceable operation.",
+    "The direct attribution workload measures metadata timing, not the qualified throughput baseline."
+  ]
+}

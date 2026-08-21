@@ -133,6 +133,14 @@ Implement and validate one focused change per commit, in this order:
    24 channels, but the global setting reduced live c32 throughput to 614.622
    tok/s. The qualified automatic PyNCCL policy remains active. See
    `docs/tp8-dcp2-mtp4-tp-collective-campaign.md`.
+8. **Corrected and rejected:** the q=4 producer-overlap prototype kept all
+   graph buffers alive and used the actual capture stream. Five routes passed
+   100 changed-input replays on all eight ranks. Real overlap still regressed
+   6.31% because it doubled GEMMs and reductions.
+9. **Attributed, no candidate retained:** q=4 attention metadata measured
+   4.194 ms at c1 and 6.579 ms at c32. Three GDN groups dominate the c32 cost.
+   Removing one GPU scalar assertion did not improve the full step. See
+   `docs/tp8-dcp2-mtp3-attention-metadata.md`.
 
 Each change first passes targeted unit/kernel tests and no-MTP/MTP3 graph and
 numerical tests, then a direct canary S1/c32 candidate gate.  Keep a change
