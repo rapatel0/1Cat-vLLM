@@ -4,7 +4,7 @@
 
 The common uniform q=4 GDN metadata route passed its measurement, correctness, graph, performance, capacity, retrieval, and no-MTP gates.
 
-Source commit `dd432ec253` retains the route for the exact SM70 native-MTP3 c32 layout.
+Source commits `dd432ec253` and `2b5d45abb0` retain the route without duplicate buffer allocations.
 
 The first GDN KV group writes persistent invariant buffers once per target step. Each GDN group still builds its distinct state contract.
 
@@ -116,7 +116,7 @@ The no-MTP restart passed an exact 8K retrieval request. It reported no speculat
 
 Persistent artifacts are under `/srv/dev/dcp2-direct-lse-profile-53893bfb47/mtp3-common-gdn-metadata`.
 
-The artifact manifest SHA256 is `7624cfcba05b591fa52e8c036feba97c1fd8f03257c348ade70b5076fddc8e82`.
+The artifact manifest SHA256 is `97ba306328e2d5b3ad1cb74601dc5a8caa60e504c795b344bd9da5c22149bb98`.
 
 ## Residual risks
 

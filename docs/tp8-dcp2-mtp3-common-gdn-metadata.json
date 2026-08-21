@@ -1,7 +1,8 @@
 {
   "date": "2026-08-21",
   "branch": "experiment/qwen38-mtp-dcp2",
-  "source_commit": "dd432ec253ea5951191bb25101eaad37db683803",
+  "source_commit": "2b5d45abb0e8351879478a280fa7a19a0a1eef31",
+  "feature_commit": "dd432ec253ea5951191bb25101eaad37db683803",
   "baseline_runtime_commit": "59a5fa11f0a1e872197a4c4715353109ab0d7601",
   "configuration": {
     "hardware": "gpu-01: 8 x Tesla V100-SXM2-32GB",
@@ -159,7 +160,7 @@
   },
   "artifacts": {
     "root": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/mtp3-common-gdn-metadata",
-    "manifest_sha256": "7624cfcba05b591fa52e8c036feba97c1fd8f03257c348ade70b5076fddc8e82"
+    "manifest_sha256": "97ba306328e2d5b3ad1cb74601dc5a8caa60e504c795b344bd9da5c22149bb98"
   },
   "decision": {
     "retained": true,
