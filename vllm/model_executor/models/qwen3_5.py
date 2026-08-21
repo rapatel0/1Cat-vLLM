@@ -133,6 +133,25 @@ def _sm70_gdn_fused_zba_extract_enabled(speculative_config: object | None) -> bo
     )
 
 
+def _sm70_mtp3_direct_attention_output_enabled(vllm_config: VllmConfig) -> bool:
+    """Select the opt-in direct projection output only for SM70 native MTP3."""
+    speculative_config = vllm_config.speculative_config
+    debug_dump_requested = bool(
+        os.getenv("VLLM_SM70_DUMP_QWEN_LAYER_DIR")
+        or os.getenv("VLLM_SM70_DUMP_GDN_PROJ_DIR")
+        or os.getenv("VLLM_SM70_DUMP_GDN_GRAPH_BUFFERS") == "1"
+    )
+    return (
+        envs.VLLM_SM70_MTP3_DIRECT_ATTENTION_OUTPUT
+        and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+        and current_platform.is_device_capability(70)
+        and speculative_config is not None
+        and getattr(speculative_config, "method", None) == "mtp"
+        and getattr(speculative_config, "num_speculative_tokens", None) == 3
+        and not debug_dump_requested
+    )
+
+
 @triton.jit
 def _sm70_gdn_extract_zba_kernel(
     mixed_qkvz_ptr,
@@ -199,6 +218,7 @@ def _sm70_gdn_extract_zba(
         block_size=block_size,
     )
     return z, b, a
+
 
 def _parse_sm70_moe_dense_allowlist() -> set[str] | None:
     raw = envs.VLLM_SM70_MOE_DENSE_ALLOWLIST
@@ -335,8 +355,8 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
     def forward_cuda(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
-    ):
+        output: torch.Tensor | None,
+    ) -> torch.Tensor:
         num_tokens = hidden_states.size(0)
         layer_name = _encode_layer_name(self.prefix)
         qkv_size = (self.key_dim * 2 + self.value_dim) // self.tp_size
@@ -418,7 +438,7 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             conv_state_cache=conv_state_cache,
             ssm_state_cache=ssm_state_cache,
         )
-        self._output_projection(core_attn_out, z, output, num_tokens)
+        return self._output_projection(core_attn_out, z, output, num_tokens)
 
 
 class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
@@ -437,6 +457,9 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
 
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
+        self.use_direct_attention_output = _sm70_mtp3_direct_attention_output_enabled(
+            vllm_config
+        )
 
         if self.layer_type == "linear_attention":
             self.linear_attn = Qwen3_5GatedDeltaNet(

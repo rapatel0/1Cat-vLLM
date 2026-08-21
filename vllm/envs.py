@@ -217,6 +217,7 @@ if TYPE_CHECKING:
     VLLM_SM70_DECODE_EVENT_TRACE_EVERY: int = 16
     VLLM_SM70_MTP_PROFILE: bool = False
     VLLM_SM70_MTP_PROFILE_INTERVAL: int = 16
+    VLLM_SM70_MTP3_DIRECT_ATTENTION_OUTPUT: bool = False
     VLLM_MTP_STOCHASTIC_TOKEN_MATCHING: bool = False
     VLLM_SM70_MTP_DUMP_STEP_DIR: str | None = None
     VLLM_SM70_MTP_DUMP_STEP_MAX: int = 512
@@ -1863,6 +1864,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_MTP_PROFILE_INTERVAL": lambda: max(
         1, int(os.getenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "16"))
+    ),
+    # Experimental Qwen3.5 MTP3 graph route. The model keeps the default
+    # preallocated attention output contract unless this exact route is enabled.
+    "VLLM_SM70_MTP3_DIRECT_ATTENTION_OUTPUT": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP3_DIRECT_ATTENTION_OUTPUT", "0"))
     ),
     "VLLM_MTP_STOCHASTIC_TOKEN_MATCHING": lambda: bool(
         int(os.getenv("VLLM_MTP_STOCHASTIC_TOKEN_MATCHING", "0"))

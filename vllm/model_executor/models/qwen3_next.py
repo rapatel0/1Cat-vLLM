@@ -551,9 +551,9 @@ class Qwen3NextAttention(nn.Module):
     def forward(
         self,
         positions: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
         hidden_states: torch.Tensor,
-    ):
+    ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
         qkv = _sm70_dump_qwen_layer_tensor(
             "full_attn_qkv",
@@ -627,13 +627,19 @@ class Qwen3NextAttention(nn.Module):
                 attn_output,
             )
 
-        output[:], _ = self.o_proj(attn_output)
-        _sm70_dump_qwen_layer_tensor(
+        proj_out, _ = self.o_proj(attn_output)
+        if output is None:
+            attention_output = proj_out
+        else:
+            output.copy_(proj_out)
+            attention_output = output
+        attention_output = _sm70_dump_qwen_layer_tensor(
             "full_attn_o_proj_out",
             self.layer_idx,
             "full_attention",
-            output,
+            attention_output,
         )
+        return attention_output
 
 
 class Qwen3NextDecoderLayer(nn.Module):
@@ -652,6 +658,8 @@ class Qwen3NextDecoderLayer(nn.Module):
 
         self.layer_type = layer_type
         self.layer_idx = extract_layer_index(prefix)
+        # Qwen3.5 enables this only for its opt-in SM70 native-MTP3 route.
+        self.use_direct_attention_output = False
 
         if self.layer_type == "linear_attention":
             self.linear_attn = QwenGatedDeltaNetAttention(
@@ -748,21 +756,33 @@ class Qwen3NextDecoderLayer(nn.Module):
             hidden_states,
         )
 
-        self_attention_output = torch.empty_like(hidden_states)
-        if self.layer_type == "linear_attention":
-            self.linear_attn(
-                hidden_states=hidden_states,
-                output=self_attention_output,
-            )
-        elif self.layer_type == "full_attention":
-            self.self_attn(
-                hidden_states=hidden_states,
-                output=self_attention_output,
-                positions=positions,
-            )
+        if self.use_direct_attention_output:
+            if self.layer_type == "linear_attention":
+                hidden_states = self.linear_attn.forward_direct(hidden_states)
+            elif self.layer_type == "full_attention":
+                hidden_states = self.self_attn(
+                    hidden_states=hidden_states,
+                    output=None,
+                    positions=positions,
+                )
+            else:
+                raise ValueError("Invalid layer_type")
         else:
-            raise ValueError("Invalid layer_type")
-        hidden_states = self_attention_output
+            self_attention_output = torch.empty_like(hidden_states)
+            if self.layer_type == "linear_attention":
+                self.linear_attn(
+                    hidden_states=hidden_states,
+                    output=self_attention_output,
+                )
+            elif self.layer_type == "full_attention":
+                self.self_attn(
+                    hidden_states=hidden_states,
+                    output=self_attention_output,
+                    positions=positions,
+                )
+            else:
+                raise ValueError("Invalid layer_type")
+            hidden_states = self_attention_output
         hidden_states = _sm70_dump_qwen_layer_tensor(
             "attn_out",
             self.layer_idx,
