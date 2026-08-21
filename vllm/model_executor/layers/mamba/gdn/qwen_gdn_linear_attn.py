@@ -3255,7 +3255,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 ssm_state_cache,
                 layer_name,
             )
-            if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
+            if (
+                envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP
+                and output is not None
+            ):
                 torch.ops.vllm.qwen_gdn_output_projection(
                     core_attn_out,
                     z,
@@ -3263,9 +3266,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     num_tokens,
                     layer_name,
                 )
-            else:
-                self._output_projection(core_attn_out, z, output, num_tokens)
-            return
+                return None
+            return self._output_projection(core_attn_out, z, output, num_tokens)
 
         if envs.VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP:
             mixed_qkv = torch.empty(
@@ -3307,7 +3309,10 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 conv_state_cache=conv_state_cache,
                 ssm_state_cache=ssm_state_cache,
             )
-            if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
+            if (
+                envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP
+                and output is not None
+            ):
                 torch.ops.vllm.qwen_gdn_output_projection(
                     core_attn_out,
                     z,
@@ -3315,9 +3320,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                     num_tokens,
                     layer_name,
                 )
-            else:
-                self._output_projection(core_attn_out, z, output, num_tokens)
-            return
+                return None
+            return self._output_projection(core_attn_out, z, output, num_tokens)
 
         # ============================================================
         # Part 1: Input Projection
@@ -3407,7 +3411,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
         # ============================================================
         # Part 3: Output Projection
         # ============================================================
-        if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP:
+        if envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP and output is not None:
             torch.ops.vllm.qwen_gdn_output_projection(
                 core_attn_out,
                 z,
@@ -3415,8 +3419,8 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 num_tokens,
                 layer_name,
             )
-        else:
-            self._output_projection(core_attn_out, z, output, num_tokens)
+            return None
+        return self._output_projection(core_attn_out, z, output, num_tokens)
 
     def forward_xpu(
         self,

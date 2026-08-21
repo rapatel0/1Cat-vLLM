@@ -255,6 +255,50 @@ def test_cuda_communicator_inplace_pynccl_reuses_input_allocation():
     trace.assert_called_once_with(communicator, "pynccl_inplace", tensor)
 
 
+def test_qwen_gdn_cuda_forward_returns_direct_projection():
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+
+    hidden_states = torch.randn(4, 8)
+    projection = torch.randn(4, 8)
+    layer = SimpleNamespace(
+        prefix="model.layers.0.linear_attn",
+        num_v_heads=1,
+        tp_size=1,
+        head_v_dim=8,
+        _output_projection=Mock(return_value=projection),
+    )
+    with (
+        patch(
+            "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn."
+            "_sm70_qwen_gdn_input_core_boundary_enabled",
+            return_value=True,
+        ),
+        patch(
+            "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn."
+            "_resolve_qwen_gdn_kv_cache_args",
+            return_value=(torch.empty(0), torch.empty(0)),
+        ),
+        patch(
+            "torch.ops.vllm.qwen_gdn_input_projection_core",
+        ),
+        patch(
+            "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn."
+            "envs.VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP",
+            False,
+        ),
+    ):
+        output = QwenGatedDeltaNetAttention.forward_cuda(
+            layer,
+            hidden_states,
+            None,
+        )
+
+    assert output is projection
+    layer._output_projection.assert_called_once()
+
+
 def test_qwen_gdn_direct_custom_op_returns_projection_allocation():
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         qwen_gdn_full_forward_direct,
