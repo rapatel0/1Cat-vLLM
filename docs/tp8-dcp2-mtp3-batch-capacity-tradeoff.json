@@ -1,0 +1,242 @@
+{
+  "outcome": {
+    "active_profile": "balanced-c32",
+    "active_config": {
+      "max_num_seqs": 32,
+      "gpu_memory_utilization": 0.78,
+      "max_num_batched_tokens": 16384
+    },
+    "separate_high_throughput_profile": {
+      "name": "c96-capacity-tradeoff",
+      "max_num_seqs": 96,
+      "gpu_memory_utilization": 0.67,
+      "max_num_batched_tokens": 16384,
+      "status": "qualified but not active",
+      "reason": "passed 600 seconds, raw-exact 8K and 128K retrieval, active p50=96, and 1138 MiB minimum free memory"
+    },
+    "c128_decision": "reject",
+    "c128_reason": "no tested point combined active p50=128 with at least 1 GiB physical free memory"
+  },
+  "fixed_policy": {
+    "runtime_source": "d299e4acbc, byte-equivalent to 59a5fa11f0",
+    "mtp_depth": 3,
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 2,
+    "attention_backend": "FLASH_ATTN_V100",
+    "dcp_backend": "packed A2A plus direct query gather",
+    "tp_backend": "automatic PyNCCL",
+    "draft_sampling": "probabilistic",
+    "image_digest": "sha256:253e98bfd4a3f9e89187321b37dae01dd27642b3dc11546be881ce188df96c72"
+  },
+  "baseline_memory_budget_per_gpu": {
+    "physical_gib": 32.0,
+    "model_gib": 4.53,
+    "kv_reservation_gib": 18.02,
+    "graph_gib": 1.99,
+    "calculated_non_reclaimable_gib_range": [3.13, 3.2],
+    "idle_physical_free_gib_range": [4.0, 4.06],
+    "kv_tokens_at_campaign_start": 2123901,
+    "kv_tokens_after_final_restore": 2116258
+  },
+  "protocol": {
+    "prompt_tokens_per_request": 256,
+    "completion_tokens_per_request": 2048,
+    "closed_loop": true,
+    "immediate_replacement": true,
+    "telemetry_interval_s": 1,
+    "deep_backlog_clients": {
+      "c96": 128,
+      "c128": 160
+    },
+    "correctness": "raw-exact 8K and 128K c1 retrieval",
+    "retention_minimum_free_mib": 1024,
+    "note": "The first c32 and retained c96 windows ran for 600 seconds. Later token-budget and c128 boundary windows ran for 120-240 seconds after supervisor steering."
+  },
+  "baseline_c32": {
+    "max_num_seqs": 32,
+    "gpu_memory_utilization": 0.78,
+    "max_num_batched_tokens": 16384,
+    "graph_gib": 1.99,
+    "kv_tokens": 2123901,
+    "duration_s": 600,
+    "aggregate_tok_s": 773.1066666666667,
+    "request_latency_s_p50": 85.3136621247977,
+    "request_latency_s_p95": 93.57946037501097,
+    "active_p50": 32,
+    "waiting_max": 0,
+    "sm_mean": 76.7937649880096,
+    "sm_p50": 83.0,
+    "sm_p95": 86.0,
+    "minimum_free_mib": 2778,
+    "raw_exact_8k": true,
+    "raw_exact_128k": true
+  },
+  "c96_trials": [
+    {
+      "gpu_memory_utilization": 0.74,
+      "max_num_batched_tokens": 16384,
+      "graph_gib": 6.52,
+      "kv_gib": 16.75,
+      "kv_tokens": 1974104,
+      "idle_minimum_free_mib": 545,
+      "decision": "reject before load",
+      "reason": "idle free memory was below 1 GiB"
+    },
+    {
+      "gpu_memory_utilization": 0.69,
+      "max_num_batched_tokens": 16384,
+      "graph_gib": 6.52,
+      "kv_gib": 15.17,
+      "kv_tokens": 1786859,
+      "duration_s": 600,
+      "aggregate_tok_s": 972.77,
+      "active_p50": 96,
+      "waiting_max": 0,
+      "minimum_free_mib": 492,
+      "raw_exact_8k": true,
+      "raw_exact_128k": true,
+      "decision": "reject",
+      "reason": "minimum load margin was below 1 GiB"
+    },
+    {
+      "gpu_memory_utilization": 0.67,
+      "max_num_batched_tokens": 16384,
+      "graph_gib": 6.52,
+      "kv_gib": 14.53,
+      "kv_tokens": 1711960,
+      "duration_s": 600,
+      "aggregate_tok_s": 972.455,
+      "change_vs_c32_pct": 25.78535476152573,
+      "request_latency_s_p50": 198.42954799998552,
+      "request_latency_s_p95": 243.5458588344045,
+      "active_mean": 95.42045454545455,
+      "active_p50": 96,
+      "waiting_max": 0,
+      "sm_mean": 65.05810397553516,
+      "sm_p50": 66.5,
+      "sm_p95": 88.0,
+      "minimum_free_mib": 1138,
+      "raw_exact_8k": true,
+      "raw_exact_128k": true,
+      "decision": "qualify as separate throughput profile"
+    },
+    {
+      "gpu_memory_utilization": 0.67,
+      "max_num_batched_tokens": 32768,
+      "scheduler_reason": "96 x 256 prompt tokens is 24576, above 16384; 32768 admits the prompt batch in one scheduler token pass",
+      "graph_gib": 6.93,
+      "kv_gib": 12.64,
+      "kv_tokens": 1489558,
+      "duration_s": 240,
+      "clients": 128,
+      "aggregate_tok_s": 899.6083333333333,
+      "active_p50": 96,
+      "deadline_running": 96,
+      "deadline_waiting": 32,
+      "minimum_free_mib": 358,
+      "raw_exact_8k": true,
+      "raw_exact_128k": true,
+      "decision": "reject",
+      "reason": "one-pass prompt admission reduced the minimum physical margin below 1 GiB"
+    }
+  ],
+  "c128_trials": [
+    {
+      "gpu_memory_utilization": 0.58,
+      "max_num_batched_tokens": 32768,
+      "graph_gib": 8.84,
+      "kv_gib": 9.78,
+      "kv_tokens": 1152516,
+      "duration_s": 240,
+      "aggregate_tok_s": 814.025,
+      "active_p50": 107,
+      "active_max": 115,
+      "kv_usage_max": 1.0,
+      "minimum_free_mib": 1886,
+      "raw_exact_8k": true,
+      "raw_exact_128k": true,
+      "decision": "reject",
+      "reason": "KV capacity prevented c128 admission"
+    },
+    {
+      "gpu_memory_utilization": 0.6,
+      "max_num_batched_tokens": 32768,
+      "graph_gib": 8.62,
+      "kv_gib": 10.42,
+      "kv_tokens": 1227414,
+      "duration_s": 240,
+      "aggregate_tok_s": 724.8291666666667,
+      "active_p50": 114,
+      "active_max": 123,
+      "kv_usage_max": 1.0,
+      "minimum_free_mib": 1478,
+      "raw_exact_8k": true,
+      "raw_exact_128k": true,
+      "decision": "reject",
+      "reason": "KV capacity prevented c128 admission"
+    },
+    {
+      "gpu_memory_utilization": 0.61,
+      "max_num_batched_tokens": 32768,
+      "graph_gib": 8.62,
+      "kv_gib": 10.74,
+      "kv_tokens": 1250342,
+      "duration_s": 120,
+      "aggregate_tok_s": 877.675,
+      "active_p50": 117,
+      "active_max": 125,
+      "kv_usage_max": 1.0,
+      "minimum_free_mib": 1292,
+      "raw_exact_8k": true,
+      "raw_exact_128k": true,
+      "decision": "reject",
+      "reason": "safe memory margin remained, but active p50 never reached 128"
+    },
+    {
+      "gpu_memory_utilization": 0.62,
+      "max_num_batched_tokens": 32768,
+      "scheduler_reason": "128 x 256 prompt tokens equals 32768, so this setting admits one complete fixed prompt batch",
+      "graph_gib": 8.62,
+      "kv_gib": 11.05,
+      "kv_tokens": 1287791,
+      "duration_s": 120,
+      "aggregate_tok_s": 935.2666666666667,
+      "active_p50": 120,
+      "active_max": 128,
+      "full_active_fraction": 0.32142857142857145,
+      "kv_usage_max": 1.0,
+      "minimum_free_mib": 950,
+      "raw_exact_8k": true,
+      "raw_exact_128k": true,
+      "decision": "reject",
+      "reason": "c128 appeared only transiently and the minimum margin fell below 1 GiB"
+    }
+  ],
+  "final_state": {
+    "service_ready": "1/1",
+    "max_num_seqs": 32,
+    "gpu_memory_utilization": 0.78,
+    "max_num_batched_tokens": 16384,
+    "graph_gib": 1.99,
+    "kv_tokens": 2116258,
+    "raw_exact_8k": true,
+    "raw_exact_128k": true
+  },
+  "artifacts": {
+    "root": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/mtp3-batch-capacity-tradeoff",
+    "manifest_sha256": "9db700f44452e5781503e833ec0796cca07be81b585e2e3109617aea546cf02e",
+    "file_count": 88
+  },
+  "review_findings": [
+    "high: c128 has no tested point that combines sustained active p50=128 with at least 1 GiB free memory",
+    "high: c96 at utilization 0.67 and batch tokens 16384 is the fastest safe tested profile at 972.455 tok/s",
+    "medium: one-pass 32768-token prompt admission consumes about 1.89 GiB of KV budget at c96 and fails the memory-margin gate",
+    "correct: every tested valid c96/c128 profile passed raw-exact 8K and 128K retrieval"
+  ],
+  "residual_risks": [
+    "The c96 retained profile needs two scheduler token passes for the 96 x 256 initial prompt batch.",
+    "The c128 boundary windows ran for two to four minutes, not ten minutes, after supervisor steering.",
+    "C128 throughput values are not saturated c128 results because active p50 stayed below 128.",
+    "The final baseline KV count varied by 7643 tokens from the campaign-start value."
+  ]
+}
