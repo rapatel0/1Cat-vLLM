@@ -3,6 +3,7 @@
 """Backend for GatedDeltaNet attention."""
 
 import os
+import weakref
 from dataclasses import dataclass
 from typing import Literal
 
@@ -42,6 +43,87 @@ GDN_SPEC_METADATA_TENSORS = tuple[
     torch.Tensor,
 ]
 _GDN_SPEC_METADATA_TENSOR_REGISTRY: dict[str, GDN_SPEC_METADATA_TENSORS] = {}
+
+
+@dataclass
+class _GDNUniformSpecCommonBuffers:
+    """Persistent metadata that is identical across homogeneous GDN groups."""
+
+    spec_sequence_masks: torch.Tensor
+    spec_token_indx: torch.Tensor
+    non_spec_token_indx: torch.Tensor
+    spec_query_start_loc: torch.Tensor
+    non_spec_query_start_loc: torch.Tensor
+    num_accepted_tokens: torch.Tensor
+    spec_state_slot_selectors: torch.Tensor
+    epoch: int | None = None
+    spec_sequence_masks_cpu: torch.Tensor | None = None
+
+
+_GDN_UNIFORM_SPEC_COMMON_BUFFERS: dict[
+    int, tuple[weakref.ReferenceType[VllmConfig], dict[tuple, object]]
+] = {}
+
+
+def _sm70_common_gdn_metadata_enabled() -> bool:
+    override = os.getenv("VLLM_SM70_COMMON_GDN_METADATA")
+    if override is not None:
+        return override.strip().lower() not in ("0", "false", "no", "off", "")
+    from vllm.platforms import current_platform
+
+    return current_platform.is_cuda() and current_platform.is_device_capability(70)
+
+
+def _get_uniform_spec_common_buffers(
+    vllm_config: VllmConfig,
+    device: torch.device,
+    decode_cudagraph_max_bs: int,
+    state_width: int,
+) -> _GDNUniformSpecCommonBuffers:
+    config_id = id(vllm_config)
+    cache_entry = _GDN_UNIFORM_SPEC_COMMON_BUFFERS.get(config_id)
+    if cache_entry is None or cache_entry[0]() is not vllm_config:
+        cache: dict[tuple, object] = {}
+        _GDN_UNIFORM_SPEC_COMMON_BUFFERS[config_id] = (
+            weakref.ref(vllm_config),
+            cache,
+        )
+    else:
+        cache = cache_entry[1]
+    key = (device.type, device.index, decode_cudagraph_max_bs, state_width)
+    buffers = cache.get(key)
+    assert buffers is None or isinstance(buffers, _GDNUniformSpecCommonBuffers)
+    if buffers is not None:
+        return buffers
+    buffers = _GDNUniformSpecCommonBuffers(
+        spec_sequence_masks=torch.empty(
+            decode_cudagraph_max_bs, dtype=torch.bool, device=device
+        ),
+        spec_token_indx=torch.empty(
+            decode_cudagraph_max_bs * state_width,
+            dtype=torch.int32,
+            device=device,
+        ),
+        non_spec_token_indx=torch.empty(
+            decode_cudagraph_max_bs * state_width,
+            dtype=torch.int32,
+            device=device,
+        ),
+        spec_query_start_loc=torch.empty(
+            decode_cudagraph_max_bs + 1, dtype=torch.int32, device=device
+        ),
+        non_spec_query_start_loc=torch.empty(
+            decode_cudagraph_max_bs + 1, dtype=torch.int32, device=device
+        ),
+        num_accepted_tokens=torch.empty(
+            decode_cudagraph_max_bs, dtype=torch.int32, device=device
+        ),
+        spec_state_slot_selectors=torch.empty(
+            decode_cudagraph_max_bs, dtype=torch.int32, device=device
+        ),
+    )
+    cache[key] = buffers
+    return buffers
 
 
 @triton.jit
@@ -595,6 +677,29 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
+
+        self._uniform_spec_common_buffers: _GDNUniformSpecCommonBuffers | None = None
+        if (
+            self.use_spec_decode
+            and self.num_spec == 3
+            and self.num_spec_state_tokens == self.num_spec
+            and self.use_full_cuda_graph
+            and _sm70_common_gdn_metadata_enabled()
+        ):
+            common_buffers = _get_uniform_spec_common_buffers(
+                vllm_config,
+                device,
+                self.decode_cudagraph_max_bs,
+                self.num_spec_state_tokens + 1,
+            )
+            self._uniform_spec_common_buffers = common_buffers
+            self.spec_sequence_masks = common_buffers.spec_sequence_masks
+            self.spec_token_indx = common_buffers.spec_token_indx
+            self.non_spec_token_indx = common_buffers.non_spec_token_indx
+            self.spec_query_start_loc = common_buffers.spec_query_start_loc
+            self.non_spec_query_start_loc = common_buffers.non_spec_query_start_loc
+            self.num_accepted_tokens = common_buffers.num_accepted_tokens
+            self.spec_state_slot_selectors = common_buffers.spec_state_slot_selectors
         if self.use_spec_decode and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
             placeholder_rows = max(
                 1, min(self.num_spec_state_tokens + 1, self.decode_cudagraph_max_bs)
@@ -629,6 +734,162 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 ),
             )
 
+    def _build_uniform_mtp_common_metadata(
+        self,
+        *,
+        common_attn_metadata: CommonAttentionMetadata,
+        num_accepted_tokens: torch.Tensor | None,
+        spec_state_slot_selectors: torch.Tensor | None,
+        num_decode_draft_tokens_cpu: torch.Tensor | None,
+        spec_sequence_masks_cpu: torch.Tensor | None,
+        current_state_block_ids: torch.Tensor | None,
+        common_gdn_metadata_epoch: int | None,
+        ddtree_parent_ids: torch.Tensor | None,
+        for_cudagraph_capture: bool,
+    ) -> GDNAttentionMetadata | None:
+        """Build only per-group state metadata after one shared q=4 build."""
+        common_buffers = self._uniform_spec_common_buffers
+        if (
+            common_buffers is None
+            or common_gdn_metadata_epoch is None
+            or for_cudagraph_capture
+            or ddtree_parent_ids is not None
+            or os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR")
+            or self.vllm_config.cache_config.mamba_cache_mode != "align"
+            or num_accepted_tokens is None
+            or spec_state_slot_selectors is None
+            or num_decode_draft_tokens_cpu is None
+            or current_state_block_ids is None
+        ):
+            return None
+
+        m = common_attn_metadata
+        query_start_loc_cpu = m.query_start_loc_cpu
+        num_reqs = query_start_loc_cpu.numel() - 1
+        state_width = self.num_spec_state_tokens + 1
+        query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
+        if (
+            num_reqs != self.vllm_config.scheduler_config.max_num_seqs
+            or num_reqs != 32
+            or m.num_actual_tokens != num_reqs * state_width
+            or current_state_block_ids.shape[0] < num_reqs
+            or current_state_block_ids.shape[1] < state_width
+            or not bool(torch.all(query_lens_cpu == state_width).item())
+            or not bool(torch.all(num_decode_draft_tokens_cpu == self.num_spec).item())
+        ):
+            return None
+
+        if spec_sequence_masks_cpu is None:
+            spec_sequence_masks_cpu = num_decode_draft_tokens_cpu >= 0
+        if spec_sequence_masks_cpu.numel() != num_reqs or not bool(
+            torch.all(spec_sequence_masks_cpu).item()
+        ):
+            return None
+
+        update_common = common_buffers.epoch != common_gdn_metadata_epoch
+        if update_common:
+            spec_sequence_masks = spec_sequence_masks_cpu.to(
+                m.query_start_loc.device, non_blocking=True
+            )
+            common_buffers.spec_sequence_masks[:num_reqs].copy_(
+                spec_sequence_masks, non_blocking=True
+            )
+            common_buffers.spec_sequence_masks[num_reqs:].fill_(False)
+
+            common_buffers.spec_token_indx[: m.num_actual_tokens].copy_(
+                torch.arange(
+                    m.num_actual_tokens,
+                    dtype=torch.int32,
+                    device=m.query_start_loc.device,
+                ),
+                non_blocking=True,
+            )
+
+            common_buffers.spec_query_start_loc[: num_reqs + 1].copy_(
+                m.query_start_loc[: num_reqs + 1], non_blocking=True
+            )
+            spec_num_query_tokens = m.query_start_loc[num_reqs]
+            common_buffers.spec_query_start_loc[num_reqs + 1 :].fill_(
+                spec_num_query_tokens
+            )
+
+            common_buffers.num_accepted_tokens[:num_reqs].copy_(
+                num_accepted_tokens[:num_reqs], non_blocking=True
+            )
+            common_buffers.num_accepted_tokens[num_reqs:].fill_(1)
+            common_buffers.spec_state_slot_selectors[:num_reqs].copy_(
+                spec_state_slot_selectors[:num_reqs], non_blocking=True
+            )
+            common_buffers.spec_state_slot_selectors[num_reqs:].fill_(1)
+            common_buffers.spec_sequence_masks_cpu = spec_sequence_masks_cpu
+            common_buffers.epoch = common_gdn_metadata_epoch
+
+        shared_mask_cpu = common_buffers.spec_sequence_masks_cpu
+        assert shared_mask_cpu is not None
+        _ = m.compute_num_computed_tokens()
+        block_table_tensor = mamba_get_block_table_tensor(
+            m.block_table_tensor,
+            m.seq_lens,
+            self.kv_cache_spec,
+            self.vllm_config.cache_config.mamba_cache_mode,
+        )
+        state_contract = build_gdn_spec_decode_state_contract(
+            block_table_tensor=block_table_tensor,
+            seq_lens=m.seq_lens,
+            block_size=self.kv_cache_spec.block_size,
+            num_spec=self.num_spec_state_tokens,
+            spec_sequence_masks_cpu=shared_mask_cpu,
+            num_accepted_tokens=num_accepted_tokens,
+            current_state_block_ids=current_state_block_ids,
+            is_mamba_cache_all=False,
+            spec_state_slot_selectors=spec_state_slot_selectors,
+        )
+
+        self.spec_state_indices_tensor[:num_reqs].copy_(
+            state_contract.spec_state_indices_tensor, non_blocking=True
+        )
+        spec_state_indices_tensor = self.spec_state_indices_tensor[
+            : m.num_actual_tokens
+        ]
+        spec_state_indices_tensor[num_reqs:].fill_(PAD_SLOT_ID)
+
+        spec_query_start_loc = common_buffers.spec_query_start_loc[
+            : m.num_actual_tokens + 1
+        ]
+        if update_common:
+            assert spec_query_start_loc[num_reqs].item() == m.num_actual_tokens
+
+        attn_metadata = GDNAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_spec_decodes=num_reqs,
+            num_spec_decode_tokens=m.num_actual_tokens,
+            num_actual_tokens=m.num_actual_tokens,
+            spec_query_start_loc=spec_query_start_loc,
+            non_spec_query_start_loc=None,
+            spec_state_indices_tensor=spec_state_indices_tensor,
+            non_spec_state_indices_tensor=None,
+            spec_sequence_masks=common_buffers.spec_sequence_masks[
+                : m.num_actual_tokens
+            ],
+            spec_token_indx=common_buffers.spec_token_indx[: m.num_actual_tokens],
+            non_spec_token_indx=common_buffers.non_spec_token_indx[:0],
+            num_accepted_tokens=common_buffers.num_accepted_tokens[
+                : m.num_actual_tokens
+            ],
+            spec_state_slot_selectors=common_buffers.spec_state_slot_selectors[
+                : m.num_actual_tokens
+            ],
+        )
+        if self.use_spec_decode and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
+            register_gdn_spec_metadata_tensors(
+                self.layer_names,
+                gdn_spec_metadata_tensors(attn_metadata, m.query_start_loc.device),
+            )
+        return attn_metadata
+
     def build(  # type: ignore[override]
         self,
         common_prefix_len: int,
@@ -640,6 +901,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         current_state_block_ids: torch.Tensor | None = None,
         ddtree_parent_ids: torch.Tensor | None = None,
         ddtree_num_tree_tokens_cpu: torch.Tensor | None = None,
+        common_gdn_metadata_epoch: int | None = None,
         for_cudagraph_capture: bool = False,
         fast_build: bool = False,
     ) -> GDNAttentionMetadata:
@@ -682,6 +944,20 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             assert ddtree_num_tree_tokens_cpu.numel() == num_reqs, (
                 "ddtree_num_tree_tokens_cpu must align with query_start_loc"
             )
+
+        uniform_metadata = self._build_uniform_mtp_common_metadata(
+            common_attn_metadata=common_attn_metadata,
+            num_accepted_tokens=num_accepted_tokens,
+            spec_state_slot_selectors=spec_state_slot_selectors,
+            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            spec_sequence_masks_cpu=spec_sequence_masks_cpu,
+            current_state_block_ids=current_state_block_ids,
+            common_gdn_metadata_epoch=common_gdn_metadata_epoch,
+            ddtree_parent_ids=ddtree_parent_ids,
+            for_cudagraph_capture=for_cudagraph_capture,
+        )
+        if uniform_metadata is not None:
+            return uniform_metadata
 
         if (
             os.getenv("VLLM_SM70_GDN_SINGLE_SPEC_METADATA", "0") == "1"
