@@ -1274,24 +1274,6 @@ def _resolve_qwen_gdn_kv_cache_args(
     return fallback.new_empty((0,)), fallback.new_empty((0,))
 
 
-def _shared_qwen_gdn_cache_storage(
-    conv_state_cache: torch.Tensor,
-    ssm_state_cache: torch.Tensor,
-) -> torch.Tensor | None:
-    """Create one byte marker for the shared allocation of both cache views."""
-    conv_storage = conv_state_cache.untyped_storage()
-    ssm_storage = ssm_state_cache.untyped_storage()
-    if conv_storage._cdata != ssm_storage._cdata:
-        return None
-    # One byte is enough to expose the shared storage dependency. A full-size
-    # marker makes AOTAutograd retain an extra cache-sized graph allocation.
-    return torch.empty(
-        0,
-        dtype=torch.uint8,
-        device=conv_state_cache.device,
-    ).set_(conv_storage, 0, (1,), (1,))
-
-
 def _sm70_mixed_qkv_state_diff_stats(
     mixed_state: torch.Tensor,
     ref_state: torch.Tensor,
@@ -2007,20 +1989,6 @@ class ChunkGatedDeltaRule(CustomOp):
 
 @PluggableLayer.register("qwen_gated_delta_net_attention")
 class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
-    @property
-    def kv_cache(self) -> tuple[torch.Tensor, ...]:
-        return self._kv_cache
-
-    @kv_cache.setter
-    def kv_cache(self, value: tuple[torch.Tensor, ...]) -> None:
-        self._kv_cache = value
-        self._direct_state_cache_marker = None
-        if len(value) >= 2:
-            self._direct_state_cache_marker = _shared_qwen_gdn_cache_storage(
-                value[0],
-                value[1],
-            )
-
     def get_state_shape(
         self,
     ) -> tuple[tuple[int, ...], tuple[int, ...], tuple[int, ...], tuple[int, ...]]:
@@ -3095,13 +3063,16 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 disabled=self.disable_sm70_qwen_gdn_full_forward,
                 auto_enabled=self.auto_sm70_qwen_gdn_full_forward,
             ):
-                state_cache = getattr(self, "_direct_state_cache_marker", None)
-                if state_cache is not None:
-                    return torch.ops.vllm.qwen_gdn_full_forward_direct(
-                        hidden_states,
-                        state_cache,
-                        layer_name,
-                    )
+                conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
+                    layer_name,
+                    hidden_states,
+                )
+                return torch.ops.vllm.qwen_gdn_full_forward_direct(
+                    hidden_states,
+                    conv_state_cache,
+                    ssm_state_cache,
+                    layer_name,
+                )
 
         # Prefill and every non-SM70/non-MTP fallback keep the established
         # preallocated-output contract.
@@ -6116,16 +6087,15 @@ def qwen_gdn_full_forward_fake(
 
 def qwen_gdn_full_forward_direct(
     hidden_states: torch.Tensor,
-    state_cache: torch.Tensor,
+    conv_state_cache: torch.Tensor,
+    ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     """Run Qwen3.5 GDN and return its row-parallel projection allocation."""
     layer_name = _resolve_layer_name(layer_name)
     forward_context: ForwardContext = get_forward_context()
     self = forward_context.no_compile_layers[layer_name]
-    # The single storage marker represents both differently typed cache views.
-    # Passing both views makes AOTAutograd reject their declared mutations.
-    _ = state_cache
+    _ = conv_state_cache, ssm_state_cache
     _log_runtime_route_once("SM70 Qwen GDN direct-output route enabled.")
     output = self._forward_method(hidden_states, None)
     if not isinstance(output, torch.Tensor):
@@ -6137,7 +6107,8 @@ def qwen_gdn_full_forward_direct(
 
 def qwen_gdn_full_forward_direct_fake(
     hidden_states: torch.Tensor,
-    state_cache: torch.Tensor,
+    conv_state_cache: torch.Tensor,
+    ssm_state_cache: torch.Tensor,
     layer_name: LayerNameType,
 ) -> torch.Tensor:
     """Return the contiguous output metadata produced by RowParallelLinear."""
@@ -6325,7 +6296,7 @@ direct_register_custom_op(
 direct_register_custom_op(
     op_name="qwen_gdn_full_forward_direct",
     op_func=qwen_gdn_full_forward_direct,
-    mutates_args=["state_cache"],
+    mutates_args=["conv_state_cache", "ssm_state_cache"],
     fake_impl=qwen_gdn_full_forward_direct_fake,
 )
 

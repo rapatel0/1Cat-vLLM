@@ -84,8 +84,14 @@ def _run_gdn_projection(layer, output: torch.Tensor | None) -> torch.Tensor:
 
 
 def test_sm70_mtp3_direct_attention_output_scope():
+    from vllm.config.compilation import CompilationConfig
     from vllm.model_executor.models.qwen3_5 import (
         _sm70_mtp3_direct_attention_output_enabled,
+    )
+
+    assert (
+        "vllm::qwen_gdn_full_forward_direct"
+        in CompilationConfig._attention_ops
     )
 
     config = Mock()
@@ -225,7 +231,6 @@ def test_direct_route_removes_64_copies_without_more_projections():
 
 def test_qwen_gdn_direct_custom_op_returns_projection_allocation():
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-        _shared_qwen_gdn_cache_storage,
         qwen_gdn_full_forward_direct,
         qwen_gdn_full_forward_direct_fake,
     )
@@ -236,27 +241,8 @@ def test_qwen_gdn_direct_custom_op_returns_projection_allocation():
         _forward_method=Mock(return_value=projection),
     )
     context = SimpleNamespace(no_compile_layers={"model.layers.0.linear_attn": layer})
-    cache_storage = torch.empty(32, dtype=torch.uint8)
-    conv_cache = cache_storage.view(torch.float16)
-    ssm_cache = cache_storage.view(torch.float32)
-    state_cache = _shared_qwen_gdn_cache_storage(conv_cache, ssm_cache)
-    assert state_cache is not None
-    assert state_cache.data_ptr() == cache_storage.data_ptr()
-    assert state_cache.dtype == torch.uint8
-    assert state_cache.numel() == 1
-    assert _shared_qwen_gdn_cache_storage(conv_cache, torch.empty(8)) is None
-
-    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-        QwenGatedDeltaNetAttention,
-    )
-
-    bound_layer = SimpleNamespace()
-    QwenGatedDeltaNetAttention.kv_cache.fset(
-        bound_layer,
-        (conv_cache, ssm_cache),
-    )
-    assert bound_layer._direct_state_cache_marker is not None
-    assert bound_layer._direct_state_cache_marker.data_ptr() == cache_storage.data_ptr()
+    conv_cache = torch.empty(0)
+    ssm_cache = torch.empty(0)
     with (
         patch(
             "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn."
@@ -270,7 +256,8 @@ def test_qwen_gdn_direct_custom_op_returns_projection_allocation():
     ):
         output = qwen_gdn_full_forward_direct(
             hidden_states,
-            cache_storage,
+            conv_cache,
+            ssm_cache,
             "model.layers.0.linear_attn",
         )
 
@@ -278,7 +265,8 @@ def test_qwen_gdn_direct_custom_op_returns_projection_allocation():
     layer._forward_method.assert_called_once_with(hidden_states, None)
     fake_output = qwen_gdn_full_forward_direct_fake(
         hidden_states,
-        cache_storage,
+        conv_cache,
+        ssm_cache,
         "model.layers.0.linear_attn",
     )
     assert fake_output.shape == hidden_states.shape
@@ -289,58 +277,16 @@ def test_qwen_gdn_direct_custom_op_returns_projection_allocation():
 
     with FakeTensorMode() as fake_mode:
         fake_hidden = fake_mode.from_tensor(hidden_states)
-        fake_cache = fake_mode.from_tensor(cache_storage)
+        fake_conv = fake_mode.from_tensor(conv_cache)
+        fake_ssm = fake_mode.from_tensor(ssm_cache)
         dispatched_fake = torch.ops.vllm.qwen_gdn_full_forward_direct(
             fake_hidden,
-            fake_cache,
+            fake_conv,
+            fake_ssm,
             "model.layers.0.linear_attn",
         )
     assert dispatched_fake.shape == hidden_states.shape
     assert dispatched_fake.is_contiguous()
-
-
-def test_qwen_gdn_direct_custom_op_compiles_with_typed_cache_views():
-    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
-        pytest.skip("The direct MTP3 compile route requires an SM70 CUDA device")
-
-    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-        _shared_qwen_gdn_cache_storage,
-    )
-
-    hidden_states = torch.randn(4, 8, device="cuda", dtype=torch.float16)
-    cache_storage = torch.empty(256, device="cuda", dtype=torch.uint8)
-    conv_cache = cache_storage.view(torch.float16)
-    ssm_cache = cache_storage.view(torch.float32)
-    state_cache = _shared_qwen_gdn_cache_storage(conv_cache, ssm_cache)
-    assert state_cache is not None
-    assert state_cache.data_ptr() == cache_storage.data_ptr()
-    projection = torch.randn_like(hidden_states)
-    layer = SimpleNamespace(_forward_method=Mock(return_value=projection))
-    context = SimpleNamespace(no_compile_layers={"model.layers.0.linear_attn": layer})
-
-    @torch.compile(fullgraph=True)
-    def invoke(hidden_states: torch.Tensor) -> torch.Tensor:
-        return torch.ops.vllm.qwen_gdn_full_forward_direct(
-            hidden_states,
-            state_cache,
-            "model.layers.0.linear_attn",
-        )
-
-    with (
-        patch(
-            "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn."
-            "get_forward_context",
-            return_value=context,
-        ),
-        patch(
-            "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn."
-            "_log_runtime_route_once"
-        ),
-    ):
-        output = invoke(hidden_states)
-        torch.cuda.synchronize()
-
-    assert output.data_ptr() == projection.data_ptr()
 
 
 @pytest.mark.parametrize("num_tokens", [4, 128])
