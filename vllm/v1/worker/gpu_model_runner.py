@@ -3536,60 +3536,6 @@ class GPUModelRunner(
             positions=self.positions[:num_tokens_padded],
         )
 
-        common_gdn_metadata_epoch: int | None = None
-        current_req_ids = tuple(self.input_batch.req_ids[:num_reqs])
-        previous_req_ids = getattr(self, "_sm70_common_gdn_req_ids", None)
-        ownership_unchanged = previous_req_ids == current_req_ids
-        if not for_cudagraph_capture:
-            self._sm70_common_gdn_req_ids = current_req_ids
-
-        if (
-            use_spec_decode
-            and not for_cudagraph_capture
-            and ubatch_slices is None
-            and ddtree_parent_metadata is None
-            and current_platform.is_device_capability(70)
-            and self.cache_config.mamba_cache_mode == "align"
-            and not os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR")
-            and ownership_unchanged
-            and num_reqs == self.max_num_reqs == 32
-            and num_reqs_padded == num_reqs
-            and num_tokens == num_tokens_padded
-            and num_tokens == num_reqs * (self.num_spec_tokens + 1)
-        ):
-            query_lens_cpu = (
-                cm_base.query_start_loc_cpu[1:] - cm_base.query_start_loc_cpu[:-1]
-            )
-            draft_counts_cpu = self.num_decode_draft_tokens.cpu[:num_reqs]
-            gdn_builders = []
-            for groups in self.attn_groups:
-                for attn_group in groups:
-                    builder = attn_group.get_metadata_builder(0)
-                    if isinstance(builder, GDNAttentionMetadataBuilder):
-                        gdn_builders.append(builder)
-            shared_buffers = [
-                builder._uniform_spec_common_buffers for builder in gdn_builders
-            ]
-            if (
-                len(gdn_builders) == 3
-                and all(builder.num_spec == 3 for builder in gdn_builders)
-                and all(
-                    builder.num_spec_state_tokens == self.num_spec_tokens
-                    for builder in gdn_builders
-                )
-                and shared_buffers[0] is not None
-                and all(buffers is shared_buffers[0] for buffers in shared_buffers)
-                and bool(
-                    torch.all(query_lens_cpu == self.num_spec_tokens + 1).item()
-                )
-                and bool(
-                    torch.all(draft_counts_cpu == self.num_spec_tokens).item()
-                )
-            ):
-                epoch = getattr(self, "_sm70_common_gdn_metadata_epoch", 0) + 1
-                self._sm70_common_gdn_metadata_epoch = epoch
-                common_gdn_metadata_epoch = epoch
-
         current_mamba_state_block_ids_by_gid: dict[int, torch.Tensor] = {}
 
         def _get_current_mamba_state_block_ids(
@@ -3685,10 +3631,6 @@ class GPUModelRunner(
                     extra_attn_metadata_args["spec_state_slot_selectors"] = (
                         self.spec_state_slot_selectors.gpu[:num_reqs_padded]
                     )
-                    if common_gdn_metadata_epoch is not None:
-                        extra_attn_metadata_args["common_gdn_metadata_epoch"] = (
-                            common_gdn_metadata_epoch
-                        )
                 if (
                     ddtree_parent_metadata is not None
                     and isinstance(builder, GDNAttentionMetadataBuilder)

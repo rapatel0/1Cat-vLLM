@@ -459,7 +459,9 @@ def test_spec_state_slot_selector_can_differ_from_accepted_count(local_gdn_model
         common_prefix_len=0,
         common_attn_metadata=common,
         num_accepted_tokens=torch.tensor([2], dtype=torch.int32, device=DEVICE),
-        spec_state_slot_selectors=torch.tensor([4], dtype=torch.int32, device=DEVICE),
+        spec_state_slot_selectors=torch.tensor(
+            [4], dtype=torch.int32, device=DEVICE
+        ),
         num_decode_draft_tokens_cpu=torch.tensor([4], dtype=torch.int32, device="cpu"),
     )
 
@@ -702,183 +704,6 @@ def test_align_active_mtp_rollover_contract_near_block_boundary(
     )
 
 
-def test_uniform_mtp3_common_metadata_shares_only_invariant_buffers(
-    monkeypatch,
-    local_gdn_model,
-):
-    monkeypatch.setenv("VLLM_SM70_COMMON_GDN_METADATA", "1")
-    vllm_config = create_vllm_config(
-        model_name=local_gdn_model,
-        block_size=BLOCK_SIZE,
-    )
-    vllm_config.cache_config.mamba_cache_mode = "align"
-    vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.FULL
-    vllm_config.compilation_config.max_cudagraph_capture_size = 128
-    vllm_config.scheduler_config.max_num_seqs = 32
-    vllm_config.speculative_config = SpeculativeConfig(
-        method="ngram",
-        num_speculative_tokens=3,
-    )
-    mamba_spec = MambaSpec(
-        block_size=BLOCK_SIZE,
-        shapes=((16, 64),),
-        dtypes=(torch.float16,),
-        num_speculative_blocks=3,
-    )
-    builders = [
-        GDNAttentionMetadataBuilder(
-            kv_cache_spec=mamba_spec,
-            layer_names=[f"layer.{group}"],
-            vllm_config=vllm_config,
-            device=DEVICE,
-        )
-        for group in range(3)
-    ]
-    batch = BatchSpec(
-        seq_lens=[100 + index for index in range(32)],
-        query_lens=[4] * 32,
-    )
-    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE)
-    extra_blocks = torch.arange(
-        5000,
-        5000 + 32 * 4,
-        dtype=torch.int32,
-        device=DEVICE,
-    ).reshape(32, 4)
-    common = common.replace(
-        block_table_tensor=torch.cat(
-            (common.block_table_tensor, extra_blocks), dim=1
-        )
-    )
-    accepted = torch.tensor(
-        [(index % 4) + 1 for index in range(32)],
-        dtype=torch.int32,
-        device=DEVICE,
-    )
-    selectors = torch.tensor(
-        [((index + 1) % 4) + 1 for index in range(32)],
-        dtype=torch.int32,
-        device=DEVICE,
-    )
-    drafts = torch.full((32,), 3, dtype=torch.int32, device="cpu")
-    state_ids = [
-        torch.arange(
-            1000 * (group + 1),
-            1000 * (group + 1) + 128,
-            dtype=torch.int32,
-            device=DEVICE,
-        ).reshape(32, 4)
-        for group in range(3)
-    ]
-
-    metadata = [
-        builder.build(
-            common_prefix_len=0,
-            common_attn_metadata=common,
-            num_accepted_tokens=accepted,
-            spec_state_slot_selectors=selectors,
-            num_decode_draft_tokens_cpu=drafts,
-            current_state_block_ids=state_ids[group],
-            common_gdn_metadata_epoch=1,
-        )
-        for group, builder in enumerate(builders)
-    ]
-
-    invariant_fields = (
-        "spec_query_start_loc",
-        "non_spec_query_start_loc",
-        "spec_sequence_masks",
-        "spec_token_indx",
-        "non_spec_token_indx",
-        "num_accepted_tokens",
-        "spec_state_slot_selectors",
-    )
-    for field in invariant_fields:
-        first = getattr(metadata[0], field)
-        for item in metadata[1:]:
-            other = getattr(item, field)
-            if first is None:
-                assert other is None
-            else:
-                assert other is not None
-                assert first.data_ptr() == other.data_ptr()
-                assert torch.equal(first, other)
-
-    state_ptrs = {
-        item.spec_state_indices_tensor.data_ptr()  # type: ignore[union-attr]
-        for item in metadata
-    }
-    assert len(state_ptrs) == 3
-    for group, item in enumerate(metadata):
-        assert item.spec_state_indices_tensor is not None
-        assert torch.equal(item.spec_state_indices_tensor[:32], state_ids[group])
-        assert item.spec_state_indices_tensor[32:].eq(PAD_SLOT_ID).all()
-
-    changed_accepted = torch.roll(accepted, 1)
-    changed_selectors = torch.roll(selectors, 2)
-    changed_state_ids = [state_ids[group] + 17 for group in range(3)]
-    changed = [
-        builder.build(
-            common_prefix_len=0,
-            common_attn_metadata=common,
-            num_accepted_tokens=changed_accepted,
-            spec_state_slot_selectors=changed_selectors,
-            num_decode_draft_tokens_cpu=drafts,
-            current_state_block_ids=changed_state_ids[group],
-            common_gdn_metadata_epoch=2,
-        )
-        for group, builder in enumerate(builders)
-    ]
-    assert torch.equal(changed[0].num_accepted_tokens[:32], changed_accepted)
-    assert torch.equal(changed[0].spec_state_slot_selectors[:32], changed_selectors)
-    for group, item in enumerate(changed):
-        assert torch.equal(
-            item.spec_state_indices_tensor[:32], changed_state_ids[group]
-        )
-
-    c1_batch = BatchSpec(seq_lens=[100], query_lens=[4])
-    c1_common = create_common_attn_metadata(c1_batch, BLOCK_SIZE, DEVICE)
-    c1_common = c1_common.replace(
-        block_table_tensor=torch.cat(
-            (
-                c1_common.block_table_tensor,
-                torch.arange(4, dtype=torch.int32, device=DEVICE).reshape(1, 4),
-            ),
-            dim=1,
-        )
-    )
-    common_buffers = builders[0]._uniform_spec_common_buffers
-    assert common_buffers is not None and common_buffers.epoch == 2
-    builders[0].build(
-        common_prefix_len=0,
-        common_attn_metadata=c1_common,
-        num_accepted_tokens=torch.ones(1, dtype=torch.int32, device=DEVICE),
-        spec_state_slot_selectors=torch.ones(1, dtype=torch.int32, device=DEVICE),
-        num_decode_draft_tokens_cpu=torch.full(
-            (1,), 3, dtype=torch.int32, device="cpu"
-        ),
-        current_state_block_ids=torch.arange(
-            4, dtype=torch.int32, device=DEVICE
-        ).reshape(1, 4),
-        common_gdn_metadata_epoch=3,
-    )
-    assert common_buffers.epoch == 2
-
-    mtp4_builder = _create_gdn_builder(
-        local_gdn_model,
-        num_speculative_tokens=4,
-        use_full_cuda_graph=True,
-        max_cudagraph_capture_size=128,
-    )
-    no_mtp_builder = _create_gdn_builder(
-        local_gdn_model,
-        use_full_cuda_graph=True,
-        max_cudagraph_capture_size=128,
-    )
-    assert mtp4_builder._uniform_spec_common_buffers is None
-    assert no_mtp_builder._uniform_spec_common_buffers is None
-
-
 def test_spec_core_placeholder_registry_includes_state_slot_selector(
     monkeypatch,
     local_gdn_model,
@@ -915,7 +740,9 @@ def test_gdn_state_contract_debug_assert_rejects_pad_accepted_slot(
             spec_sequence_masks_cpu=torch.tensor(
                 [True], dtype=torch.bool, device="cpu"
             ),
-            num_accepted_tokens=torch.tensor([5], dtype=torch.int32, device=DEVICE),
+            num_accepted_tokens=torch.tensor(
+                [5], dtype=torch.int32, device=DEVICE
+            ),
             current_state_block_ids=None,
             is_mamba_cache_all=False,
         )
@@ -942,7 +769,9 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
         num_spec_decodes=2,
         num_spec_decode_tokens=10,
         num_actual_tokens=10,
-        spec_query_start_loc=torch.tensor([0, 5, 10], dtype=torch.int32, device=DEVICE),
+        spec_query_start_loc=torch.tensor(
+            [0, 5, 10], dtype=torch.int32, device=DEVICE
+        ),
         spec_state_indices_tensor=torch.tensor(
             [[10, 11, 12, 13, 14], [20, 21, 22, 23, 24]],
             dtype=torch.int32,
@@ -983,6 +812,7 @@ def test_spec_commit_pure_decode_consumes_padded_graph_rows_without_metadata_pat
     seen: dict[str, object] = {}
 
     class FakeLayer:
+
         def __init__(self) -> None:
             self.conv1d = torch.nn.Identity()
             self.conv1d.weight = torch.empty((8, 1, 1), device=DEVICE)
