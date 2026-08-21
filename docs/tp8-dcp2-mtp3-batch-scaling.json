@@ -1,0 +1,678 @@
+{
+  "outcome": {
+    "decision": "restore max_num_seqs=32 fallback",
+    "reason": "larger batches increase aggregate throughput but do not increase sustained SM utilization; max64 lacks safe memory headroom and expanded limits regress c32",
+    "bottleneck": "device dependency and CUDA graph replay gaps, not scheduler batching"
+  },
+  "fixed_policy": {
+    "runtime_source": "d299e4acbc, byte-equivalent to 59a5fa11f0",
+    "mtp_depth": 3,
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 2,
+    "attention_backend": "FLASH_ATTN_V100",
+    "dcp_backend": "packed A2A plus direct query gather",
+    "tp_backend": "automatic PyNCCL",
+    "draft_sampling": "probabilistic",
+    "local_argmax": true,
+    "max_num_batched_tokens": 16384,
+    "batched_token_explanation": "c64 x 256 prompt tokens equals 16,384; q=4 decode uses 256 verifier tokens at c64. The ceiling did not need a change."
+  },
+  "protocol": {
+    "short_matrix": "two 64-token warmups plus five fixed-corpus 256-token completion cohorts per matrix cell",
+    "steady_state": "closed-loop immediate replacement with 2,048-token completions for 600 seconds",
+    "gpu_sampling": "nvidia-smi dmon configured at a 1-second delay on all eight GPUs",
+    "scheduler_sampling": "vLLM metrics at a 1-second delay",
+    "correctness": "8K exact retrieval after every clean valid configuration and long-output quality checks"
+  },
+  "short_matrix": {
+    "max32": {
+      "c32": {
+        "median_aggregate_tok_s": 719.9676454191908,
+        "mean_aggregate_tok_s": 688.2622478679303,
+        "range_aggregate_tok_s": [
+          585.4824944921783,
+          726.6384426676839
+        ],
+        "median_request_latency_s": 10.996458104113117,
+        "median_verifier_batch_step_ms": 99.45513538831051,
+        "waiting_max": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "corpus_hashes": [
+          "a89f32e02c503cc6b59ce4309c7d1b55b614877c15f4f6a1017e9f93348ed3cc",
+          "0aba09550ae87a867d6cd23b2528f695f65bcad7ccc08b1ed0864a2fd9df706f",
+          "3a0e0c9190230050d269299b9b2dd0b9c96cc2b105ffccebae420017dc8ccdbd",
+          "0c0a8a379a12da73d911f6e83c276e4989a33e2d7b28e2a2c8dae5aa10bb76df",
+          "88239d236eed253b94be5005e470bfdc57b6739ecc43e07aeca9c5bcf54a85da"
+        ]
+      },
+      "c40": {
+        "median_aggregate_tok_s": 529.7437172399618,
+        "mean_aggregate_tok_s": 531.2114981087335,
+        "range_aggregate_tok_s": [
+          506.1552972082748,
+          556.7161838781572
+        ],
+        "median_request_latency_s": 13.626960041932762,
+        "median_verifier_batch_step_ms": 169.37657685589295,
+        "waiting_max": [
+          8.0,
+          8.0,
+          8.0,
+          8.0,
+          8.0
+        ],
+        "corpus_hashes": [
+          "d4e0b152682d6ce902bb1b1d3e546f3112a8e25e3033a978b181da4a29a17e88",
+          "02c4d84f6ae6716f476e672b686a4190cb7044f3c5dab13945ee9a73fc6cae16",
+          "a9484514324dca51786dcefedc859793f0c813c96298f56d19c297ff6b92a0c3",
+          "883a7a27f57f1c6fce9caab680094afb56f6d3a9a034333837dcec70928fa042",
+          "d8b6f939c042d1d694cb0599482ffd66d2c725c276e9d32ca737b735d32fe26d"
+        ]
+      },
+      "c48": {
+        "median_aggregate_tok_s": 555.7263296159704,
+        "mean_aggregate_tok_s": 559.6199205697163,
+        "range_aggregate_tok_s": [
+          540.4817280804166,
+          584.6895104734077
+        ],
+        "median_request_latency_s": 14.911721312440932,
+        "median_verifier_batch_step_ms": 192.48403082637196,
+        "waiting_max": [
+          16.0,
+          16.0,
+          16.0,
+          16.0,
+          16.0
+        ],
+        "corpus_hashes": [
+          "ed77470b12ae7a7486278d377eccc9305bebe8f24f4815e9959df02285870ce4",
+          "df7798b7399282a844ab3b64f06cfdc1fa90a4f961e4a28357fb6928687be152",
+          "3c228f006ecffa5f37073a9ad3484b3f8d5b9744449e294b6337148c900b7b3d",
+          "f21951329daa74887c781a6f59890fcc04a931fec776c2285c1e54cc4ba30293",
+          "244d1ed741805da6e492d12d37ccdd14cbe6b603336a7a27b0e14eac88d4effe"
+        ]
+      }
+    },
+    "max40": {
+      "c32": {
+        "median_aggregate_tok_s": 669.6307326562461,
+        "mean_aggregate_tok_s": 665.0906141473314,
+        "range_aggregate_tok_s": [
+          645.4181212484849,
+          680.5680500178873
+        ],
+        "median_request_latency_s": 11.175800187513232,
+        "median_verifier_batch_step_ms": 106.5819388371607,
+        "waiting_max": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "corpus_hashes": [
+          "a89f32e02c503cc6b59ce4309c7d1b55b614877c15f4f6a1017e9f93348ed3cc",
+          "0aba09550ae87a867d6cd23b2528f695f65bcad7ccc08b1ed0864a2fd9df706f",
+          "3a0e0c9190230050d269299b9b2dd0b9c96cc2b105ffccebae420017dc8ccdbd",
+          "0c0a8a379a12da73d911f6e83c276e4989a33e2d7b28e2a2c8dae5aa10bb76df",
+          "88239d236eed253b94be5005e470bfdc57b6739ecc43e07aeca9c5bcf54a85da"
+        ]
+      },
+      "c40": {
+        "median_aggregate_tok_s": 833.8615938117202,
+        "mean_aggregate_tok_s": 826.6519537934977,
+        "range_aggregate_tok_s": [
+          811.8508849511054,
+          840.174025937181
+        ],
+        "median_request_latency_s": 11.970583896152675,
+        "median_verifier_batch_step_ms": 107.74481611787607,
+        "waiting_max": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "corpus_hashes": [
+          "d4e0b152682d6ce902bb1b1d3e546f3112a8e25e3033a978b181da4a29a17e88",
+          "02c4d84f6ae6716f476e672b686a4190cb7044f3c5dab13945ee9a73fc6cae16",
+          "a9484514324dca51786dcefedc859793f0c813c96298f56d19c297ff6b92a0c3",
+          "883a7a27f57f1c6fce9caab680094afb56f6d3a9a034333837dcec70928fa042",
+          "d8b6f939c042d1d694cb0599482ffd66d2c725c276e9d32ca737b735d32fe26d"
+        ]
+      },
+      "c48": {
+        "median_aggregate_tok_s": 560.0771127099171,
+        "mean_aggregate_tok_s": 572.4519740807706,
+        "range_aggregate_tok_s": [
+          536.8922475137488,
+          630.7404253060852
+        ],
+        "median_request_latency_s": 15.893733208300546,
+        "median_verifier_batch_step_ms": 191.0927468666449,
+        "waiting_max": [
+          8.0,
+          8.0,
+          8.0,
+          8.0,
+          8.0
+        ],
+        "corpus_hashes": [
+          "ed77470b12ae7a7486278d377eccc9305bebe8f24f4815e9959df02285870ce4",
+          "df7798b7399282a844ab3b64f06cfdc1fa90a4f961e4a28357fb6928687be152",
+          "3c228f006ecffa5f37073a9ad3484b3f8d5b9744449e294b6337148c900b7b3d",
+          "f21951329daa74887c781a6f59890fcc04a931fec776c2285c1e54cc4ba30293",
+          "244d1ed741805da6e492d12d37ccdd14cbe6b603336a7a27b0e14eac88d4effe"
+        ]
+      }
+    },
+    "max48": {
+      "c32": {
+        "median_aggregate_tok_s": 673.4870568328436,
+        "mean_aggregate_tok_s": 677.8804475025222,
+        "range_aggregate_tok_s": [
+          616.0043139152266,
+          726.4029145244112
+        ],
+        "median_request_latency_s": 11.169463625177741,
+        "median_verifier_batch_step_ms": 106.28998069604324,
+        "waiting_max": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "corpus_hashes": [
+          "a89f32e02c503cc6b59ce4309c7d1b55b614877c15f4f6a1017e9f93348ed3cc",
+          "0aba09550ae87a867d6cd23b2528f695f65bcad7ccc08b1ed0864a2fd9df706f",
+          "3a0e0c9190230050d269299b9b2dd0b9c96cc2b105ffccebae420017dc8ccdbd",
+          "0c0a8a379a12da73d911f6e83c276e4989a33e2d7b28e2a2c8dae5aa10bb76df",
+          "88239d236eed253b94be5005e470bfdc57b6739ecc43e07aeca9c5bcf54a85da"
+        ]
+      },
+      "c40": {
+        "median_aggregate_tok_s": 785.413892515915,
+        "mean_aggregate_tok_s": 797.6659851623785,
+        "range_aggregate_tok_s": [
+          774.5372297272942,
+          827.9043573683406
+        ],
+        "median_request_latency_s": 12.671618333319202,
+        "median_verifier_batch_step_ms": 113.99092312719002,
+        "waiting_max": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "corpus_hashes": [
+          "d4e0b152682d6ce902bb1b1d3e546f3112a8e25e3033a978b181da4a29a17e88",
+          "02c4d84f6ae6716f476e672b686a4190cb7044f3c5dab13945ee9a73fc6cae16",
+          "a9484514324dca51786dcefedc859793f0c813c96298f56d19c297ff6b92a0c3",
+          "883a7a27f57f1c6fce9caab680094afb56f6d3a9a034333837dcec70928fa042",
+          "d8b6f939c042d1d694cb0599482ffd66d2c725c276e9d32ca737b735d32fe26d"
+        ]
+      },
+      "c48": {
+        "median_aggregate_tok_s": 902.9190036596618,
+        "mean_aggregate_tok_s": 904.5813058442585,
+        "range_aggregate_tok_s": [
+          899.6531250397295,
+          909.8665542354005
+        ],
+        "median_request_latency_s": 13.182685083243996,
+        "median_verifier_batch_step_ms": 118.9705625049185,
+        "waiting_max": [
+          0.0,
+          0.0,
+          0.0,
+          0.0,
+          0.0
+        ],
+        "corpus_hashes": [
+          "ed77470b12ae7a7486278d377eccc9305bebe8f24f4815e9959df02285870ce4",
+          "df7798b7399282a844ab3b64f06cfdc1fa90a4f961e4a28357fb6928687be152",
+          "3c228f006ecffa5f37073a9ad3484b3f8d5b9744449e294b6337148c900b7b3d",
+          "f21951329daa74887c781a6f59890fcc04a931fec776c2285c1e54cc4ba30293",
+          "244d1ed741805da6e492d12d37ccdd14cbe6b603336a7a27b0e14eac88d4effe"
+        ]
+      }
+    }
+  },
+  "short_tradeoff": {
+    "max32_c32_median_tok_s": 719.9676454191908,
+    "max40_c40_median_tok_s": 833.8615938117202,
+    "max48_c48_median_tok_s": 902.9190036596618,
+    "max40_c40_change_vs_max32_c32_pct": 15.819314814656193,
+    "max48_c48_change_vs_max32_c32_pct": 25.411052761120988,
+    "max40_c32_change_pct": -6.991552062542583,
+    "max48_c32_change_pct": -6.455927413138774
+  },
+  "steady_state": {
+    "c32": {
+      "duration_s": 600,
+      "steady_aggregate_tok_s": 778.095,
+      "completion_tokens_per_request_step": 2.449278631761188,
+      "accepted_tokens_per_request_step": 1.4492471538744032,
+      "verifier_batch_step_ms": 100.72923771050837,
+      "scheduler": {
+        "samples": 526,
+        "active_mean": 31.90494296577947,
+        "active_p50": 32.0,
+        "active_min": 30.0,
+        "active_max": 32.0,
+        "full_active_fraction": 0.9182509505703422,
+        "waiting_mean": 0.0,
+        "waiting_max": 0.0,
+        "kv_cache_usage_mean": 0.16209448491268988,
+        "kv_cache_usage_max": 0.17638588912886966
+      },
+      "request_latency_s_median": 84.24784412514418,
+      "request_latency_s_p95": 91.15527158416808,
+      "quality": {
+        "all_completed_2048": true,
+        "min_unique_20word_ratio": 0.5105263157894737,
+        "max_identical_line_run": 1,
+        "max_digit_run": 6
+      },
+      "gpu": {
+        "samples": 3344,
+        "per_gpu": {
+          "0": {
+            "samples": 418,
+            "sm_mean": 74.69377990430623,
+            "sm_p50": 82.0,
+            "sm_p95": 84.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 131.14354066985646,
+            "power_max_w": 164.0,
+            "temperature_max_c": 47.0,
+            "memory_max_mib": 28006.0,
+            "pcie_rx_mean_mib_s": 1634.858851674641,
+            "pcie_tx_mean_mib_s": 218.83732057416267
+          },
+          "1": {
+            "samples": 418,
+            "sm_mean": 78.30143540669856,
+            "sm_p50": 83.0,
+            "sm_p95": 85.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 130.58612440191388,
+            "power_max_w": 161.0,
+            "temperature_max_c": 54.0,
+            "memory_max_mib": 28006.0,
+            "pcie_rx_mean_mib_s": 1682.22009569378,
+            "pcie_tx_mean_mib_s": 232.4090909090909
+          },
+          "2": {
+            "samples": 418,
+            "sm_mean": 77.04545454545455,
+            "sm_p50": 84.0,
+            "sm_p95": 86.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 136.19617224880383,
+            "power_max_w": 172.0,
+            "temperature_max_c": 55.0,
+            "memory_max_mib": 28078.0,
+            "pcie_rx_mean_mib_s": 1631.6052631578948,
+            "pcie_tx_mean_mib_s": 221.22966507177034
+          },
+          "3": {
+            "samples": 418,
+            "sm_mean": 75.7177033492823,
+            "sm_p50": 82.0,
+            "sm_p95": 85.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 131.9090909090909,
+            "power_max_w": 164.0,
+            "temperature_max_c": 49.0,
+            "memory_max_mib": 28078.0,
+            "pcie_rx_mean_mib_s": 1728.0502392344497,
+            "pcie_tx_mean_mib_s": 221.26794258373207
+          },
+          "4": {
+            "samples": 418,
+            "sm_mean": 79.7511961722488,
+            "sm_p50": 84.0,
+            "sm_p95": 86.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 137.1267942583732,
+            "power_max_w": 175.0,
+            "temperature_max_c": 50.0,
+            "memory_max_mib": 28006.0,
+            "pcie_rx_mean_mib_s": 1685.6076555023924,
+            "pcie_tx_mean_mib_s": 232.9665071770335
+          },
+          "5": {
+            "samples": 418,
+            "sm_mean": 73.60765550239235,
+            "sm_p50": 83.0,
+            "sm_p95": 85.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 145.55502392344496,
+            "power_max_w": 187.0,
+            "temperature_max_c": 56.0,
+            "memory_max_mib": 28006.0,
+            "pcie_rx_mean_mib_s": 1796.7105263157894,
+            "pcie_tx_mean_mib_s": 225.39473684210526
+          },
+          "6": {
+            "samples": 418,
+            "sm_mean": 76.48086124401914,
+            "sm_p50": 83.0,
+            "sm_p95": 86.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 142.5311004784689,
+            "power_max_w": 185.0,
+            "temperature_max_c": 55.0,
+            "memory_max_mib": 28078.0,
+            "pcie_rx_mean_mib_s": 1634.8995215311004,
+            "pcie_tx_mean_mib_s": 233.85645933014354
+          },
+          "7": {
+            "samples": 418,
+            "sm_mean": 75.53827751196172,
+            "sm_p50": 82.0,
+            "sm_p95": 86.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 138.95933014354068,
+            "power_max_w": 176.0,
+            "temperature_max_c": 52.0,
+            "memory_max_mib": 28078.0,
+            "pcie_rx_mean_mib_s": 1715.409090909091,
+            "pcie_tx_mean_mib_s": 224.1244019138756
+          }
+        },
+        "all_rank_sm_mean": 76.39204545454545,
+        "all_rank_sm_p50": 83.0,
+        "all_rank_sm_p95": 86.0,
+        "all_rank_idle_fraction": 0.0,
+        "nvlink": {
+          "available": false,
+          "reason": "nvidia-smi nvlink --getthroughput d returned N/A on all V100 links; device-level GPM NVLink metrics are unsupported"
+        },
+        "stderr": ""
+      }
+    },
+    "c64": {
+      "duration_s": 600,
+      "steady_aggregate_tok_s": 902.6816666666666,
+      "completion_tokens_per_request_step": 2.470753804605671,
+      "accepted_tokens_per_request_step": 1.4705165869858765,
+      "verifier_batch_step_ms": 175.17608846392469,
+      "scheduler": {
+        "samples": 525,
+        "active_mean": 63.668571428571425,
+        "active_p50": 64.0,
+        "active_min": 60.0,
+        "active_max": 64.0,
+        "full_active_fraction": 0.7733333333333333,
+        "waiting_mean": 0.0,
+        "waiting_max": 0.0,
+        "kv_cache_usage_mean": 0.3243603231906481,
+        "kv_cache_usage_max": 0.351985559566787
+      },
+      "request_latency_s_median": 143.16427535377443,
+      "request_latency_s_p95": 162.04528700001538,
+      "quality": {
+        "all_completed_2048": true,
+        "min_unique_20word_ratio": 0.5099415204678363,
+        "max_identical_line_run": 1,
+        "max_digit_run": 6
+      },
+      "gpu": {
+        "samples": 3096,
+        "per_gpu": {
+          "0": {
+            "samples": 387,
+            "sm_mean": 64.94315245478036,
+            "sm_p50": 78.0,
+            "sm_p95": 88.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 135.7312661498708,
+            "power_max_w": 198.0,
+            "temperature_max_c": 49.0,
+            "memory_max_mib": 32102.0,
+            "pcie_rx_mean_mib_s": 1446.4521963824288,
+            "pcie_tx_mean_mib_s": 200.69250645994833
+          },
+          "1": {
+            "samples": 387,
+            "sm_mean": 75.89405684754522,
+            "sm_p50": 80.0,
+            "sm_p95": 90.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 134.04909560723513,
+            "power_max_w": 201.0,
+            "temperature_max_c": 56.0,
+            "memory_max_mib": 32102.0,
+            "pcie_rx_mean_mib_s": 1425.2454780361757,
+            "pcie_tx_mean_mib_s": 188.72093023255815
+          },
+          "2": {
+            "samples": 387,
+            "sm_mean": 67.48062015503876,
+            "sm_p50": 79.0,
+            "sm_p95": 89.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 135.68733850129198,
+            "power_max_w": 203.0,
+            "temperature_max_c": 57.0,
+            "memory_max_mib": 32174.0,
+            "pcie_rx_mean_mib_s": 1438.953488372093,
+            "pcie_tx_mean_mib_s": 195.2170542635659
+          },
+          "3": {
+            "samples": 387,
+            "sm_mean": 70.84754521963825,
+            "sm_p50": 80.0,
+            "sm_p95": 89.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 135.42635658914728,
+            "power_max_w": 206.0,
+            "temperature_max_c": 50.0,
+            "memory_max_mib": 32174.0,
+            "pcie_rx_mean_mib_s": 1428.3875968992247,
+            "pcie_tx_mean_mib_s": 198.1782945736434
+          },
+          "4": {
+            "samples": 387,
+            "sm_mean": 70.40826873385014,
+            "sm_p50": 79.0,
+            "sm_p95": 90.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 139.98708010335918,
+            "power_max_w": 203.0,
+            "temperature_max_c": 52.0,
+            "memory_max_mib": 32102.0,
+            "pcie_rx_mean_mib_s": 1416.5710594315246,
+            "pcie_tx_mean_mib_s": 189.54780361757105
+          },
+          "5": {
+            "samples": 387,
+            "sm_mean": 67.45219638242894,
+            "sm_p50": 78.0,
+            "sm_p95": 89.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 142.13953488372093,
+            "power_max_w": 209.0,
+            "temperature_max_c": 57.0,
+            "memory_max_mib": 32102.0,
+            "pcie_rx_mean_mib_s": 1420.7054263565892,
+            "pcie_tx_mean_mib_s": 187.27390180878552
+          },
+          "6": {
+            "samples": 387,
+            "sm_mean": 65.25839793281654,
+            "sm_p50": 78.0,
+            "sm_p95": 89.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 139.5581395348837,
+            "power_max_w": 211.0,
+            "temperature_max_c": 56.0,
+            "memory_max_mib": 32174.0,
+            "pcie_rx_mean_mib_s": 1484.7390180878554,
+            "pcie_tx_mean_mib_s": 188.52713178294573
+          },
+          "7": {
+            "samples": 387,
+            "sm_mean": 72.3514211886305,
+            "sm_p50": 79.0,
+            "sm_p95": 89.0,
+            "idle_fraction": 0.0,
+            "power_mean_w": 139.48837209302326,
+            "power_max_w": 206.0,
+            "temperature_max_c": 53.0,
+            "memory_max_mib": 32174.0,
+            "pcie_rx_mean_mib_s": 1345.4418604651162,
+            "pcie_tx_mean_mib_s": 186.8113695090439
+          }
+        },
+        "all_rank_sm_mean": 69.32945736434108,
+        "all_rank_sm_p50": 79.0,
+        "all_rank_sm_p95": 89.0,
+        "all_rank_idle_fraction": 0.0,
+        "nvlink": {
+          "available": false,
+          "reason": "nvidia-smi nvlink --getthroughput d returned N/A on all V100 links; device-level GPM NVLink metrics are unsupported"
+        },
+        "stderr": ""
+      }
+    },
+    "c64_throughput_change_pct": 16.011755205555446,
+    "c64_latency_change_pct": 69.93227166871365
+  },
+  "admission": {
+    "max32": {
+      "status": "passed",
+      "graph_memory_gib": 1.99,
+      "kv_tokens": 2123901
+    },
+    "max40": {
+      "status": "passed",
+      "graph_memory_gib_observed_range": [
+        2.48,
+        2.95
+      ],
+      "kv_tokens_observed_range": [
+        2117787,
+        2123901
+      ]
+    },
+    "max48": {
+      "status": "passed",
+      "graph_memory_gib": 3.43,
+      "kv_tokens": 2117787,
+      "minimum_free_mib_during_short_load": 1785
+    },
+    "max64": {
+      "status": "passed",
+      "graph_memory_gib": 4.98,
+      "kv_tokens": 2117787,
+      "idle_free_mib_range": [
+        1465,
+        1537
+      ],
+      "peak_memory_mib_during_steady": 32174,
+      "estimated_minimum_free_mib": 321
+    },
+    "max96": {
+      "status": "failed",
+      "graph_memory_gib_before_failure": 6.93,
+      "limiter": "sampler warmup OOM with 96 dummy requests",
+      "free_mib_at_failure_range": [
+        56.5,
+        220.5
+      ],
+      "failed_allocation_mib_range": [
+        92,
+        274
+      ]
+    },
+    "max128": {
+      "status": "failed",
+      "kv_tokens_before_capture": 2090273,
+      "limiter": "CUDA graph capture failed with cudaErrorMemoryAllocation",
+      "captured_q4_shapes": "attempted 1..128"
+    }
+  },
+  "trace": {
+    "rank_count": 8,
+    "wall_ms_mean": 36489.118311096194,
+    "wall_ms_max": 36530.282128417966,
+    "device_busy_fraction_mean": 0.7063069080892657,
+    "device_idle_ms_mean": 10716.350752075195,
+    "scheduler_gap_heuristic_ms_mean": 112.70829248046874,
+    "graph_replay_gap_heuristic_ms_mean": 10603.642459594726,
+    "serialized_kernel_ms_mean": {
+      "attention_gdn": 3110.9842968752837,
+      "dcp_a2a": 554.7766100000001,
+      "dcp_query_all_gather": 584.3911599999996,
+      "fp8_gemm": 9992.340385999978,
+      "other": 2186.3978825001723,
+      "other_linear_gemm": 4775.958556624901,
+      "tp_all_reduce": 4568.114076750009
+    },
+    "serialized_kernel_share_mean": {
+      "attention_gdn": 0.12075948067420265,
+      "dcp_a2a": 0.021331395888285996,
+      "dcp_query_all_gather": 0.022667747969500274,
+      "fp8_gemm": 0.38788961788867193,
+      "other": 0.08486988420088463,
+      "other_linear_gemm": 0.18539164415686962,
+      "tp_all_reduce": 0.17709022922158488
+    },
+    "methodology": {
+      "kernel_shares": "serialized CUDA kernel duration; streams can overlap",
+      "device_busy": "union of all CUDA kernel intervals per rank",
+      "scheduler_gap": "idle interval before the first cudaGraphLaunch found in that gap",
+      "graph_replay_gap": "remaining idle interval after a launch plus internal idle gaps"
+    }
+  },
+  "trace_interpretation": {
+    "device_busy_pct": 70.63069080892657,
+    "device_idle_pct": 29.369309191073434,
+    "scheduler_gap_pct": 0.30888192890699306,
+    "graph_replay_gap_pct": 29.059738767023596,
+    "gemm_serialized_share_pct": 57.32812620455415,
+    "tp_all_reduce_serialized_share_pct": 17.70902292215849,
+    "dcp_serialized_share_pct": 4.399914385778627,
+    "attention_gdn_serialized_share_pct": 12.075948067420265
+  },
+  "correctness": {
+    "valid_config_8k_needles": "passed for max32, max40, max48, max64 and final max32",
+    "short_quality": "all 256-token saturated outputs completed; no repeated-line failure",
+    "steady_quality": "all completed 2,048-token requests passed repeated-line and digit-run checks"
+  },
+  "final_state": {
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384,
+    "ready": "1/1",
+    "kv_tokens": 2123901,
+    "graph_memory_gib": 1.99,
+    "final_8k": "passed",
+    "profiler_disabled": true,
+    "worktree_expected_clean": true
+  },
+  "artifacts": {
+    "root": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/mtp3-batch-scaling",
+    "manifest_sha256": "195537ef3b62bcac7de3da2db3c324b9a083845eccddac021950479846a85a5b",
+    "trace_rank_files": 8,
+    "trace_size_mib": 657
+  },
+  "residual_risks": [
+    "The nvidia-smi dmon command used a one-second delay, but eight-GPU polling produced fewer than 570 steady samples per rank.",
+    "NVLink throughput counters returned N/A on this V100 driver; PCIe RX and TX were recorded.",
+    "The bounded Torch profiler produced valid traces, but its stop flush exceeded 900 seconds and timed out the instrumented engine. The clean baseline restart passed afterward.",
+    "Cohort throughput variance remains material, so the steady 600-second comparison is the decision authority."
+  ]
+}
