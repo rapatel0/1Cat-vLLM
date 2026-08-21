@@ -1,0 +1,815 @@
+{
+  "date": "2026-08-21",
+  "branch": "experiment/qwen38-mtp-dcp2",
+  "purpose": "Fixed-corpus config-only native-MTP depth sweep",
+  "verdict": {
+    "winner": "MTP3",
+    "retained_depth": 3,
+    "reason": "MTP1, MTP2, and MTP4 failed the no-more-than-2-percent c1 regression rule despite some c32 gains."
+  },
+  "source": {
+    "canonical_head_before_results": "ff5f51551f8749d92c9d88e68624f0013bf9d40a",
+    "active_projection_commit": "d299e4acbc38632c1329771a190c4a9ecdf21bb6",
+    "runtime_source_equivalent_to": "59a5fa11f0a1e872197a4c4715353109ab0d7601",
+    "runtime_source_changed": false
+  },
+  "preflight": {
+    "checkpoint_text_config_mtp_num_hidden_layers": 1,
+    "valid_explicit_depths": [
+      1,
+      2,
+      3,
+      4
+    ],
+    "invalid_depths": [],
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 2,
+    "attention_backend": "FLASH_ATTN_V100",
+    "cudagraph_mode": "FULL_AND_PIECEWISE",
+    "sequence_parallelism_enable_sp": false,
+    "draft_sample_method": "probabilistic",
+    "use_local_argmax_reduction": true,
+    "gdn_full_forward": "automatic SM70 route enabled",
+    "image_id": "localhost:32000/onecat-vllm@sha256:253e98bfd4a3f9e89187321b37dae01dd27642b3dc11546be881ce188df96c72",
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384,
+    "gpu_memory_utilization": 0.78,
+    "zba_depth_condition": {
+      "mtp1": "unfused default",
+      "mtp2": "unfused default",
+      "mtp3": "fused default",
+      "mtp4": "fused default",
+      "source": "vllm/model_executor/models/qwen3_5.py:123"
+    }
+  },
+  "methodology": {
+    "sequence": [
+      3,
+      1,
+      4,
+      2,
+      2,
+      4,
+      1,
+      3,
+      4,
+      3,
+      2,
+      1
+    ],
+    "clean_starts_per_depth": 3,
+    "c1_cohorts_per_start": 3,
+    "c32_cohorts_per_start": 3,
+    "total_c1_cohorts_per_depth": 9,
+    "total_c32_cohorts_per_depth": 9,
+    "concurrency_c1": 1,
+    "concurrency_c32": 32,
+    "completion_tokens_per_request": 256,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "ignore_eos": true,
+    "warmups_per_start": [
+      "warm-alpha c32 64",
+      "warm-beta c32 64"
+    ],
+    "fixed_corpus_hashes_equal": true,
+    "normalized_deployment_fingerprints_equal": true,
+    "needle_assertion": "Remove punctuation and whitespace only. Preserve complete alphanumeric content, case, and order.",
+    "client": "same local host through kubectl port-forward",
+    "graph_hit_evidence": "All starts captured the depth-specific FULL graphs. Runtime logs contained no graph-miss or eager-fallback messages."
+  },
+  "results": {
+    "1": {
+      "depth": 1,
+      "clean_starts": 3,
+      "c1_cohorts": 9,
+      "c32_cohorts": 9,
+      "all_runs_passed": true,
+      "c1": {
+        "start_medians_tok_s": [
+          49.38986792956217,
+          49.62198250185904,
+          47.25664412587577
+        ],
+        "median_tok_s": 49.33089593062425,
+        "mean_tok_s": 49.026534140572245,
+        "pooled_tok_s": 48.994438328076114,
+        "range_tok_s": [
+          47.02961372823,
+          51.257726449513456
+        ],
+        "p25_tok_s": 48.25990522670541,
+        "p75_tok_s": 49.62198250185904,
+        "median_verifier_step_ms": 36.10086179679443
+      },
+      "c32": {
+        "start_medians_tok_s": [
+          610.1280663415351,
+          612.5844680829734,
+          629.5890422648773
+        ],
+        "median_tok_s": 612.5844680829734,
+        "mean_tok_s": 607.7177665190288,
+        "pooled_tok_s": 604.4381139899502,
+        "range_tok_s": [
+          542.3084918038863,
+          666.7780608766375
+        ],
+        "p25_tok_s": 564.7076649024833,
+        "p75_tok_s": 645.5648276126834,
+        "median_verifier_step_ms": 93.72124164330558,
+        "median_completion_tokens_per_step": 1.7953101030024108,
+        "median_accepted_tokens_per_step": 0.791319596668128,
+        "pooled_completion_tokens_per_step": 1.7953975404845977,
+        "pooled_accepted_tokens_per_step": 0.7911116522586144,
+        "pooled_mean_acceptance_length": 1.7911116522586144,
+        "pooled_per_position_acceptance": {
+          "0": 0.7911116522586144
+        },
+        "corpus_medians_tok_s": {
+          "batch-alpha": 545.2042522610296,
+          "batch-beta": 652.5950245251531,
+          "batch-gamma": 629.5890422648773
+        }
+      },
+      "correctness": {
+        "needle_8k_all_passed": true,
+        "needle_8k_normalized_pairs": [
+          [
+            "FIXEDARCHIVESECRET8192A7C9E2",
+            "FIXEDARCHIVESECRET8192A7C9E2"
+          ],
+          [
+            "FIXEDARCHIVESECRET8192A7C9E2",
+            "FIXEDARCHIVESECRET8192A7C9E2"
+          ],
+          [
+            "FIXEDARCHIVESECRET8192A7C9E2",
+            "FIXEDARCHIVESECRET8192A7C9E2"
+          ]
+        ],
+        "needle_8k_raw_outputs": [
+          "FIXEDARCHIVESECRET8192A7C9E2",
+          "FIXEDARCHIVESECRET8192A7C9E2",
+          "FIXEDARCHIVESECRET8192A7C9E2"
+        ],
+        "needle_32k_passed": true,
+        "needle_32k_raw_output": "FIXED_ARCHIVE_SECRET_32768_A7C9E2",
+        "long_quality": {
+          "passed": true,
+          "elapsed_s": 44.60942012490705,
+          "completion_tokens": 2048,
+          "tok_s": 45.9095857840243,
+          "response_sha256": "fa9b9f5ce612baf24e98da741d60d5c47d07f36b3f1d689b303d3af279db10a7",
+          "word_count": 1555,
+          "line_count": 51,
+          "max_digit_run": 3,
+          "max_identical_line_run": 1,
+          "ngram_unique_ratio": {
+            "8": 1.0,
+            "20": 1.0,
+            "50": 1.0,
+            "100": 1.0
+          },
+          "spec_decode": {
+            "raw_delta": {
+              "vllm:spec_decode_num_accepted_tokens_total": 868.0,
+              "vllm:spec_decode_num_drafts_total": 1180.0,
+              "accepted_position_0": 868.0,
+              "vllm:spec_decode_num_draft_tokens_total": 1180.0
+            },
+            "draft_steps": 1180.0,
+            "draft_tokens": 1180.0,
+            "accepted_tokens": 868.0,
+            "draft_tokens_per_step": 1.0,
+            "accepted_per_step": 0.735593220338983,
+            "mean_acceptance_length": 1.735593220338983,
+            "acceptance": 0.735593220338983,
+            "per_position_acceptance": {
+              "0": 0.735593220338983
+            },
+            "positions_monotonic": true,
+            "all_positions_saturated": false
+          }
+        },
+        "all_c32_positions_monotonic": true,
+        "any_c32_all_positions_saturated": false
+      },
+      "runtime": {
+        "kv_tokens": [
+          2161715,
+          2161715,
+          2161715
+        ],
+        "graph_gib": [
+          1.94,
+          1.94,
+          1.94
+        ],
+        "image_ids": [
+          "localhost:32000/onecat-vllm@sha256:253e98bfd4a3f9e89187321b37dae01dd27642b3dc11546be881ce188df96c72"
+        ],
+        "source_commits": [
+          "d299e4acbc38632c1329771a190c4a9ecdf21bb6"
+        ],
+        "deployment_fingerprints": [
+          "0d9694f39414a1b0f04f8fd3427d4c6d4562b3dbedffdae2aa99e4f1d066adfd"
+        ],
+        "graphs_captured": true,
+        "zba_fused_default": false,
+        "power_thermal": {
+          "mean_util_pct": 69.292,
+          "max_util_pct": 100.0,
+          "mean_power_w": 110.116,
+          "max_power_w": 228.91,
+          "mean_temp_c": 44.90533333333333,
+          "max_temp_c": 54.0
+        }
+      },
+      "corpus_hashes": {
+        "c1": {
+          "single-alpha": "5e62be67770e206d43bc6ef3d346389a46e7355cd5c439e6402901ffb2e2859e",
+          "single-beta": "e686b2b5233131df6412e400c956248480f0d1a0cebe4d76d97d1148b64eda6f",
+          "single-gamma": "b598f98aec24391a0f9c77e032206dc406fc60e634bd122170d5b769790716ec"
+        },
+        "c32": {
+          "batch-alpha": "c665a6fda89bd7dc5aa4130e5a25a5991b5d2c56172f701355f39c3398bf99a3",
+          "batch-beta": "73f62898d4bad49598beea7db55fff06d0b60d592b3cfe93775f1eb004a05cf4",
+          "batch-gamma": "2182dd594efbd6ad7302542c1aa10fb070d1af9b5de0a95c7d57a16abc2e08bf"
+        }
+      },
+      "versus_mtp3_pct": {
+        "c1_median": -18.815844287934592,
+        "c32_median": 1.5444747854123753,
+        "c32_pooled": 0.06012701714652735,
+        "verifier_step": -31.478792121316058
+      }
+    },
+    "2": {
+      "depth": 2,
+      "clean_starts": 3,
+      "c1_cohorts": 9,
+      "c32_cohorts": 9,
+      "all_runs_passed": true,
+      "c1": {
+        "start_medians_tok_s": [
+          57.61721746497909,
+          54.698217182297874,
+          56.61389372046217
+        ],
+        "median_tok_s": 56.61389372046217,
+        "mean_tok_s": 56.64199245693977,
+        "pooled_tok_s": 56.5766447719719,
+        "range_tok_s": [
+          53.288883378658525,
+          59.62593922625399
+        ],
+        "p25_tok_s": 55.43627222784066,
+        "p75_tok_s": 57.61721746497909,
+        "median_verifier_step_ms": 39.66542287615307
+      },
+      "c32": {
+        "start_medians_tok_s": [
+          638.2849168180785,
+          655.7465123164609,
+          632.7820557560598
+        ],
+        "median_tok_s": 638.2849168180785,
+        "mean_tok_s": 643.2304224135946,
+        "pooled_tok_s": 640.884842739818,
+        "range_tok_s": [
+          589.3205558334807,
+          703.176815699621
+        ],
+        "p25_tok_s": 608.5126835290927,
+        "p75_tok_s": 683.1966161367245,
+        "median_verifier_step_ms": 114.18747996383622,
+        "median_completion_tokens_per_step": 2.2642343836373686,
+        "median_accepted_tokens_per_step": 1.2622271345675602,
+        "pooled_completion_tokens_per_step": 2.2666707658253142,
+        "pooled_accepted_tokens_per_step": 1.2637808589786945,
+        "pooled_mean_acceptance_length": 2.2637808589786945,
+        "pooled_per_position_acceptance": {
+          "0": 0.7570018753650813,
+          "1": 0.5067789836136133
+        },
+        "corpus_medians_tok_s": {
+          "batch-alpha": 594.4863315876685,
+          "batch-beta": 638.2849168180785,
+          "batch-gamma": 683.567314045165
+        }
+      },
+      "correctness": {
+        "needle_8k_all_passed": true,
+        "needle_8k_normalized_pairs": [
+          [
+            "FIXEDARCHIVESECRET8192A7C9E2",
+            "FIXEDARCHIVESECRET8192A7C9E2"
+          ],
+          [
+            "FIXEDARCHIVESECRET8192A7C9E2",
+            "FIXEDARCHIVESECRET8192A7C9E2"
+          ],
+          [
+            "FIXEDARCHIVESECRET8192A7C9E2",
+            "FIXEDARCHIVESECRET8192A7C9E2"
+          ]
+        ],
+        "needle_8k_raw_outputs": [
+          "FIXEDARCHIVESECRET8192A7C9E2",
+          "FIXEDARCHIVESECRET8192A7C9E2",
+          "FIXEDARCHIVESECRET8192A7C9E2"
+        ],
+        "needle_32k_passed": true,
+        "needle_32k_raw_output": "FIXED_ARCHIVE_SECRET_32768_A7C9E2",
+        "long_quality": {
+          "passed": true,
+          "elapsed_s": 37.34690166590735,
+          "completion_tokens": 2048,
+          "tok_s": 54.83721295867351,
+          "response_sha256": "f197fa44d08264dad05ee0ca3fcdb3e831fb8861ac4db64a10bfe362f9f763f2",
+          "word_count": 1547,
+          "line_count": 45,
+          "max_digit_run": 4,
+          "max_identical_line_run": 1,
+          "ngram_unique_ratio": {
+            "8": 1.0,
+            "20": 1.0,
+            "50": 1.0,
+            "100": 1.0
+          },
+          "spec_decode": {
+            "raw_delta": {
+              "accepted_position_0": 690.0,
+              "vllm:spec_decode_num_accepted_tokens_total": 1082.0,
+              "vllm:spec_decode_num_draft_tokens_total": 1934.0,
+              "vllm:spec_decode_num_drafts_total": 967.0,
+              "accepted_position_1": 392.0
+            },
+            "draft_steps": 967.0,
+            "draft_tokens": 1934.0,
+            "accepted_tokens": 1082.0,
+            "draft_tokens_per_step": 2.0,
+            "accepted_per_step": 1.1189245087900723,
+            "mean_acceptance_length": 2.118924508790072,
+            "acceptance": 0.5594622543950362,
+            "per_position_acceptance": {
+              "0": 0.7135470527404343,
+              "1": 0.40537745604963804
+            },
+            "positions_monotonic": true,
+            "all_positions_saturated": false
+          }
+        },
+        "all_c32_positions_monotonic": true,
+        "any_c32_all_positions_saturated": false
+      },
+      "runtime": {
+        "kv_tokens": [
+          2142641,
+          2134931,
+          2142641
+        ],
+        "graph_gib": [
+          1.97,
+          1.97,
+          1.97
+        ],
+        "image_ids": [
+          "localhost:32000/onecat-vllm@sha256:253e98bfd4a3f9e89187321b37dae01dd27642b3dc11546be881ce188df96c72"
+        ],
+        "source_commits": [
+          "d299e4acbc38632c1329771a190c4a9ecdf21bb6"
+        ],
+        "deployment_fingerprints": [
+          "0d9694f39414a1b0f04f8fd3427d4c6d4562b3dbedffdae2aa99e4f1d066adfd"
+        ],
+        "graphs_captured": true,
+        "zba_fused_default": false,
+        "power_thermal": {
+          "mean_util_pct": 68.249,
+          "max_util_pct": 100.0,
+          "mean_power_w": 116.82366666666667,
+          "max_power_w": 266.78,
+          "mean_temp_c": 44.34766666666667,
+          "max_temp_c": 53.0
+        }
+      },
+      "corpus_hashes": {
+        "c1": {
+          "single-alpha": "5e62be67770e206d43bc6ef3d346389a46e7355cd5c439e6402901ffb2e2859e",
+          "single-beta": "e686b2b5233131df6412e400c956248480f0d1a0cebe4d76d97d1148b64eda6f",
+          "single-gamma": "b598f98aec24391a0f9c77e032206dc406fc60e634bd122170d5b769790716ec"
+        },
+        "c32": {
+          "batch-alpha": "c665a6fda89bd7dc5aa4130e5a25a5991b5d2c56172f701355f39c3398bf99a3",
+          "batch-beta": "73f62898d4bad49598beea7db55fff06d0b60d592b3cfe93775f1eb004a05cf4",
+          "batch-gamma": "2182dd594efbd6ad7302542c1aa10fb070d1af9b5de0a95c7d57a16abc2e08bf"
+        }
+      },
+      "versus_mtp3_pct": {
+        "c1_median": -6.8301704933141805,
+        "c32_median": 5.804684935242976,
+        "c32_pooled": 6.0936054224012715,
+        "verifier_step": -16.515574115807073
+      }
+    },
+    "3": {
+      "depth": 3,
+      "clean_starts": 3,
+      "c1_cohorts": 9,
+      "c32_cohorts": 9,
+      "all_runs_passed": true,
+      "c1": {
+        "start_medians_tok_s": [
+          61.35303576504223,
+          60.64446170450612,
+          60.76419160603872
+        ],
+        "median_tok_s": 60.76419160603872,
+        "mean_tok_s": 60.879379038927794,
+        "pooled_tok_s": 60.84007173618771,
+        "range_tok_s": [
+          58.73650549780362,
+          63.22649300828242
+        ],
+        "p25_tok_s": 59.16424949808189,
+        "p75_tok_s": 62.44016849275666,
+        "median_verifier_step_ms": 41.712946364527
+      },
+      "c32": {
+        "start_medians_tok_s": [
+          603.2671589247077,
+          632.3115851276458,
+          602.8543279906103
+        ],
+        "median_tok_s": 603.2671589247077,
+        "mean_tok_s": 608.9559219160284,
+        "pooled_tok_s": 604.074901770185,
+        "range_tok_s": [
+          532.4627270342346,
+          688.3543088784011
+        ],
+        "p25_tok_s": 562.3864276437567,
+        "p75_tok_s": 657.688757503123,
+        "median_verifier_step_ms": 136.77698415538444,
+        "median_completion_tokens_per_step": 2.5785332074283915,
+        "median_accepted_tokens_per_step": 1.580421781554926,
+        "pooled_completion_tokens_per_step": 2.580880036405643,
+        "pooled_accepted_tokens_per_step": 1.581720166625827,
+        "pooled_mean_acceptance_length": 2.5817201666258267,
+        "pooled_per_position_acceptance": {
+          "2": 0.32064970070360904,
+          "0": 0.7600728112857493,
+          "1": 0.5009976546364686
+        },
+        "corpus_medians_tok_s": {
+          "batch-alpha": 533.8445535146993,
+          "batch-beta": 632.3115851276458,
+          "batch-gamma": 657.688757503123
+        }
+      },
+      "correctness": {
+        "needle_8k_all_passed": true,
+        "needle_8k_normalized_pairs": [
+          [
+            "FIXEDARCHIVESECRET8192A7C9E2",
+            "FIXEDARCHIVESECRET8192A7C9E2"
+          ],
+          [
+            "FIXEDARCHIVESECRET8192A7C9E2",
+            "FIXEDARCHIVESECRET8192A7C9E2"
+          ],
+          [
+            "FIXEDARCHIVESECRET8192A7C9E2",
+            "FIXEDARCHIVESECRET8192A7C9E2"
+          ]
+        ],
+        "needle_8k_raw_outputs": [
+          "FIXEDARCHIVESECRET8192A7C9E2",
+          "FIXEDARCHIVESECRET8192A7C9E2",
+          "FIXEDARCHIVESECRET8192A7C9E2"
+        ],
+        "needle_32k_passed": true,
+        "needle_32k_raw_output": "FIXED_ARCHIVE_SECRET_32768_A7C9E2",
+        "long_quality": {
+          "passed": true,
+          "elapsed_s": 35.82138670887798,
+          "completion_tokens": 2048,
+          "tok_s": 57.172549366784374,
+          "response_sha256": "6dafba1620d2e85330b8d057ada51d44fe9ad6e6dde5d8d2ba62a9d7fa9c59ee",
+          "word_count": 1558,
+          "line_count": 51,
+          "max_digit_run": 3,
+          "max_identical_line_run": 1,
+          "ngram_unique_ratio": {
+            "8": 1.0,
+            "20": 1.0,
+            "50": 1.0,
+            "100": 1.0
+          },
+          "spec_decode": {
+            "raw_delta": {
+              "accepted_position_2": 175.0,
+              "vllm:spec_decode_num_draft_tokens_total": 2646.0,
+              "vllm:spec_decode_num_drafts_total": 882.0,
+              "accepted_position_0": 654.0,
+              "accepted_position_1": 336.0,
+              "vllm:spec_decode_num_accepted_tokens_total": 1165.0
+            },
+            "draft_steps": 882.0,
+            "draft_tokens": 2646.0,
+            "accepted_tokens": 1165.0,
+            "draft_tokens_per_step": 3.0,
+            "accepted_per_step": 1.3208616780045352,
+            "mean_acceptance_length": 2.320861678004535,
+            "acceptance": 0.4402872260015117,
+            "per_position_acceptance": {
+              "0": 0.7414965986394558,
+              "1": 0.38095238095238093,
+              "2": 0.1984126984126984
+            },
+            "positions_monotonic": true,
+            "all_positions_saturated": false
+          }
+        },
+        "all_c32_positions_monotonic": true,
+        "any_c32_all_positions_saturated": false
+      },
+      "runtime": {
+        "kv_tokens": [
+          2123901,
+          2123901,
+          2123901
+        ],
+        "graph_gib": [
+          1.99,
+          1.99,
+          1.99
+        ],
+        "image_ids": [
+          "localhost:32000/onecat-vllm@sha256:253e98bfd4a3f9e89187321b37dae01dd27642b3dc11546be881ce188df96c72"
+        ],
+        "source_commits": [
+          "d299e4acbc38632c1329771a190c4a9ecdf21bb6"
+        ],
+        "deployment_fingerprints": [
+          "0d9694f39414a1b0f04f8fd3427d4c6d4562b3dbedffdae2aa99e4f1d066adfd"
+        ],
+        "graphs_captured": true,
+        "zba_fused_default": true,
+        "power_thermal": {
+          "mean_util_pct": 69.89333333333333,
+          "max_util_pct": 100.0,
+          "mean_power_w": 118.92366666666666,
+          "max_power_w": 236.75,
+          "mean_temp_c": 45.730666666666664,
+          "max_temp_c": 54.0
+        }
+      },
+      "corpus_hashes": {
+        "c1": {
+          "single-alpha": "5e62be67770e206d43bc6ef3d346389a46e7355cd5c439e6402901ffb2e2859e",
+          "single-beta": "e686b2b5233131df6412e400c956248480f0d1a0cebe4d76d97d1148b64eda6f",
+          "single-gamma": "b598f98aec24391a0f9c77e032206dc406fc60e634bd122170d5b769790716ec"
+        },
+        "c32": {
+          "batch-alpha": "c665a6fda89bd7dc5aa4130e5a25a5991b5d2c56172f701355f39c3398bf99a3",
+          "batch-beta": "73f62898d4bad49598beea7db55fff06d0b60d592b3cfe93775f1eb004a05cf4",
+          "batch-gamma": "2182dd594efbd6ad7302542c1aa10fb070d1af9b5de0a95c7d57a16abc2e08bf"
+        }
+      },
+      "versus_mtp3_pct": {
+        "c1_median": 0.0,
+        "c32_median": 0.0,
+        "c32_pooled": 0.0,
+        "verifier_step": 0.0
+      }
+    },
+    "4": {
+      "depth": 4,
+      "clean_starts": 3,
+      "c1_cohorts": 9,
+      "c32_cohorts": 9,
+      "all_runs_passed": true,
+      "c1": {
+        "start_medians_tok_s": [
+          60.777974086574154,
+          56.59921827683118,
+          59.40191150394998
+        ],
+        "median_tok_s": 58.03151710435649,
+        "mean_tok_s": 58.583768510648056,
+        "pooled_tok_s": 58.49123509131669,
+        "range_tok_s": [
+          54.11826521276575,
+          61.54707221193978
+        ],
+        "p25_tok_s": 57.43385373845973,
+        "p75_tok_s": 60.777974086574154,
+        "median_verifier_step_ms": 43.898503948003054
+      },
+      "c32": {
+        "start_medians_tok_s": [
+          616.1527002645137,
+          638.171973836181,
+          653.1659459161936
+        ],
+        "median_tok_s": 638.171973836181,
+        "mean_tok_s": 626.6964529575165,
+        "pooled_tok_s": 622.1338165416059,
+        "range_tok_s": [
+          516.9054447796314,
+          695.4158141471387
+        ],
+        "p25_tok_s": 598.2553520976446,
+        "p75_tok_s": 653.1659459161936,
+        "median_verifier_step_ms": 139.0095729261082,
+        "median_completion_tokens_per_step": 2.750839489590329,
+        "median_accepted_tokens_per_step": 1.7555406312961719,
+        "pooled_completion_tokens_per_step": 2.7529965273888206,
+        "pooled_accepted_tokens_per_step": 1.7556103207497853,
+        "pooled_mean_acceptance_length": 2.7556103207497853,
+        "pooled_per_position_acceptance": {
+          "0": 0.754602143310556,
+          "3": 0.1918897725999776,
+          "1": 0.4945670437997087,
+          "2": 0.31455136103954295
+        },
+        "corpus_medians_tok_s": {
+          "batch-alpha": 589.5389702812286,
+          "batch-beta": 638.171973836181,
+          "batch-gamma": 689.1650334691757
+        }
+      },
+      "correctness": {
+        "needle_8k_all_passed": true,
+        "needle_8k_normalized_pairs": [
+          [
+            "FIXEDARCHIVESECRET8192A7C9E2",
+            "FIXEDARCHIVESECRET8192A7C9E2"
+          ],
+          [
+            "FIXEDARCHIVESECRET8192A7C9E2",
+            "FIXEDARCHIVESECRET8192A7C9E2"
+          ],
+          [
+            "FIXEDARCHIVESECRET8192A7C9E2",
+            "FIXEDARCHIVESECRET8192A7C9E2"
+          ]
+        ],
+        "needle_8k_raw_outputs": [
+          "FIXEDARCHIVESECRET8192A7C9E2",
+          "FIXEDARCHIVESECRET8192A7C9E2",
+          "FIXEDARCHIVESECRET8192A7C9E2"
+        ],
+        "needle_32k_passed": true,
+        "needle_32k_raw_output": "FIXED_ARCHIVE_SECRET_32768_A7C9E2",
+        "long_quality": {
+          "passed": true,
+          "elapsed_s": 35.86908258404583,
+          "completion_tokens": 2048,
+          "tok_s": 57.0965258227967,
+          "response_sha256": "fa9b9f5ce612baf24e98da741d60d5c47d07f36b3f1d689b303d3af279db10a7",
+          "word_count": 1555,
+          "line_count": 51,
+          "max_digit_run": 3,
+          "max_identical_line_run": 1,
+          "ngram_unique_ratio": {
+            "8": 1.0,
+            "20": 1.0,
+            "50": 1.0,
+            "100": 1.0
+          },
+          "spec_decode": {
+            "raw_delta": {
+              "accepted_position_0": 613.0,
+              "accepted_position_3": 101.0,
+              "vllm:spec_decode_num_drafts_total": 840.0,
+              "vllm:spec_decode_num_accepted_tokens_total": 1208.0,
+              "accepted_position_1": 326.0,
+              "vllm:spec_decode_num_draft_tokens_total": 3360.0,
+              "accepted_position_2": 168.0
+            },
+            "draft_steps": 840.0,
+            "draft_tokens": 3360.0,
+            "accepted_tokens": 1208.0,
+            "draft_tokens_per_step": 4.0,
+            "accepted_per_step": 1.438095238095238,
+            "mean_acceptance_length": 2.4380952380952383,
+            "acceptance": 0.3595238095238095,
+            "per_position_acceptance": {
+              "0": 0.7297619047619047,
+              "1": 0.3880952380952381,
+              "2": 0.2,
+              "3": 0.12023809523809524
+            },
+            "positions_monotonic": true,
+            "all_positions_saturated": false
+          }
+        },
+        "all_c32_positions_monotonic": true,
+        "any_c32_all_positions_saturated": false
+      },
+      "runtime": {
+        "kv_tokens": [
+          2097152,
+          2097152,
+          2090088
+        ],
+        "graph_gib": [
+          2.03,
+          2.03,
+          2.03
+        ],
+        "image_ids": [
+          "localhost:32000/onecat-vllm@sha256:253e98bfd4a3f9e89187321b37dae01dd27642b3dc11546be881ce188df96c72"
+        ],
+        "source_commits": [
+          "d299e4acbc38632c1329771a190c4a9ecdf21bb6"
+        ],
+        "deployment_fingerprints": [
+          "0d9694f39414a1b0f04f8fd3427d4c6d4562b3dbedffdae2aa99e4f1d066adfd"
+        ],
+        "graphs_captured": true,
+        "zba_fused_default": true,
+        "power_thermal": {
+          "mean_util_pct": 70.68266666666666,
+          "max_util_pct": 100.0,
+          "mean_power_w": 126.50566666666667,
+          "max_power_w": 230.42,
+          "mean_temp_c": 46.02166666666667,
+          "max_temp_c": 55.0
+        }
+      },
+      "corpus_hashes": {
+        "c1": {
+          "single-alpha": "5e62be67770e206d43bc6ef3d346389a46e7355cd5c439e6402901ffb2e2859e",
+          "single-beta": "e686b2b5233131df6412e400c956248480f0d1a0cebe4d76d97d1148b64eda6f",
+          "single-gamma": "b598f98aec24391a0f9c77e032206dc406fc60e634bd122170d5b769790716ec"
+        },
+        "c32": {
+          "batch-alpha": "c665a6fda89bd7dc5aa4130e5a25a5991b5d2c56172f701355f39c3398bf99a3",
+          "batch-beta": "73f62898d4bad49598beea7db55fff06d0b60d592b3cfe93775f1eb004a05cf4",
+          "batch-gamma": "2182dd594efbd6ad7302542c1aa10fb070d1af9b5de0a95c7d57a16abc2e08bf"
+        }
+      },
+      "versus_mtp3_pct": {
+        "c1_median": -4.497179061311929,
+        "c32_median": 5.785963050547838,
+        "c32_pooled": 2.9895158230380137,
+        "verifier_step": 1.6322839580871662
+      }
+    }
+  },
+  "decision_rules": {
+    "non_mtp3_c32_median_minimum_gain_pct": 1.5,
+    "non_mtp3_c1_maximum_regression_pct": 2.0,
+    "correctness_quality_capacity_graph_regression_allowed": false,
+    "stability_required": true,
+    "depth_decisions": {
+      "mtp1": "Rejected: c1 median regressed 18.82 percent. Its c32 median gain was 1.54 percent, but pooled c32 changed only 0.06 percent.",
+      "mtp2": "Rejected: c1 median regressed 6.83 percent despite a 5.80 percent c32 median gain.",
+      "mtp3": "Retained baseline and fastest eligible depth.",
+      "mtp4": "Rejected: c1 median regressed 4.50 percent despite a 5.79 percent c32 median gain."
+    }
+  },
+  "harness_defect": {
+    "status": "corrected before measured sweep",
+    "description": "The first attempted sweep treated underscore removal in the correct secret as failure and stopped before performance cohorts.",
+    "effect_on_results": "None. The measured 12-start sweep reran every arm after the assertion was corrected.",
+    "invalid_artifacts": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/mtp-depth-sweep/tp8-mtp-depth-sweep-invalid-needle-artifacts"
+  },
+  "historical_results": {
+    "comparable": false,
+    "reason": "Prior MTP3/MTP4 and common-GDN campaigns used different prompt corpora, token lengths, warmups, and source-labelled prompts."
+  },
+  "final_state": {
+    "depth": 3,
+    "service_ready": "1/1",
+    "exact_8k_passed": true,
+    "exact_8k_raw_output": "FIXEDARCHIVESECRET8192A7C9E2",
+    "exact_8k_normalized_output": "FIXEDARCHIVESECRET8192A7C9E2",
+    "kv_tokens": 2123901,
+    "cuda_graph_gib": 1.99,
+    "old_tp8_replicas": 0,
+    "tp8_dcp2_replicas": 1
+  },
+  "artifacts": {
+    "root": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/mtp-depth-sweep",
+    "manifest_sha256": "8de6904def574787ffbe2d1d6803287012f3d03c2513dd95e78e31b574db7337",
+    "archive_sha256": "ce9fe5fdbf7eb1210458b7be8f191a7daba550de80cc2cff87e8678d795a28ae"
+  },
+  "review_findings": [
+    "high: MTP1 c1 median regressed 18.82 percent, so it cannot win despite a marginal 1.54 percent c32 median gain.",
+    "high: MTP2 c1 median regressed 6.83 percent, so its 5.80 percent c32 median gain does not satisfy the retention rule.",
+    "high: MTP4 c1 median regressed 4.50 percent, so its 5.79 percent c32 median gain does not satisfy the retention rule.",
+    "correct: all 12 measured 8K needles, four 32K needles, and four 2048-token quality gates passed.",
+    "correct: every depth captured graphs without a logged eager fallback; all per-position acceptance rates were monotonic and unsaturated."
+  ],
+  "residual_risks": [
+    "C32 cohort ranges remained wide. The c1 disqualifications make the final MTP3 decision independent of that c32 variance.",
+    "The quality gate used one 2048-token output per depth and one 32K needle per depth. It did not run a 128K needle.",
+    "Power samples included transient readings above the nominal 200 W limit, but mean power was 110-127 W and maximum temperature was 55 C."
+  ]
+}
