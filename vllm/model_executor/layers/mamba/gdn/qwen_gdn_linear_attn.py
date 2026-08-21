@@ -1283,11 +1283,13 @@ def _shared_qwen_gdn_cache_storage(
     ssm_storage = ssm_state_cache.untyped_storage()
     if conv_storage._cdata != ssm_storage._cdata:
         return None
+    # One byte is enough to expose the shared storage dependency. A full-size
+    # marker makes AOTAutograd retain an extra cache-sized graph allocation.
     return torch.empty(
         0,
         dtype=torch.uint8,
         device=conv_state_cache.device,
-    ).set_(conv_storage, 0, (conv_storage.nbytes(),), (1,))
+    ).set_(conv_storage, 0, (1,), (1,))
 
 
 def _sm70_mixed_qkv_state_diff_stats(

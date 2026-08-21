@@ -243,7 +243,7 @@ def test_qwen_gdn_direct_custom_op_returns_projection_allocation():
     assert state_cache is not None
     assert state_cache.data_ptr() == cache_storage.data_ptr()
     assert state_cache.dtype == torch.uint8
-    assert state_cache.numel() == cache_storage.untyped_storage().nbytes()
+    assert state_cache.numel() == 1
     assert _shared_qwen_gdn_cache_storage(conv_cache, torch.empty(8)) is None
 
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
