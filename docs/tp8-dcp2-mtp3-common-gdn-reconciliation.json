@@ -307,6 +307,32 @@
     "final_cuda_graph_gib": 1.99,
     "final_8k_passed": true
   },
+  "canonical_source_retirement": {
+    "revert_commits": [
+      "0d669136ba",
+      "d299e4acbc"
+    ],
+    "reverted_runtime_commits": [
+      "2b5d45abb0",
+      "dd432ec253"
+    ],
+    "candidate_touched_paths_match_retained_source": true,
+    "candidate_only_tests_removed": true,
+    "projection": "/localpool/onecat-vllm-hy3-sm70/dcp2-branch-d299e4acbc38",
+    "projection_commit": "d299e4acbc38632c1329771a190c4a9ecdf21bb6",
+    "projection_source_equivalent_runtime": "59a5fa11f0a1e872197a4c4715353109ab0d7601",
+    "projection_manifest_sha256": "80e660c88956c92e58e1fec088e2cac7ab5c02e82db4123b7116eedd60f2e368",
+    "clean_start": {
+      "healthy": true,
+      "focused_tests": "3 passed",
+      "eight_k_needle_passed": true,
+      "eight_k_prompt_tokens": 8173,
+      "kv_tokens": 2116258,
+      "cuda_graph_gib": 1.99,
+      "small_c32_smoke_tok_s": 219.50973513777777,
+      "small_c32_smoke_completion_tokens": 1024
+    }
+  },
   "residual_risks": [
     "Fresh cohort throughput remained wide for both sources.",
     "Probabilistic draft sampling produced varying c32 response hashes under temperature zero; acceptance metrics and exact 8K gates are the correctness evidence.",

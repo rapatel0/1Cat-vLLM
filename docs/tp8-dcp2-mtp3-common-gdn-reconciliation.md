@@ -125,6 +125,35 @@ Source `59a5fa11f0` remains active with:
 
 No TP, NCCL, DCP, MTP, sampling, gateway, image, or virtual-environment policy changed.
 
+## Canonical source retirement
+
+The canonical branch reverted the rejected runtime commits in reverse order:
+
+- `0d669136ba` reverted `2b5d45abb0`;
+- `d299e4acbc` reverted `dd432ec253`.
+
+At `d299e4acbc`, the three candidate-touched source and test paths match
+`59a5fa11f0` byte for byte. The candidate-only tests no longer exist.
+
+The checked runtime projection is:
+
+```text
+/localpool/onecat-vllm-hy3-sm70/dcp2-branch-d299e4acbc38
+```
+
+Its `SHA256SUMS` manifest SHA256 is
+`80e660c88956c92e58e1fec088e2cac7ab5c02e82db4123b7116eedd60f2e368`.
+The projection records canonical commit `d299e4acbc` and runtime equivalence to
+`59a5fa11f0`.
+
+A clean native-MTP3 startup passed checksum, health, focused GDN metadata tests,
+and the exact 8K needle. It reported 2,116,258 KV tokens and 1.99 GiB graphs.
+A small c32 smoke completed 1,024 tokens at 219.51 tok/s. This smoke is not a
+promotion benchmark.
+
+Canonical HEAD and the active projection now both contain the retained baseline
+runtime source.
+
 ## Artifacts
 
 The structured record is `docs/tp8-dcp2-mtp3-common-gdn-reconciliation.json`.
