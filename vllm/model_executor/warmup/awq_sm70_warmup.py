@@ -138,6 +138,15 @@ def _get_decode_m_values(worker: Worker) -> list[int]:
     return sorted(size for size in sizes if size <= max_dense_m)
 
 
+def _get_fp8_dense_m_values(worker: Worker) -> list[int]:
+    sizes = set(_get_decode_m_values(worker))
+    tune_max_m = int(envs.VLLM_SM70_FP8_DENSE_TUNE_MAX_M)
+    capture_sizes = worker.vllm_config.compilation_config.cudagraph_capture_sizes
+    if capture_sizes is not None and tune_max_m in capture_sizes:
+        sizes.add(tune_max_m)
+    return sorted(sizes)
+
+
 def _get_moe_token_counts(worker: Worker) -> list[int]:
     max_tokens = max(
         1,
@@ -618,24 +627,27 @@ def sm70_awq_warmup(worker: Worker) -> None:
         )
 
     m_values = _get_decode_m_values(worker)
+    fp8_m_values = _get_fp8_dense_m_values(worker)
     moe_token_counts = _get_moe_token_counts(worker)
     lut_path = _resolve_lut_path(device)
 
     logger.info(
         "Warming up SM70 TurboMind accepted routes (%d AWQ dense layer "
         "shapes, %d FP8 dense layer shapes, %d FP4 dense layer shapes, "
-        "%d MoE layer shapes, dense_m=%s, moe_tokens=%s, lut_path=%s).",
+        "%d MoE layer shapes, dense_m=%s, fp8_m=%s, moe_tokens=%s, "
+        "lut_path=%s).",
         len(dense_layers),
         len(fp8_dense_layers),
         len(fp4_dense_layers),
         len(moe_layers),
         m_values,
+        fp8_m_values,
         moe_token_counts,
         lut_path,
     )
     with torch.inference_mode():
         dense_calls = _warmup_dense_layers(dense_layers, m_values)
-        fp8_dense_calls = _warmup_fp8_dense_layers(fp8_dense_layers, m_values)
+        fp8_dense_calls = _warmup_fp8_dense_layers(fp8_dense_layers, fp8_m_values)
         fp4_dense_calls = _warmup_fp4_dense_layers(fp4_dense_layers, m_values)
         moe_stage_calls = _warmup_moe_dense_stage_layers(
             moe_layers, moe_token_counts

@@ -69,6 +69,27 @@ logger = init_logger(__name__)
 DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset({"Qwen3ForCausalLM"})
 
 
+def _sm70_qwen35_mtp3_fp8_verifier_tune_m(config: "VllmConfig") -> int | None:
+    """Return the exact c32 q=4 FP8 verifier row count for the V100 lane."""
+    model_config = config.model_config
+    text_config = None if model_config is None else model_config.hf_text_config
+    speculative_config = config.speculative_config
+    return (
+        128
+        if model_config is not None
+        and text_config is not None
+        and getattr(text_config, "model_type", None) == "qwen3_5_text"
+        and getattr(model_config, "quantization", None) == "fp8"
+        and speculative_config is not None
+        and getattr(speculative_config, "method", None) == "mtp"
+        and getattr(speculative_config, "num_speculative_tokens", None) == 3
+        and config.parallel_config.tensor_parallel_size == 8
+        and config.parallel_config.decode_context_parallel_size == 2
+        and config.scheduler_config.max_num_seqs == 32
+        else None
+    )
+
+
 class OptimizationLevel(IntEnum):
     """Optimization level enum."""
 
@@ -1255,6 +1276,11 @@ class VllmConfig:
                 "VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE": "1",
                 "VLLM_SM70_GDN_DECODE_FLASHQLA": "1",
             }
+            fp8_verifier_tune_m = _sm70_qwen35_mtp3_fp8_verifier_tune_m(self)
+            if fp8_verifier_tune_m is not None:
+                sm70_baseline_env_defaults["VLLM_SM70_FP8_DENSE_TUNE_MAX_M"] = str(
+                    fp8_verifier_tune_m
+                )
             if (
                 not sm70_compile_disabled_by_user
                 and not sm70_no_compile_decode_graph_requested
