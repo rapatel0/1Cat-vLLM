@@ -88,14 +88,8 @@ def _run_gdn_projection(layer, output: torch.Tensor | None) -> torch.Tensor:
 
 
 def test_sm70_mtp3_direct_attention_output_scope():
-    from vllm.config.compilation import CompilationConfig
     from vllm.model_executor.models.qwen3_5 import (
         _sm70_mtp3_direct_attention_output_enabled,
-    )
-
-    assert (
-        "vllm::qwen_gdn_full_forward_direct"
-        in CompilationConfig._attention_ops
     )
 
     config = Mock()
@@ -255,6 +249,32 @@ def test_cuda_communicator_inplace_pynccl_reuses_input_allocation():
     trace.assert_called_once_with(communicator, "pynccl_inplace", tensor)
 
 
+def test_qwen_gdn_forward_direct_returns_cuda_projection():
+    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+        QwenGatedDeltaNetAttention,
+    )
+
+    hidden_states = torch.randn(4, 8)
+    projection = torch.randn(4, 8)
+    layer = SimpleNamespace(
+        prefix="model.layers.0.linear_attn",
+        maybe_sm70_qwen_gdn_full_forward=True,
+        force_sm70_qwen_gdn_full_forward=False,
+        disable_sm70_qwen_gdn_full_forward=False,
+        auto_sm70_qwen_gdn_full_forward=True,
+        _forward_method=Mock(return_value=projection),
+    )
+    with patch(
+        "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn."
+        "_sm70_qwen_gdn_full_forward_enabled",
+        return_value=True,
+    ):
+        output = QwenGatedDeltaNetAttention.forward_direct(layer, hidden_states)
+
+    assert output is projection
+    layer._forward_method.assert_called_once_with(hidden_states, None)
+
+
 def test_qwen_gdn_cuda_forward_returns_direct_projection():
     from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
         QwenGatedDeltaNetAttention,
@@ -297,66 +317,6 @@ def test_qwen_gdn_cuda_forward_returns_direct_projection():
 
     assert output is projection
     layer._output_projection.assert_called_once()
-
-
-def test_qwen_gdn_direct_custom_op_returns_projection_allocation():
-    from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
-        qwen_gdn_full_forward_direct,
-        qwen_gdn_full_forward_direct_fake,
-    )
-
-    hidden_states = torch.randn(4, 8)
-    projection = torch.randn(4, 8)
-    layer = SimpleNamespace(
-        _forward_method=Mock(return_value=projection),
-    )
-    context = SimpleNamespace(no_compile_layers={"model.layers.0.linear_attn": layer})
-    conv_cache = torch.empty(0)
-    ssm_cache = torch.empty(0)
-    with (
-        patch(
-            "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn."
-            "get_forward_context",
-            return_value=context,
-        ),
-        patch(
-            "vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn."
-            "_log_runtime_route_once"
-        ),
-    ):
-        output = qwen_gdn_full_forward_direct(
-            hidden_states,
-            conv_cache,
-            ssm_cache,
-            "model.layers.0.linear_attn",
-        )
-
-    assert output.data_ptr() == projection.data_ptr()
-    layer._forward_method.assert_called_once_with(hidden_states, None)
-    fake_output = qwen_gdn_full_forward_direct_fake(
-        hidden_states,
-        conv_cache,
-        ssm_cache,
-        "model.layers.0.linear_attn",
-    )
-    assert fake_output.shape == hidden_states.shape
-    assert fake_output.is_contiguous()
-    assert fake_output.data_ptr() != hidden_states.data_ptr()
-
-    from torch._subclasses.fake_tensor import FakeTensorMode
-
-    with FakeTensorMode() as fake_mode:
-        fake_hidden = fake_mode.from_tensor(hidden_states)
-        fake_conv = fake_mode.from_tensor(conv_cache)
-        fake_ssm = fake_mode.from_tensor(ssm_cache)
-        dispatched_fake = torch.ops.vllm.qwen_gdn_full_forward_direct(
-            fake_hidden,
-            fake_conv,
-            fake_ssm,
-            "model.layers.0.linear_attn",
-        )
-    assert dispatched_fake.shape == hidden_states.shape
-    assert dispatched_fake.is_contiguous()
 
 
 @pytest.mark.parametrize("num_tokens", [4, 128])

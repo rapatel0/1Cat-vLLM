@@ -768,7 +768,6 @@ class CompilationConfig:
         "vllm::qwen_gdn_attention_core_context",
         "vllm::qwen_gdn_attention_core_003_spec",
         "vllm::qwen_gdn_full_forward",
-        "vllm::qwen_gdn_full_forward_direct",
         "vllm::qwen_gdn_input_projection_core",
         "vllm::qwen_gdn_input_projection",
         "vllm::qwen_gdn_output_projection",

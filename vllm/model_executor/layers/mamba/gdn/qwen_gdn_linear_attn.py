@@ -3063,16 +3063,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 disabled=self.disable_sm70_qwen_gdn_full_forward,
                 auto_enabled=self.auto_sm70_qwen_gdn_full_forward,
             ):
-                conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
-                    layer_name,
-                    hidden_states,
-                )
-                return torch.ops.vllm.qwen_gdn_full_forward_direct(
-                    hidden_states,
-                    conv_state_cache,
-                    ssm_state_cache,
-                    layer_name,
-                )
+                output = self._forward_method(hidden_states, None)
+                if not isinstance(output, torch.Tensor):
+                    raise RuntimeError(
+                        "The direct Qwen GDN route requires a functional output"
+                        " projection"
+                    )
+                return output
 
         # Prefill and every non-SM70/non-MTP fallback keep the established
         # preallocated-output contract.
@@ -6098,36 +6095,6 @@ def qwen_gdn_full_forward_fake(
     """Fake implementation for torch.compile."""
 
 
-def qwen_gdn_full_forward_direct(
-    hidden_states: torch.Tensor,
-    conv_state_cache: torch.Tensor,
-    ssm_state_cache: torch.Tensor,
-    layer_name: LayerNameType,
-) -> torch.Tensor:
-    """Run Qwen3.5 GDN and return its row-parallel projection allocation."""
-    layer_name = _resolve_layer_name(layer_name)
-    forward_context: ForwardContext = get_forward_context()
-    self = forward_context.no_compile_layers[layer_name]
-    _ = conv_state_cache, ssm_state_cache
-    _log_runtime_route_once("SM70 Qwen GDN direct-output route enabled.")
-    output = self._forward_method(hidden_states, None)
-    if not isinstance(output, torch.Tensor):
-        raise RuntimeError(
-            "The direct Qwen GDN route requires a functional output projection"
-        )
-    return output
-
-
-def qwen_gdn_full_forward_direct_fake(
-    hidden_states: torch.Tensor,
-    conv_state_cache: torch.Tensor,
-    ssm_state_cache: torch.Tensor,
-    layer_name: LayerNameType,
-) -> torch.Tensor:
-    """Return the contiguous output metadata produced by RowParallelLinear."""
-    return hidden_states.new_empty(hidden_states.shape)
-
-
 def qwen_gdn_output_projection(
     core_attn_out: torch.Tensor,
     z: torch.Tensor,
@@ -6303,14 +6270,6 @@ direct_register_custom_op(
     op_func=qwen_gdn_full_forward,
     mutates_args=["output", "conv_state_cache", "ssm_state_cache"],
     fake_impl=qwen_gdn_full_forward_fake,
-)
-
-
-direct_register_custom_op(
-    op_name="qwen_gdn_full_forward_direct",
-    op_func=qwen_gdn_full_forward_direct,
-    mutates_args=["conv_state_cache", "ssm_state_cache"],
-    fake_impl=qwen_gdn_full_forward_direct_fake,
 )
 
 
