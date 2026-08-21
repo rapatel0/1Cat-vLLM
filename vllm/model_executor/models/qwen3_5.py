@@ -121,7 +121,7 @@ logger = init_logger(__name__)
 
 
 def _sm70_gdn_fused_zba_extract_enabled(speculative_config: object | None) -> bool:
-    """Use the exact fused projection-slice copy for SM70 native MTP4."""
+    """Use the exact fused projection-slice copy for SM70 native MTP3/4."""
     override = os.getenv("VLLM_SM70_GDN_FUSED_ZBA_EXTRACT")
     if override is not None:
         return override.strip().lower() in ("1", "true", "yes", "on")
@@ -129,7 +129,7 @@ def _sm70_gdn_fused_zba_extract_enabled(speculative_config: object | None) -> bo
         current_platform.is_device_capability(70)
         and speculative_config is not None
         and getattr(speculative_config, "method", None) == "mtp"
-        and getattr(speculative_config, "num_speculative_tokens", None) == 4
+        and getattr(speculative_config, "num_speculative_tokens", None) in (3, 4)
     )
 
 

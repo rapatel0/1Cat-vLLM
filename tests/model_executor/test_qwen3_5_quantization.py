@@ -3,17 +3,25 @@
 
 from unittest.mock import Mock, patch
 
+import pytest
+import torch
+
 
 class _QuantConfig:
     pass
 
 
-def test_sm70_mtp4_enables_fused_gdn_projection_extract_by_default():
+@pytest.mark.parametrize("num_speculative_tokens", [3, 4])
+def test_sm70_mtp_enables_fused_gdn_projection_extract_by_default(
+    num_speculative_tokens: int,
+):
     from vllm.model_executor.models.qwen3_5 import (
         _sm70_gdn_fused_zba_extract_enabled,
     )
 
-    speculative_config = Mock(method="mtp", num_speculative_tokens=4)
+    speculative_config = Mock(
+        method="mtp", num_speculative_tokens=num_speculative_tokens
+    )
     with (
         patch.dict("os.environ", {}, clear=True),
         patch("vllm.model_executor.models.qwen3_5.current_platform") as mock_platform,
@@ -22,7 +30,7 @@ def test_sm70_mtp4_enables_fused_gdn_projection_extract_by_default():
         assert _sm70_gdn_fused_zba_extract_enabled(speculative_config)
 
 
-def test_fused_gdn_projection_extract_default_is_narrow_to_sm70_mtp4():
+def test_fused_gdn_projection_extract_default_scope():
     from vllm.model_executor.models.qwen3_5 import (
         _sm70_gdn_fused_zba_extract_enabled,
     )
@@ -34,23 +42,98 @@ def test_fused_gdn_projection_extract_default_is_narrow_to_sm70_mtp4():
         mock_platform.is_device_capability.return_value = True
         assert not _sm70_gdn_fused_zba_extract_enabled(None)
         assert not _sm70_gdn_fused_zba_extract_enabled(
-            Mock(method="mtp", num_speculative_tokens=3)
+            Mock(method="mtp", num_speculative_tokens=2)
+        )
+        assert not _sm70_gdn_fused_zba_extract_enabled(
+            Mock(method="other", num_speculative_tokens=3)
         )
         mock_platform.is_device_capability.return_value = False
         assert not _sm70_gdn_fused_zba_extract_enabled(
-            Mock(method="mtp", num_speculative_tokens=4)
+            Mock(method="mtp", num_speculative_tokens=3)
         )
 
 
-def test_fused_gdn_projection_extract_explicit_disable_wins():
+@pytest.mark.parametrize("num_speculative_tokens", [3, 4])
+def test_fused_gdn_projection_extract_explicit_disable_wins(
+    num_speculative_tokens: int,
+):
     from vllm.model_executor.models.qwen3_5 import (
         _sm70_gdn_fused_zba_extract_enabled,
     )
 
     with patch.dict("os.environ", {"VLLM_SM70_GDN_FUSED_ZBA_EXTRACT": "0"}, clear=True):
         assert not _sm70_gdn_fused_zba_extract_enabled(
-            Mock(method="mtp", num_speculative_tokens=4)
+            Mock(method="mtp", num_speculative_tokens=num_speculative_tokens)
         )
+
+
+def test_fused_gdn_projection_extract_explicit_enable_wins():
+    from vllm.model_executor.models.qwen3_5 import (
+        _sm70_gdn_fused_zba_extract_enabled,
+    )
+
+    with patch.dict("os.environ", {"VLLM_SM70_GDN_FUSED_ZBA_EXTRACT": "1"}, clear=True):
+        assert _sm70_gdn_fused_zba_extract_enabled(None)
+
+
+@pytest.mark.parametrize("num_tokens", [4, 128])
+@pytest.mark.parametrize("padded_rows", [False, True])
+def test_sm70_fused_gdn_projection_extract_cuda_graph_parity(
+    num_tokens: int,
+    padded_rows: bool,
+):
+    if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("The fused extraction kernel requires an SM70 CUDA device")
+
+    from vllm.model_executor.models.qwen3_5 import _sm70_gdn_extract_zba
+
+    qkv_size = 512
+    z_size = 192
+    ba_size = 12
+    mixed_width = qkv_size + z_size
+    ba_width = ba_size * 2
+    mixed_padding = 16 if padded_rows else 0
+    ba_padding = 8 if padded_rows else 0
+    device = torch.device("cuda")
+
+    mixed_storage = torch.randn(
+        num_tokens,
+        mixed_width + mixed_padding,
+        dtype=torch.float16,
+        device=device,
+    )
+    ba_storage = torch.randn(
+        num_tokens,
+        ba_width + ba_padding,
+        dtype=torch.float16,
+        device=device,
+    )
+    mixed = mixed_storage[:, :mixed_width]
+    ba = ba_storage[:, :ba_width]
+
+    def reference():
+        return (
+            mixed[:, qkv_size:].contiguous(),
+            ba[:, :ba_size].contiguous(),
+            ba[:, ba_size:].contiguous(),
+        )
+
+    # Warm Triton compilation before graph capture.
+    actual = _sm70_gdn_extract_zba(mixed, ba, qkv_size, z_size, ba_size)
+    torch.cuda.synchronize()
+    for result, expected in zip(actual, reference()):
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        captured = _sm70_gdn_extract_zba(mixed, ba, qkv_size, z_size, ba_size)
+
+    mixed_storage.normal_()
+    ba_storage.normal_()
+    graph.replay()
+    torch.cuda.synchronize()
+    for result, expected in zip(captured, reference()):
+        torch.testing.assert_close(result, expected, rtol=0, atol=0)
 
 
 def test_qwen3_5_split_gdn_detects_compressed_tensors_ignore():
