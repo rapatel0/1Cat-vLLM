@@ -1,0 +1,136 @@
+{
+  "date": "2026-08-21",
+  "branch": "experiment/qwen38-mtp-dcp2",
+  "runtime_commit": "59a5fa11f0a1e872197a4c4715353109ab0d7601",
+  "baseline_runtime_commit": "8b760b5f65198b88ec86a00c548507d79e3d34ac",
+  "configuration": {
+    "hardware": "gpu-01: 8 x Tesla V100-SXM2-32GB",
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 2,
+    "dcp_comm_backend": "a2a",
+    "tp_backend": "automatic PyNCCL",
+    "speculator": "native MTP3",
+    "num_speculative_tokens": 3,
+    "max_model_len": 262144,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384,
+    "gpu_memory_utilization": 0.78
+  },
+  "audit": {
+    "prior_default": "SM70 native MTP with exactly four speculative tokens",
+    "finding": "The depth-four condition recorded the only live-qualified depth. The extraction kernel has no depth-dependent indexing or state operation.",
+    "kernel_inputs": [
+      "runtime row count",
+      "qkv slice offset",
+      "z width",
+      "b/a width",
+      "row strides"
+    ],
+    "new_default": "SM70 native MTP with three or four speculative tokens",
+    "explicit_override": "VLLM_SM70_GDN_FUSED_ZBA_EXTRACT",
+    "no_mtp_default_changed": false,
+    "sampling_changed": false,
+    "state_semantics_changed": false
+  },
+  "component_validation": {
+    "selection_and_override_tests_passed": 6,
+    "cuda_graph_parity_cases_passed": 4,
+    "cuda_graph_rows": [4, 128],
+    "layouts": [
+      "contiguous FP16 rows",
+      "FP16 rows with padded leading strides"
+    ],
+    "changed_input_replay": true,
+    "z_b_a_bit_exact": true,
+    "live_all_rank_sample_comparisons": 32,
+    "live_all_rank_graph_buffer_comparisons": 288,
+    "live_component_inputs_exact": true,
+    "max_layer_0_output_diff": 0.00006103515625,
+    "max_target_logits_diff": 0.0625,
+    "target_top1_equal": true,
+    "response_text_equal": true,
+    "recurrent_state_check": "Four sequential target steps kept exact top-1 tokens and the same 16-token response after bit-exact z/b/a state inputs."
+  },
+  "performance": {
+    "qualified_unfused_mtp3": {
+      "single_tok_s": 53.3336,
+      "c32_seven_run_median_tok_s": 746.2713,
+      "accepted_drafts_per_step_c32": 1.3892,
+      "completion_tokens_per_step_c32": 2.3894,
+      "c32_batch_step_ms": 103.4912,
+      "kv_tokens": 2123901,
+      "cuda_graph_gib": 2.0
+    },
+    "fused_mtp3": {
+      "single_three_run_median_tok_s": 54.0519699628092,
+      "single_three_run_tok_s": [
+        55.98250570035034,
+        53.54125214923854,
+        54.0519699628092
+      ],
+      "official_c32_three_run_median_tok_s": 657.6330682931552,
+      "official_c32_three_run_tok_s": [
+        627.2634207698353,
+        657.6330682931552,
+        694.1931096187177
+      ],
+      "c32_seven_run_median_tok_s": 746.7680064956203,
+      "c32_seven_run_tok_s": [
+        712.7047906121823,
+        748.0507881408499,
+        752.2458159857143,
+        746.7680064956203,
+        728.4831314654049,
+        741.471167972801,
+        759.072391752678
+      ],
+      "accepted_drafts_per_step_c32": 1.3888495058588048,
+      "completion_tokens_per_step_c32": 2.388849505858805,
+      "c32_batch_step_ms": 103.26985482512193,
+      "kv_tokens": 2123901,
+      "cuda_graph_gib": 1.99
+    },
+    "change_pct": {
+      "single_vs_prior_official": 1.347,
+      "c32_seven_run": 0.0666,
+      "c32_batch_step": -0.2139,
+      "completion_tokens_per_step": -0.023
+    },
+    "interpretation": "The longer matched c32 gate is flat within run variance. The exact launch reduction caused no throughput loss."
+  },
+  "correctness": {
+    "needle_8k": true,
+    "needle_32k": true,
+    "needle_128k": true,
+    "repeated_prefix_32k": [true, true],
+    "no_mtp_8k": true,
+    "no_mtp_spec_counters_zero": true,
+    "no_mtp_kv_tokens": 2326331,
+    "no_mtp_cuda_graph_gib": 0.46,
+    "final_active_8k": true
+  },
+  "artifacts": {
+    "projection": "/localpool/onecat-vllm-hy3-sm70/dcp2-branch-59a5fa11f0a1",
+    "projection_manifest_sha256": "3dd61333fa9786e888e554e45f1bcbcf3a77762b2225106646e102ea6a8ae7a1",
+    "parity_report_sha256": "ac529bd3b866d449efe4523e466173d25593349e1116f13edee045e3982d27e7",
+    "official_three_run_sha256": "3aa0dffb8a859a09911c8fb03b80cf9ac23d3d0eba749c0ccdc238166c1daaf0",
+    "c32_seven_run_sha256": "84df8d4eef9db2e1345441d7d4e02fcffbced9fdfa26417b032298ab976fa535",
+    "short_needles_sha256": "746874682b3b87a0d7bdaf8cd23737ddad4a68e9a462a68f89810e471f7a2bfb",
+    "no_mtp_smoke_sha256": "78d426fde53a82d857a49751a2898d8dfd2789f66502325767107dab91d3d560",
+    "final_8k_sha256": "94d09d2f3bf1eb69b45c0db288acaf4ba568ec7ccd636fc7f1e2fc164bf188b0"
+  },
+  "residual_risks": [
+    "The seven-run c32 difference is within run variance, so no throughput gain is claimed.",
+    "The live A/B used separate clean starts. Downstream FP16 outputs were tolerance-equal, not bitwise equal.",
+    "The unchanged no-MTP mode reported 2,326,331 KV tokens, below the plan's historical 2.48M floor."
+  ],
+  "active_state": {
+    "qwen38-27b-fp8-tp8": "0/0",
+    "qwen38-27b-fp8-tp8-dcp2": "1/1 healthy",
+    "projection_commit": "59a5fa11f0a1e872197a4c4715353109ab0d7601",
+    "mode": "TP8+DCP2+A2A+native MTP3+uniform verifier batching+direct query gather+fused GDN z/b/a extraction",
+    "profiler_disabled": true,
+    "gateway_changed": false,
+    "shared_venv_changed": false
+  }
+}
