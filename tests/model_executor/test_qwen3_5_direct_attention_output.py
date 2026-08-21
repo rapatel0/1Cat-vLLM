@@ -329,7 +329,9 @@ def test_direct_projection_changed_input_cuda_graph_replay(num_tokens: int):
     weight = torch.randn(32, 32, dtype=torch.float16, device=device)
     layer = SimpleNamespace(
         prefix="model.layers.0.linear_attn",
-        _compute_output_projection=lambda core, _z, _tokens: core @ weight,
+        _compute_output_projection=lambda core, _z, _tokens, direct_output=False: (
+            core @ weight
+        ),
     )
     z = torch.empty_like(hidden)
 
