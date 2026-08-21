@@ -2,11 +2,13 @@
 
 ## Outcome
 
-The common uniform q=4 GDN metadata route passed its measurement, correctness, graph, performance, capacity, retrieval, and no-MTP gates.
+The common uniform q=4 GDN metadata route passed its component, graph, retrieval, and no-MTP gates.
 
-Source commits `dd432ec253` and `2b5d45abb0` retain the route without duplicate buffer allocations.
+A fresh fixed-corpus comparison rejected its performance claim and restored source `59a5fa11f0`.
 
-The first GDN KV group writes persistent invariant buffers once per target step. Each GDN group still builds its distinct state contract.
+Source commits `dd432ec253` and `2b5d45abb0` contain the inactive candidate.
+
+The candidate makes the first GDN group write invariant buffers once. Each GDN group retains its distinct state contract.
 
 ## Phase-1 measurement
 
@@ -47,7 +49,7 @@ The live tensors had these q=4 graph shapes:
 
 The baseline used distinct invariant pointers for each group. Each group registered 16 GDN layer names, for 48 total GDN layers.
 
-## Retained route
+## Candidate route
 
 The runner enables the route only when all conditions match:
 
@@ -84,22 +86,31 @@ Three matched c1 responses were byte-identical between the baseline and candidat
 
 ## Performance
 
-The matched direct-service harness used identical unique prompts and separate clean starts.
+The original campaign reported 694.8579 tok/s for baseline and 728.7711 tok/s for candidate.
 
-| Metric | Baseline | Candidate | Change |
+That comparison used source labels inside each prompt, so the two prompt corpora differed.
+
+It also used a different corpus and warmup from the historical 746.7680 result.
+
+A fresh sequence used six alternating clean starts and nine identical fixed-corpus cohorts per source.
+
+| Metric | `59a5fa11f0` | `2b5d45abb0` | Candidate change |
 |---|---:|---:|---:|
-| c1, three-run median | 54.4857 tok/s | **55.6787 tok/s** | **+2.19%** |
-| c32, seven-run median | 694.8579 tok/s | **728.7711 tok/s** | **+4.88%** |
+| c32 cohort median | **724.8159 tok/s** | 664.0300 tok/s | **-8.39%** |
+| Pooled throughput | **697.4629 tok/s** | 669.6403 tok/s | **-3.99%** |
+| Median verifier step | **112.9450 ms** | 118.7300 ms | **+5.12%** |
+| Median completion tokens/step | 2.5672 | 2.5632 | -0.16% |
+| Median accepted drafts/step | 1.5697 | 1.5682 | -0.10% |
 
-Candidate c32 cohorts were 675.4876, 593.6088, 758.6552, 704.8542, 768.6612, 728.7711, and 768.3213 tok/s.
+Baseline won all three corpus-specific medians.
 
-Baseline c32 cohorts were 647.0238, 698.1539, 684.4317, 694.8579, 705.7458, 693.7044, and 737.8509 tok/s.
+The candidate failed the fresh promotion gate and is inactive.
 
-The c32 gain exceeds the 1.5% promotion threshold. The route remains active.
+See `docs/tp8-dcp2-mtp3-common-gdn-reconciliation.md`.
 
-## Live gates
+## Historical candidate gates
 
-The candidate passed these retrieval gates:
+Before reconciliation, the candidate passed these retrieval gates:
 
 - 8K needle at 8,785 prompt tokens
 - 32K needle at 34,970 prompt tokens
@@ -114,14 +125,18 @@ The no-MTP restart passed an exact 8K retrieval request. It reported no speculat
 
 ## Artifacts
 
-Persistent artifacts are under `/srv/dev/dcp2-direct-lse-profile-53893bfb47/mtp3-common-gdn-metadata`.
+Original artifacts are under `/srv/dev/dcp2-direct-lse-profile-53893bfb47/mtp3-common-gdn-metadata`.
 
-The artifact manifest SHA256 is `97ba306328e2d5b3ad1cb74601dc5a8caa60e504c795b344bd9da5c22149bb98`.
+The original artifact manifest SHA256 is `97ba306328e2d5b3ad1cb74601dc5a8caa60e504c795b344bd9da5c22149bb98`.
+
+Reconciliation artifacts are under `/srv/dev/dcp2-direct-lse-profile-53893bfb47/mtp3-common-gdn-reconciliation`.
 
 ## Residual risks
 
-The matched c32 cohorts have wide variance. The seven-run median still clears the promotion gate.
+Both fresh sources retained wide cohort variance.
 
-The fast route targets the exact c32 q=4 layout. Smaller or irregular batches keep the generic path.
+Probabilistic draft sampling changed some c32 response hashes under temperature zero.
+
+One candidate start reported 7,643 fewer KV tokens.
 
 The full metadata test file has known environment-sensitive failures under automatic SM70 graph defaults. The focused candidate tests passed.

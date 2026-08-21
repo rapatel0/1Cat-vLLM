@@ -24,7 +24,8 @@ explicitly qualified.
 | TP8+DCP2, no speculation | 45.5–50.4 short-request tok/s | 2,612,021 | `docs/dcp2-qwen38-validation.md` |
 | TP8+DCP2+MTP4, original | 51.464 tok/s single; 377.005 tok/s c32 | 2,090,088 | `docs/dcp2-qwen38-final-benchmark.json` |
 | TP8+DCP2+MTP4, final | 54.251 tok/s single; 734.934 tok/s c32 | 2,097,152 | seven-run fused-ZBA qualification |
-| TP8+DCP2+MTP3, current | 54.052 tok/s single; 746.768 tok/s c32 | 2,123,901 | MTP3 selection plus fused-ZBA qualification |
+| TP8+DCP2+MTP3, historical | 54.052 tok/s single; 746.768 tok/s c32 | 2,123,901 | fused-ZBA harness with 249-256-token prompts; not comparable to later metadata campaigns |
+| TP8+DCP2+MTP3, current fixed-corpus | 724.816 tok/s c32 | 2,123,901 | fresh six-start reconciliation; active source `59a5fa11f0` |
 
 The early 55.4/539 DCP2 figures in the implementation report predate the final
 cross-rank LSE correction and are deliberately excluded. The old 126/1,730
@@ -141,11 +142,12 @@ Implement and validate one focused change per commit, in this order:
    4.194 ms at c1 and 6.579 ms at c32. Three GDN groups dominate the c32 cost.
    Removing one GPU scalar assertion did not improve the full step. See
    `docs/tp8-dcp2-mtp3-attention-metadata.md`.
-10. **Completed:** homogeneous c32 q=4 GDN groups now share persistent invariant
-    metadata. Each group retains its state contract and state-index buffers.
-    The route improved matched seven-run c32 throughput by 4.88% and passed
-    graph, retrieval, capacity, and no-MTP gates. See
-    `docs/tp8-dcp2-mtp3-common-gdn-metadata.md`.
+10. **Reconciled and rejected:** homogeneous c32 q=4 GDN groups shared
+    persistent invariant metadata while each group retained its state contract.
+    The original 4.88% result used source-specific prompt strings. A fresh
+    fixed-corpus sequence measured -8.39% cohort median and -3.99% pooled
+    throughput. Source `59a5fa11f0` is active. See
+    `docs/tp8-dcp2-mtp3-common-gdn-reconciliation.md`.
 
 Each change first passes targeted unit/kernel tests and no-MTP/MTP3 graph and
 numerical tests, then a direct canary S1/c32 candidate gate.  Keep a change

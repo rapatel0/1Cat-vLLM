@@ -63,12 +63,24 @@
       "GPU scalar assertion"
     ],
     "tensor_shapes": {
-      "spec_query_start_loc": [129],
-      "spec_sequence_masks": [128],
-      "spec_token_indx": [128],
-      "non_spec_token_indx": [0],
-      "num_accepted_tokens": [128],
-      "spec_state_slot_selectors": [128]
+      "spec_query_start_loc": [
+        129
+      ],
+      "spec_sequence_masks": [
+        128
+      ],
+      "spec_token_indx": [
+        128
+      ],
+      "non_spec_token_indx": [
+        0
+      ],
+      "num_accepted_tokens": [
+        128
+      ],
+      "spec_state_slot_selectors": [
+        128
+      ]
     },
     "gdn_layer_names_per_group": 16,
     "gdn_layer_names_total": 48,
@@ -102,7 +114,10 @@
     "needle_8k": true,
     "needle_32k": true,
     "needle_128k": true,
-    "repeated_prefix_32k": [true, true],
+    "repeated_prefix_32k": [
+      true,
+      true
+    ],
     "no_mtp_8k": true,
     "no_mtp_speculative_metrics_present": false
   },
@@ -150,7 +165,9 @@
       "c32": 4.8806
     },
     "promotion_gate": "At least 0.4 ms from the full q=4 step or at least 1.5% c32 throughput.",
-    "promotion_passed": true
+    "promotion_passed": true,
+    "interpretation": "Historical only: the harness embedded source labels in prompts, so baseline and candidate corpora were not identical.",
+    "directly_comparable": false
   },
   "no_mtp": {
     "kv_tokens": 2347416,
@@ -163,12 +180,51 @@
     "manifest_sha256": "97ba306328e2d5b3ad1cb74601dc5a8caa60e504c795b344bd9da5c22149bb98"
   },
   "decision": {
-    "retained": true,
-    "reason": "The exact route improved matched c32 throughput by 4.88% and passed all required gates."
+    "retained": false,
+    "active_source": "59a5fa11f0a1e872197a4c4715353109ab0d7601",
+    "reason": "The candidate lost the fresh exact-corpus comparison by 8.39% on cohort median and 3.99% on pooled throughput."
   },
   "residual_risks": [
-    "The seven-run c32 cohorts have wide variance.",
-    "The route only covers the exact homogeneous c32 q=4 layout.",
+    "Fresh c32 cohorts retain wide variance.",
+    "Probabilistic draft sampling changed some c32 response hashes under temperature zero.",
+    "One candidate start reported 2,116,258 KV tokens instead of 2,123,901.",
     "The full metadata test file has environment-sensitive baseline failures under automatic SM70 graph defaults."
-  ]
+  ],
+  "reconciliation": {
+    "record": "docs/tp8-dcp2-mtp3-common-gdn-reconciliation.json",
+    "baseline_source": "59a5fa11f0a1e872197a4c4715353109ab0d7601",
+    "candidate_source": "2b5d45abb0e8351879478a280fa7a19a0a1eef31",
+    "sequence": [
+      "baseline",
+      "candidate",
+      "baseline",
+      "candidate",
+      "baseline",
+      "candidate"
+    ],
+    "clean_starts_per_source": 3,
+    "c32_cohorts_per_source": 9,
+    "exact_fixed_corpus": true,
+    "baseline_median_tok_s": 724.8159284942415,
+    "candidate_median_tok_s": 664.029967026047,
+    "candidate_change_pct": -8.386399784904485,
+    "baseline_pooled_tok_s": 697.4629491858079,
+    "candidate_pooled_tok_s": 669.6402851878469,
+    "candidate_pooled_change_pct": -3.98912430121775,
+    "baseline_median_batch_step_ms": 112.94495975371541,
+    "candidate_median_batch_step_ms": 118.73003428591821,
+    "candidate_batch_step_change_pct": 5.122029831891184,
+    "all_start_needles_passed": true,
+    "baseline_kv_tokens": [
+      2123901,
+      2123901,
+      2123901
+    ],
+    "candidate_kv_tokens": [
+      2123901,
+      2123901,
+      2116258
+    ],
+    "cuda_graph_gib": 1.99
+  }
 }

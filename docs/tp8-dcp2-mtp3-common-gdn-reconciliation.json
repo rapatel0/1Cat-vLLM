@@ -1,0 +1,320 @@
+{
+  "date": "2026-08-21",
+  "branch": "experiment/qwen38-mtp-dcp2",
+  "purpose": "Fresh matched reconciliation of native-MTP3 common GDN metadata",
+  "sources": {
+    "baseline": "59a5fa11f0a1e872197a4c4715353109ab0d7601",
+    "candidate": "2b5d45abb0e8351879478a280fa7a19a0a1eef31"
+  },
+  "methodology": {
+    "sequence": [
+      "baseline",
+      "candidate",
+      "baseline",
+      "candidate",
+      "baseline",
+      "candidate"
+    ],
+    "clean_starts_per_source": 3,
+    "measured_cohorts_per_start": 3,
+    "measured_cohorts_per_source": 9,
+    "direct_service": true,
+    "client": "same local client through kubectl port-forward to service port 80",
+    "concurrency": 32,
+    "output_tokens_per_request": 256,
+    "prompt_tokens_per_request": 311,
+    "temperature": 0.0,
+    "top_p": 1.0,
+    "ignore_eos": true,
+    "warmups_per_start": [
+      "exact 8K needle",
+      "fixed c32 corpus warm-0 with 64 output tokens",
+      "fixed c32 corpus warm-1 with 64 output tokens"
+    ],
+    "measured_corpus_sha256": [
+      "b2035761bfda9cc418cd37e7fb42318abfb0b92ed35f5c27d66721d7f97d7e86",
+      "567cb882719e9d9b7a67f6422f1d522820a7e8f0e235d847cec511d7db3a8255",
+      "5fbdae6e49c8188afa41acad3416aa61870b9b2ede562b84c45d22b4ce5ee470"
+    ],
+    "needle_content_sha256": "89dbd5412fd307b14a64db9f6cafde20cc58ea79dd774b7686c2af726de7d1c4",
+    "needle_prompt_tokens": 8178,
+    "normalized_deployment_fingerprint_sha256": "1ec31b549f236aa00d0fbfbcdc25aa4bcdb3036e7ffbb9a7e377e514020187e2",
+    "exact_corpus_hashes_equal_between_sources": true,
+    "c32_response_hashes_stable": false
+  },
+  "configuration": {
+    "hardware": "gpu-01: 8 x Tesla V100-SXM2-32GB",
+    "image_id": "localhost:32000/onecat-vllm@sha256:253e98bfd4a3f9e89187321b37dae01dd27642b3dc11546be881ce188df96c72",
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 2,
+    "dcp_comm_backend": "a2a",
+    "tp_backend": "automatic PyNCCL",
+    "speculator": "native MTP3",
+    "num_speculative_tokens": 3,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384,
+    "gpu_memory_utilization": 0.78,
+    "projection_method": "read-only workspace projection with sha256sum -c at startup"
+  },
+  "fresh_matched_performance": {
+    "baseline": {
+      "clean_starts": 3,
+      "cohorts": 9,
+      "start_medians_tok_s": [
+        737.6946950959589,
+        658.2194611162515,
+        724.8159284942415
+      ],
+      "cohort_tok_s": [
+        599.2962731449172,
+        737.6946950959589,
+        759.3565938780044,
+        630.3393194157807,
+        739.3396264287104,
+        658.2194611162515,
+        707.6185727436421,
+        724.8159284942415,
+        762.3683758068498
+      ],
+      "median_tok_s": 724.8159284942415,
+      "mean_tok_s": 702.1165384582619,
+      "pooled_tok_s": 697.4629491858079,
+      "range_tok_s": [
+        599.2962731449172,
+        762.3683758068498
+      ],
+      "median_batch_verifier_step_ms": 112.94495975371541,
+      "median_completion_tokens_per_step": 2.5672203071137574,
+      "median_accepted_tokens_per_step": 1.5697273581949232,
+      "corpus_medians_tok_s": {
+        "measure-0": 630.3393194157807,
+        "measure-1": 737.6946950959589,
+        "measure-2": 759.3565938780044
+      },
+      "kv_tokens_by_start": [
+        2123901,
+        2123901,
+        2123901
+      ],
+      "cuda_graph_gib": [
+        1.99
+      ],
+      "source_commits": [
+        "59a5fa11f0a1e872197a4c4715353109ab0d7601"
+      ],
+      "projection_manifest_sha256": [
+        "3dd61333fa9786e888e554e45f1bcbcf3a77762b2225106646e102ea6a8ae7a1"
+      ],
+      "image_ids": [
+        "localhost:32000/onecat-vllm@sha256:253e98bfd4a3f9e89187321b37dae01dd27642b3dc11546be881ce188df96c72"
+      ],
+      "needle_8k_all_passed": true,
+      "needle_content_sha256": [
+        "89dbd5412fd307b14a64db9f6cafde20cc58ea79dd774b7686c2af726de7d1c4"
+      ]
+    },
+    "candidate": {
+      "clean_starts": 3,
+      "cohorts": 9,
+      "start_medians_tok_s": [
+        656.5048175074461,
+        664.029967026047,
+        728.2189032677401
+      ],
+      "cohort_tok_s": [
+        581.3608092010014,
+        656.5048175074461,
+        713.39095874546,
+        664.029967026047,
+        655.8453736896766,
+        764.4201963439405,
+        582.2408302221033,
+        732.4006943942112,
+        728.2189032677401
+      ],
+      "median_tok_s": 664.029967026047,
+      "mean_tok_s": 675.3791722664029,
+      "pooled_tok_s": 669.6402851878469,
+      "range_tok_s": [
+        581.3608092010014,
+        764.4201963439405
+      ],
+      "median_batch_verifier_step_ms": 118.73003428591821,
+      "median_completion_tokens_per_step": 2.563204005006258,
+      "median_accepted_tokens_per_step": 1.5682102628285357,
+      "corpus_medians_tok_s": {
+        "measure-0": 582.2408302221033,
+        "measure-1": 656.5048175074461,
+        "measure-2": 728.2189032677401
+      },
+      "kv_tokens_by_start": [
+        2123901,
+        2123901,
+        2116258
+      ],
+      "cuda_graph_gib": [
+        1.99
+      ],
+      "source_commits": [
+        "2b5d45abb0e8351879478a280fa7a19a0a1eef31"
+      ],
+      "projection_manifest_sha256": [
+        "b48791fca934f698ddc697d6284cc44e0ab50291ab437aaa0b49522f8d97b9df"
+      ],
+      "image_ids": [
+        "localhost:32000/onecat-vllm@sha256:253e98bfd4a3f9e89187321b37dae01dd27642b3dc11546be881ce188df96c72"
+      ],
+      "needle_8k_all_passed": true,
+      "needle_content_sha256": [
+        "89dbd5412fd307b14a64db9f6cafde20cc58ea79dd774b7686c2af726de7d1c4"
+      ]
+    },
+    "candidate_change_pct": {
+      "candidate_change_median_tok_s_pct": -8.386399784904485,
+      "candidate_change_pooled_tok_s_pct": -3.98912430121775,
+      "candidate_change_median_step_ms_pct": 5.122029831891184,
+      "candidate_change_completion_per_step_pct": -0.15644555694617202,
+      "candidate_change_accepted_per_step_pct": -0.09664706157201941,
+      "corpus_changes_pct": {
+        "measure-0": -7.630570981714513,
+        "measure-1": -11.005891478988017,
+        "measure-2": -4.100536014475809
+      }
+    },
+    "pooled_metrics": {
+      "baseline": {
+        "completion_tokens": 73728,
+        "draft_steps": 29061,
+        "accepted_tokens": 44696,
+        "completion_tokens_per_step": 2.5370083617218953,
+        "accepted_tokens_per_step": 1.538006262688827,
+        "batch_verifier_step_ms": 116.39939823308481
+      },
+      "candidate": {
+        "completion_tokens": 73728,
+        "draft_steps": 29068,
+        "accepted_tokens": 44714,
+        "completion_tokens_per_step": 2.536397412962708,
+        "accepted_tokens_per_step": 1.5382551259116555,
+        "batch_verifier_step_ms": 121.20644323547293
+      }
+    }
+  },
+  "historical_reconciliation": {
+    "fused_zba_746": {
+      "median": 746.7680064956203,
+      "mean": 741.2565846321787,
+      "min": 712.7047906121823,
+      "max": 759.072391752678,
+      "settings": {
+        "concurrency": 32,
+        "target_prompt_tokens": 256,
+        "output_tokens_per_request": 256,
+        "runs": 7,
+        "temperature": 0.0,
+        "ignore_eos": true,
+        "unique_prompts": true
+      },
+      "warmup_tok_s": 481.5325251647118,
+      "prompt_token_ranges": [
+        [
+          249,
+          256
+        ],
+        [
+          249,
+          256
+        ],
+        [
+          249,
+          256
+        ],
+        [
+          249,
+          256
+        ],
+        [
+          249,
+          256
+        ],
+        [
+          249,
+          256
+        ],
+        [
+          249,
+          256
+        ]
+      ],
+      "spec_decode": {
+        "raw_delta": {
+          "vllm:spec_decode_num_drafts_total": 23981.0,
+          "accepted_position_2": 5665.0,
+          "accepted_position_1": 10126.0,
+          "vllm:spec_decode_num_draft_tokens_total": 71943.0,
+          "accepted_position_0": 17515.0,
+          "vllm:spec_decode_num_accepted_tokens_total": 33306.0
+        },
+        "draft_steps": 23981.0,
+        "draft_tokens": 71943.0,
+        "accepted_tokens": 33306.0,
+        "acceptance": 0.4629498352862683,
+        "accepted_per_step": 1.3888495058588048
+      }
+    },
+    "common_gdn_campaign": {
+      "baseline_median_tok_s": 694.8579051944675,
+      "candidate_median_tok_s": 728.7711000001783,
+      "prompt_token_range": [
+        310,
+        312
+      ],
+      "warmup_output_tokens": 32,
+      "harness": "run_common_gdn_benchmark.py importing run_profile_cohort.py",
+      "problem": "The source label was embedded in each prompt, so baseline and candidate corpora were not identical."
+    },
+    "canonical_benchmark_source_changed_between_commits": false,
+    "explanation": [
+      "The 746.768 result used benchmark_qwen38_dcp2_service.py with 249-256-token prompts and one 64-token c32 warmup.",
+      "The 694.858 result used the metadata profiling harness with 310-312-token prompts, a 32-token c32 warmup, and prior c1 work.",
+      "The common-GDN campaign embedded baseline/candidate labels in prompts and did not collect speculative metrics.",
+      "Historical accepted drafts per step were 1.38885. Fresh fixed-corpus pooled values were 1.53801 baseline and 1.53826 candidate.",
+      "Fresh cohort ranges remained wide, so run variance also contributed. Only the fresh fixed-corpus comparison is direct."
+    ]
+  },
+  "correctness_and_capacity": {
+    "eight_k_needles": "7/7 passed, including final restored baseline",
+    "needle_prompt_tokens": 8178,
+    "baseline_kv_tokens_all_starts": [
+      2123901,
+      2123901,
+      2123901
+    ],
+    "candidate_kv_tokens_by_start": [
+      2123901,
+      2123901,
+      2116258
+    ],
+    "baseline_cuda_graph_gib": 1.99,
+    "candidate_cuda_graph_gib": 1.99
+  },
+  "decision": {
+    "retained_source": "59a5fa11f0a1e872197a4c4715353109ab0d7601",
+    "candidate_retained": false,
+    "reason": "The candidate lost the fresh exact-corpus comparison by 8.39% on cohort median and 3.99% on pooled throughput. Its pooled verifier step was 4.13% slower with unchanged useful-token yield.",
+    "final_deployment": "TP8+DCP2 native-MTP3 baseline healthy 1/1",
+    "final_kv_tokens": 2123901,
+    "final_cuda_graph_gib": 1.99,
+    "final_8k_passed": true
+  },
+  "residual_risks": [
+    "Fresh cohort throughput remained wide for both sources.",
+    "Probabilistic draft sampling produced varying c32 response hashes under temperature zero; acceptance metrics and exact 8K gates are the correctness evidence.",
+    "The historical artifacts do not attest the client host or image digest, so their absolute throughput remains non-comparable.",
+    "One candidate start reported 2,116,258 KV tokens instead of 2,123,901; baseline capacity was stable across all starts."
+  ],
+  "artifacts": {
+    "root": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/mtp3-common-gdn-reconciliation",
+    "manifest_sha256": "883782b3b9be4be1c00388c6fb87e965142819650e6e1a7dc99cfa1adbd1acf1"
+  }
+}
