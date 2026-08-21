@@ -141,6 +141,11 @@ Implement and validate one focused change per commit, in this order:
    4.194 ms at c1 and 6.579 ms at c32. Three GDN groups dominate the c32 cost.
    Removing one GPU scalar assertion did not improve the full step. See
    `docs/tp8-dcp2-mtp3-attention-metadata.md`.
+10. **Completed:** homogeneous c32 q=4 GDN groups now share persistent invariant
+    metadata. Each group retains its state contract and state-index buffers.
+    The route improved matched seven-run c32 throughput by 4.88% and passed
+    graph, retrieval, capacity, and no-MTP gates. See
+    `docs/tp8-dcp2-mtp3-common-gdn-metadata.md`.
 
 Each change first passes targeted unit/kernel tests and no-MTP/MTP3 graph and
 numerical tests, then a direct canary S1/c32 candidate gate.  Keep a change

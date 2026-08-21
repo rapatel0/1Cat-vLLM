@@ -1,0 +1,173 @@
+{
+  "date": "2026-08-21",
+  "branch": "experiment/qwen38-mtp-dcp2",
+  "source_commit": "dd432ec253ea5951191bb25101eaad37db683803",
+  "baseline_runtime_commit": "59a5fa11f0a1e872197a4c4715353109ab0d7601",
+  "configuration": {
+    "hardware": "gpu-01: 8 x Tesla V100-SXM2-32GB",
+    "tensor_parallel_size": 8,
+    "decode_context_parallel_size": 2,
+    "dcp_comm_backend": "a2a",
+    "tp_backend": "automatic PyNCCL",
+    "speculator": "native MTP3",
+    "num_speculative_tokens": 3,
+    "verifier_query_width": 4,
+    "max_num_seqs": 32,
+    "max_num_batched_tokens": 16384,
+    "gpu_memory_utilization": 0.78
+  },
+  "phase1": {
+    "rank_count": 8,
+    "warmed_steps_per_rank_group": 40,
+    "all_invariant_fields_byte_equal": true,
+    "invariant_fields": [
+      "spec_query_start_loc",
+      "non_spec_query_start_loc",
+      "spec_sequence_masks",
+      "spec_token_indx",
+      "non_spec_token_indx",
+      "num_accepted_tokens",
+      "spec_state_slot_selectors"
+    ],
+    "critical_rank_common_boundary_median_ms": {
+      "kv0": 0.4085,
+      "kv1": 0.4005,
+      "kv2": 0.387,
+      "redundant_kv1_plus_kv2": 0.7875
+    },
+    "critical_rank_subphase_median_ms": {
+      "kv0": {
+        "mask": 0.091,
+        "query": 0.067,
+        "post": 0.089,
+        "invariant_buffers": 0.156
+      },
+      "kv1": {
+        "mask": 0.089,
+        "query": 0.069,
+        "post": 0.086,
+        "invariant_buffers": 0.1525
+      },
+      "kv2": {
+        "mask": 0.085,
+        "query": 0.065,
+        "post": 0.0875,
+        "invariant_buffers": 0.149
+      }
+    },
+    "excluded_from_timing": [
+      "build_gdn_spec_decode_state_contract",
+      "per-group state-index copy",
+      "per-group state-index PAD fill",
+      "GPU scalar assertion"
+    ],
+    "tensor_shapes": {
+      "spec_query_start_loc": [129],
+      "spec_sequence_masks": [128],
+      "spec_token_indx": [128],
+      "non_spec_token_indx": [0],
+      "num_accepted_tokens": [128],
+      "spec_state_slot_selectors": [128]
+    },
+    "gdn_layer_names_per_group": 16,
+    "gdn_layer_names_total": 48,
+    "promotion_measurement_passed": true
+  },
+  "implementation": {
+    "first_group_writes_shared_buffers": true,
+    "later_groups_reuse_shared_buffers": true,
+    "per_group_state_contracts_retained": true,
+    "per_group_state_buffers_distinct": true,
+    "state_width_derived_from_config": true,
+    "fallbacks": [
+      "c1",
+      "irregular or mixed batches",
+      "MTP4",
+      "no-MTP",
+      "changed request ownership",
+      "CUDA graph capture",
+      "DDTree metadata",
+      "debug state-table dump",
+      "other builder types"
+    ]
+  },
+  "correctness": {
+    "focused_cpu_tests_passed": 3,
+    "changed_input_graph_replays": 100,
+    "changed_input_graph_max_error": 0,
+    "state_pointers_distinct": true,
+    "invariant_pointers_shared": true,
+    "c1_response_hashes_equal": true,
+    "needle_8k": true,
+    "needle_32k": true,
+    "needle_128k": true,
+    "repeated_prefix_32k": [true, true],
+    "no_mtp_8k": true,
+    "no_mtp_speculative_metrics_present": false
+  },
+  "performance": {
+    "matched_baseline": {
+      "c1_three_run_tok_s": [
+        54.485706018019705,
+        57.85256095519978,
+        54.419339756209375
+      ],
+      "c1_median_tok_s": 54.485706018019705,
+      "c32_seven_run_tok_s": [
+        647.0237886644406,
+        698.1539416354315,
+        684.4316805191959,
+        694.8579051944675,
+        705.7458042087189,
+        693.7043996987666,
+        737.8508521397292
+      ],
+      "c32_median_tok_s": 694.8579051944675
+    },
+    "candidate": {
+      "c1_three_run_tok_s": [
+        54.51660439547643,
+        58.3328433422421,
+        55.678678782468594
+      ],
+      "c1_median_tok_s": 55.678678782468594,
+      "c32_seven_run_tok_s": [
+        675.4876379570201,
+        593.6088392973597,
+        758.6552110347892,
+        704.8542271273006,
+        768.6611837164519,
+        728.7711000001783,
+        768.3213173508473
+      ],
+      "c32_median_tok_s": 728.7711000001783,
+      "kv_tokens": 2123901,
+      "cuda_graph_gib": 1.99
+    },
+    "change_pct": {
+      "c1": 2.1895,
+      "c32": 4.8806
+    },
+    "promotion_gate": "At least 0.4 ms from the full q=4 step or at least 1.5% c32 throughput.",
+    "promotion_passed": true
+  },
+  "no_mtp": {
+    "kv_tokens": 2347416,
+    "cuda_graph_gib": 0.46,
+    "exact_8k_pass": true,
+    "speculative_metrics_present": false
+  },
+  "artifacts": {
+    "root": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/mtp3-common-gdn-metadata",
+    "manifest_sha256": "7624cfcba05b591fa52e8c036feba97c1fd8f03257c348ade70b5076fddc8e82"
+  },
+  "decision": {
+    "retained": true,
+    "reason": "The exact route improved matched c32 throughput by 4.88% and passed all required gates."
+  },
+  "residual_risks": [
+    "The seven-run c32 cohorts have wide variance.",
+    "The route only covers the exact homogeneous c32 q=4 layout.",
+    "The full metadata test file has environment-sensitive baseline failures under automatic SM70 graph defaults."
+  ]
+}
