@@ -124,6 +124,22 @@ Do not retain the exact FP8 half2 epilogue alone because its large component win
 Preserve historical TP4/no-DCP as qualified negative topology evidence: exact TP4 reduced collective time but was throughput-neutral due weight traffic; 110.015 tok/s used approximate acceptance.
 <!-- forge-decision:v2:D010:end -->
 
+<!-- forge-decision:v2:D011:start -->
+Reject the exact paired FP16 value-load plus FP8 half2 composition because matched c1 and c32 service throughput regressed.
+<!-- forge-decision:v2:D011:end -->
+
+<!-- forge-decision:v2:D012:start -->
+Use a clean composition cloned from 3bc07baedc because the resumed call2 package still contained rejected recurrent experiment code.
+<!-- forge-decision:v2:D012:end -->
+
+<!-- forge-decision:v2:D013:start -->
+Do not promote component wins without a material full-service gain.
+<!-- forge-decision:v2:D013:end -->
+
+<!-- forge-decision:v2:D014:start -->
+Retain source and service 3bc07baedc after the complete portfolio fixed point.
+<!-- forge-decision:v2:D014:end -->
+
 ## Outcome
 
 ## Continuity
