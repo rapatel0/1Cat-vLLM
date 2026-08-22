@@ -85,6 +85,19 @@ Do not reopen the M128 FP8 input tuner without a kernel that preserves the defau
 Retain the existing 3bc07baedc source and service.
 <!-- forge-decision:v2:D005:end -->
 
+<!-- forge-amendment:v2:A001:start -->
+**Amendment 001 — complete the unimplemented architecture families**
+
+The prior candidate return records valid negative evidence for one GDN fusion, one paired-head attention kernel, one DCP side-stream overlap route, and dispatch-only FP8 selection. It is not terminal under the confirmed delivery horizon.
+
+Continue this same item until it has implemented and tested both remaining architecture families:
+
+1. a new exact FP8 gated-MLP input arithmetic kernel that preserves the baseline reduction order on every tensor-parallel rank; and
+2. a structural TP/DCP communication design that reduces a real graph dependency or collective boundary without configuration-only tuning or doubled producer/collective launch counts.
+
+The controller must establish fresh exact-shape discriminators for each family, implement at least one new mechanism in each, qualify graph and service behavior, and then reconsider compatible composition with any previously measured exact micro-win. Rejections remain evidence, but a fixed point requires these new mechanisms and final red-team re-entry. All existing semantic constraints and acceptance gates remain unchanged.
+<!-- forge-amendment:v2:A001:end -->
+
 ## Outcome
 
 ## Continuity
