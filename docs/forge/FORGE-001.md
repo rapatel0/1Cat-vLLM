@@ -65,6 +65,26 @@ Continue while any safe in-scope implementation, test, profile, falsification, r
 
 ## Amendments and decisions
 
+<!-- forge-decision:v2:D001:start -->
+Reject GDN mixed-dtype in-place because full-service behavior regressed despite exact component output.
+<!-- forge-decision:v2:D001:end -->
+
+<!-- forge-decision:v2:D002:start -->
+Reject exact paired XQA because shared KV loads cost more than the scalar CTA parallelism they remove.
+<!-- forge-decision:v2:D002:end -->
+
+<!-- forge-decision:v2:D003:start -->
+Reject DCP query-reformat overlap because the graph-safe repair regressed matched service throughput.
+<!-- forge-decision:v2:D003:end -->
+
+<!-- forge-decision:v2:D004:start -->
+Do not reopen the M128 FP8 input tuner without a kernel that preserves the default reduction order on every rank.
+<!-- forge-decision:v2:D004:end -->
+
+<!-- forge-decision:v2:D005:start -->
+Retain the existing 3bc07baedc source and service.
+<!-- forge-decision:v2:D005:end -->
+
 ## Outcome
 
 ## Continuity
