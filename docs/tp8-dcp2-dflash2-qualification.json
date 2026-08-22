@@ -1,0 +1,82 @@
+{
+  "date": "2026-08-22",
+  "decision": "reject",
+  "candidate_commit_created": false,
+  "source": {
+    "retained_commit": "3bc07baedc9066d079237cc34b74bcdeecbc380b",
+    "draft_commit": "5fa53b487980f4bdf2a81a61d10aa6356ac65177",
+    "upstream_basis": "vLLM PR #52816",
+    "candidate_projection": "de88395908a95da53698165053de478655dcb23e"
+  },
+  "policy": {
+    "topology": "TP8+DCP2 A2A",
+    "draft_method": "dflash",
+    "draft_tokens": 7,
+    "draft_selection": "greedy",
+    "sampling_status": "fails closed and is unqualified",
+    "ddtree_status": "fails closed and is unqualified"
+  },
+  "checkpoint": {
+    "repository": "incoai/Qwen3.8-27B-DFlash2",
+    "revision": "dedf8df68adfb1afeaf7b7480c0a0243108177b4",
+    "path": "/srv/models/Qwen3.8-27B-DFlash2",
+    "model_safetensors_sha256": "67fc76d68dc5a9415511a4f394ef744d67510cd20e93b37cc2cc7d28e4bab65c",
+    "projection_manifest_sha256": "bafeb1833c2e6b956cbb2500fe1c0f6f9fae235b43764b7883c9db0111b8049d",
+    "authentication_required": false
+  },
+  "passed_gates": {
+    "architecture_resolved": "DFlash2DraftModel",
+    "all_rank_embedding_sharing": true,
+    "all_rank_lm_head_sharing": true,
+    "all_rank_dflash_route_hit": true,
+    "selector_top_k": 16,
+    "verifier_query_tokens": 8,
+    "graph_shapes": "8x1..4",
+    "graph_memory_gib": 0.81,
+    "changed_input_greedy_parity": true,
+    "parity_response_sha256": "657f7c0ce0fd5be3afc2989e0dd4c697695326d7afd5c39d0764c5f7d4c034a5",
+    "retrieval": {
+      "8k": true,
+      "32k": true,
+      "128k": true,
+      "repeated_32k": true
+    }
+  },
+  "failed_gates": {
+    "kv_capacity_tokens": 1437416,
+    "kv_capacity_floor_tokens": 1800000,
+    "c1_tokens_per_second": 17.633333333333333,
+    "mtp3_c1_anchor_tokens_per_second": 54.052,
+    "draft_steps": 2114,
+    "draft_tokens": 14798,
+    "accepted_draft_tokens": 0,
+    "mean_acceptance_length": 1.0,
+    "c32_completed": false,
+    "c32_error": "Speculative decode scheduled draft input slots, but the worker has no draft token tensor to scatter.",
+    "sequence_tuning_result_valid": false
+  },
+  "c1_120_seconds": {
+    "active_mean": 1.0,
+    "waiting_max": 0.0,
+    "sm_mean_percent": 64.85416666666667,
+    "power_mean_watts": 92.80303030303031,
+    "verifier_step_ms": 56.76442762535478
+  },
+  "restoration": {
+    "ready_replicas": 1,
+    "available_replicas": 1,
+    "speculator": "native MTP3",
+    "dflash_or_candidate_environment_variables": [],
+    "health_http_status": 200,
+    "retrieval_8k_passed": true,
+    "retrieval_8k_content_sha256": "89dbd5412fd307b14a64db9f6cafde20cc58ea79dd774b7686c2af726de7d1c4",
+    "kv_capacity_tokens": 2103266,
+    "graph_memory_gib": 2.11
+  },
+  "blocking_engineering_issue": "The multi-request scheduler assigns DFlash draft slots without a draft-token tensor for worker scatter. The stale-draft guard prevents corrupt GPU input_ids reuse.",
+  "next_gate": "Repair the multi-request draft-token contract. Prove all-rank fresh-token scatter, nonzero greedy acceptance, exact output parity, safe c32 warmup with 32 active and zero waiting, and at least 1.8 million KV tokens before sequence tuning.",
+  "artifacts": {
+    "root": "/srv/dev/dcp2-direct-lse-profile-53893bfb47/dflash2-qualification-de88395908",
+    "manifest_sha256": "1df4f586e407e0e9012f437254e8aa63e7ae90b7807b16f9a49e790536e1c742"
+  }
+}
