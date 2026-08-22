@@ -1,3 +1,3 @@
 # forge-state-v2
 forge_id	title	kind	cadence	parent	status	updated_at	work_commit
-001	Exact TP8 DCP2 Native MTP3 Kernel Campaign	initial	implement,verify,redteam	-	in_progress	2026-08-22T13:10:56Z	-
+001	Exact TP8 DCP2 Native MTP3 Kernel Campaign	initial	implement,verify,redteam	-	completed	2026-08-22T13:11:10Z	3bc07baedc9066d079237cc34b74bcdeecbc380b

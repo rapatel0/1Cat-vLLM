@@ -142,4 +142,9 @@ Retain source and service 3bc07baedc after the complete portfolio fixed point.
 
 ## Outcome
 
+The exact paired FP16 attention load and FP8 half2 composition passed all-rank output, LSE, changed-input graph, full graph, retrieval, and capacity gates. The paired attention route reduced mean component time by 13.12 percent, and the FP8 route reduced mean component time by 24.72 percent. The matched service result regressed c1 by 1.48 percent and c32 by 3.34 percent, so the composition did not qualify. The complete sealed portfolio reached a fixed point with no retained candidate. The service returned to 3bc07baedc and passed final retrieval.
+
 ## Continuity
+
+No safe unverified action remains in the sealed portfolio. The retained deployment is 1/1 ready with zero restarts and no candidate variables. Raw composition and test artifacts remain outside Forge state under /workspace and /tmp. No product branch, controller ref, or documentation path changed.
+
