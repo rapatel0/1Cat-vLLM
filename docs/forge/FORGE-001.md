@@ -104,6 +104,26 @@ The controller must establish fresh exact-shape discriminators for each family, 
 Retain the original kernel, attention, distributed-runtime, test, and benchmark ownership while adding the native kernel source required by Amendment 001. This correction does not change the delivery horizon, acceptance contract, or architectural authority.
 <!-- forge-amendment:v2:A002:end -->
 
+<!-- forge-decision:v2:D006:start -->
+Reject rank-major DCP query consumption because exact graph behavior passed but combined c32 regressed.
+<!-- forge-decision:v2:D006:end -->
+
+<!-- forge-decision:v2:D007:start -->
+Reject Q4 unrolled GDN recurrence because output and recurrent-state hashes changed on every rank.
+<!-- forge-decision:v2:D007:end -->
+
+<!-- forge-decision:v2:D008:start -->
+Reject single-CTA GDN value-head recurrence because it changed hashes and regressed isolated latency by about 11.8 times.
+<!-- forge-decision:v2:D008:end -->
+
+<!-- forge-decision:v2:D009:start -->
+Do not retain the exact FP8 half2 epilogue alone because its large component win did not produce the required material service gain.
+<!-- forge-decision:v2:D009:end -->
+
+<!-- forge-decision:v2:D010:start -->
+Preserve historical TP4/no-DCP as qualified negative topology evidence: exact TP4 reduced collective time but was throughput-neutral due weight traffic; 110.015 tok/s used approximate acceptance.
+<!-- forge-decision:v2:D010:end -->
+
 ## Outcome
 
 ## Continuity
