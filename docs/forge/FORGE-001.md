@@ -98,6 +98,12 @@ Continue this same item until it has implemented and tested both remaining archi
 The controller must establish fresh exact-shape discriminators for each family, implement at least one new mechanism in each, qualify graph and service behavior, and then reconsider compatible composition with any previously measured exact micro-win. Rejections remain evidence, but a fixed point requires these new mechanisms and final red-team re-entry. All existing semantic constraints and acceptance gates remain unchanged.
 <!-- forge-amendment:v2:A001:end -->
 
+<!-- forge-amendment:v2:A002:start -->
+**Amendment 002 — write-set correction**
+
+Retain the original kernel, attention, distributed-runtime, test, and benchmark ownership while adding the native kernel source required by Amendment 001. This correction does not change the delivery horizon, acceptance contract, or architectural authority.
+<!-- forge-amendment:v2:A002:end -->
+
 ## Outcome
 
 ## Continuity
