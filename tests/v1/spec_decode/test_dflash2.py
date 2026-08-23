@@ -11,6 +11,7 @@ import torch
 import vllm.model_executor.models.qwen3_dflash2 as dflash2_model
 import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 import vllm.v1.worker.gpu.attn_utils as attn_utils
+import vllm.v1.worker.gpu.spec_decode.dflash.cudagraph as dflash_cudagraph
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
 from vllm.config.compilation import CUDAGraphMode
 from vllm.config.speculative import SpeculativeConfig
@@ -50,6 +51,26 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
     _requires_sm70_tail,
     _selector_walk_kernel,
 )
+
+
+def test_dflash_cuda_graph_uses_dedicated_pool(monkeypatch):
+    dedicated_pool = object()
+
+    def fake_base_init(self, config, device, mode, decode_query_len):
+        self.pool = "global-pool"
+
+    monkeypatch.setattr(
+        dflash_cudagraph.CudaGraphManager, "__init__", fake_base_init
+    )
+    graph_pool_handle = Mock(return_value=dedicated_pool)
+    monkeypatch.setattr(torch.cuda, "graph_pool_handle", graph_pool_handle)
+
+    manager = dflash_cudagraph.DFlashCudaGraphManager(
+        SimpleNamespace(), torch.device("cpu"), CUDAGraphMode.FULL, 8
+    )
+
+    assert manager.pool is dedicated_pool
+    graph_pool_handle.assert_called_once_with()
 
 
 def test_dflash_draft_enforce_eager_disables_cuda_graph(monkeypatch):

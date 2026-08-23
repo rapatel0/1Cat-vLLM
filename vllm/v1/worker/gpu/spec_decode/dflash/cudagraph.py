@@ -4,6 +4,7 @@ from collections.abc import Callable, Mapping
 
 import torch
 
+from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
 from vllm.v1.kv_cache_interface import KVCacheConfig
 from vllm.v1.worker.gpu.attn_utils import (
@@ -75,6 +76,21 @@ def _prepare_dflash_inputs_to_capture(
 class DFlashCudaGraphManager(CudaGraphManager):
     """DFlash CudaGraphManager for the parallel-drafting query forward,
     building its own attention metadata from scratch."""
+
+    def __init__(
+        self,
+        vllm_config: VllmConfig,
+        device: torch.device,
+        cudagraph_mode: CUDAGraphMode,
+        decode_query_len: int,
+    ):
+        super().__init__(vllm_config, device, cudagraph_mode, decode_query_len)
+
+        # DFlash captures TP collectives whose CUDA graphs retain raw tensor
+        # pointers. Isolate draft allocations from later target-graph captures
+        # so the global pool cannot recycle storage behind those pointers.
+        if cudagraph_mode:
+            self.pool = torch.cuda.graph_pool_handle()
 
     def capture(
         self,
