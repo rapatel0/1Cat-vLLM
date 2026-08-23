@@ -303,9 +303,13 @@ These controls are not serving CLI fields.
 | Target c8 verifier graph size | Eight requests times eight queries equals 64. | #253 plus deployment correction | Automatic TP4 policy captures only through four requests unless explicitly extended. | Missing 64 falls back and reduces utilization. | retain-on at `64` for c8 |
 | E5M2 batched XQA routing and wide-load gates | `VLLM_FLASH_V100_XQA_BATCH_CONTEXT_ROUTING=1` selects eligible target-only routing. The kernel then checks p256 and page geometry. | #268 plus existing route policy | The current DFlash target does not satisfy Python `spec_config is None` batch-context routing. The trace gate proves future hits. | Treat it as retained target-only behavior, not DFlash evidence. | retain-on for target-only |
 
-## Provisional sane-default matrix
+## Final retained defaults
 
-This matrix is a starting point for the complete integrated stack. It is not a promotion decision.
+The FP16-KV TP4 qualification at `a39f22ed5` supersedes the provisional recommendations in this matrix.
+
+Two official c8 windows measured 259.68 and 280.77 aggregate tok/s. The median was 270.23 tok/s.
+
+Exact changed-input, 8K, 32K, 128K, repeated-prefix, and repetition gates passed.
 
 | Area | Proposed value | Recommendation | Reason |
 | --- | --- | --- | --- |
@@ -317,9 +321,9 @@ This matrix is a starting point for the complete integrated stack. It is not a p
 | Draft backend | Flash-V100 non-causal | retain-on | Required diffusion attention semantics. |
 | Graphs | target and draft through c8, verifier max 64 | retain-on | Direct c8 throughput evidence supports the missing shapes. |
 | Prefix caching | enabled with Mamba align | retain-on | Exact prefix evidence exists. |
-| Mamba convolution cache dtype | `auto` first, FP16 transfer A/B second | needs paired qualification | Pinned SGLang uses FP16. Live vLLM did not. |
-| Mamba SSM cache dtype | resolved FP32 first, FP16 transfer A/B second | needs paired qualification | Persistent state precision can change recurrent trajectories. |
-| Target KV | E5M2 first, FP16 transfer A/B second | needs paired qualification | Precision changes capacity and attention kernels. |
+| Mamba convolution cache dtype | `auto` | retain-on | The final arm preserves the model configuration. |
+| Mamba SSM cache dtype | resolved FP32 | retain-on | The final arm preserves recurrent-state precision. |
+| Target KV | `auto`, resolved FP16 | retain-on | The final objective excludes KV quantization. Exact long-context gates passed. |
 | Draft KV | explicit `auto` or FP16 | retain-on | Avoid target E5M2 inheritance. |
 | Draft sampling | greedy bring-up, probabilistic official-sampling A/B | needs paired qualification | Modes have different acceptance and memory contracts. |
 | Fused selector | off | retain-off | It was slower and used more memory. |
@@ -329,9 +333,9 @@ This matrix is a starting point for the complete integrated stack. It is not a p
 | Fused GDN norm | on | retain-on | Exact target-graph reduction evidence exists. |
 | Fused GDN split | on | retain-on | Exact graph reduction evidence exists. |
 | Fused small-query metadata | on | retain-on | Exact route and 12.1% round reduction evidence exists. |
-| Fused Gemma RMS | off | retain-off | Quality gate remains incomplete. |
+| Fused Gemma RMS | on | retain-on | Exact hashes and quality gates passed. Matched c8 improved 11.58%. |
 | Sparse rejection | off | retain-off | The live greedy arm is ineligible. |
-| QPN8 | on when compiled operators exist | retain-on | Accepted quality and target-only speed evidence exists. |
+| QPN8 | off | retain-off for c8 | It improved c1 but reduced matched c8 throughput by 17.17%. |
 | TP4 push all-reduce | off | retain-off | Full-model paired evidence remains incomplete. |
 | Dynamic Flash partitions | off for this TP4 arm | retain-off | Static partitions avoid prior workspace pressure. |
 | Diagnostic dumps and traces | off | retain-off | They add synchronization, files, or route changes. |
@@ -343,7 +347,7 @@ This matrix is a starting point for the complete integrated stack. It is not a p
 | Prefix caching `on` + unspecified Mamba mode | Resolves to `align`. | Confirm exact repeated-prefix retrieval after every combined-stack change. |
 | Mamba `align` + fused GDN metadata `1` | Fused metadata is ineligible because it requires `none`. | Compare prefix-on align against prefix-off or explicit none. Do not combine results. |
 | Compiled SM70 graphs + fused selector `1` | Startup normalizes selector to `0`. | Treat selector tests as eager-only. |
-| Draft-only `speculative_config.enforce_eager=true` + DFlash2 | The current integrated route still captures DFlash2 graphs. | Use global `--enforce-eager` for parity. Add a route test before draft-only support. |
+| Draft-only `speculative_config.enforce_eager=true` + DFlash2 | Commit `a39f22ed5` disables only draft CUDA graphs. | Use it for draft parity tests. Keep it false for the retained service. |
 | LM-head fastpath, top-one, or Tensor Core top-one layout + fused selector | The controls share LM-head layout preparation. | Hold all three LM-head controls fixed during selector tests and record memory. |
 | Eight slots + automatic TP4 verifier shapes | Automatic source policy stops at four requests and 32 verifier tokens. | Supply 40, 48, 56, and 64 explicitly. |
 | `max_num_seqs>8` + QPN8 | QPN8 falls back to TurboMind. | Keep eight slots for the accepted QPN8 contract. |
@@ -369,22 +373,22 @@ This matrix is a starting point for the complete integrated stack. It is not a p
 
 Run each pair with identical weights, prompt order, seeds, graph sizes, and sampling.
 
-1. Compare E5M2 target KV against FP16 target KV. Keep draft KV FP16 in both arms.
+1. Do not add an E5M2 target-KV arm to this retained profile. The final objective requires FP16 KV.
 2. Compare automatic draft KV resolution against explicit `auto`. Require identical route logs and output hashes.
-3. Compare live automatic Mamba dtypes against explicit FP16 convolution and SSM state independently, then together.
-4. Require exact recurrent states, output trajectories, retrieval, quality, memory, and throughput for each Mamba dtype arm.
+3. Keep automatic Mamba convolution dtype and FP32 SSM state. The final objective excludes a precision reduction.
+4. Require exact recurrent states before any future Mamba dtype experiment.
 5. Compare prefix-on Mamba align against a no-prefix Mamba-none arm before enabling fused GDN metadata.
-6. Test draft-only `speculative_config.enforce_eager=true` route behavior before documenting it as supported.
+6. Draft-only `speculative_config.enforce_eager=true` passed its route test and now disables draft graphs only.
 7. Test shared GDN metadata at c1, c2, c4, and c8 with mixed lengths and poisoned persistent buffers.
 8. Test fused GDN verifier off versus on with FP16 and FP32 recurrent state.
 9. Test fused GDN norm and split together, then disable each leaf independently.
-10. Test fused Gemma RMS with exact greedy hashes, logprobs, perplexity, and fixed quality subsets.
+10. Fused Gemma RMS passed exact greedy hashes, long retrieval, repeated-prefix, and repetition gates. Logprob and perplexity expansion remains optional.
 11. Test sparse rejection under standard probabilistic sampling, top-K20, and every dense fallback feature.
-12. Test QPN8 off versus on in the combined DFlash service at c1 and c8.
-13. Test TP4 push all-reduce with 100 changed-input graph replays and a complete service A/B.
+12. QPN8 off versus on completed. Retain it off because c8 regressed 17.17%.
+13. TP4 push all-reduce completed its service A/B. Retain it off because c8 regressed 3.01%.
 14. Test static versus dynamic decode partitions with identical admission and free-memory telemetry.
 15. Test automatic graph sizes against explicit c8 64-token coverage. Record full-graph route hits.
-16. Test 8K, 32K, 128K, and near-262K retrieval for both KV precision arms.
+16. FP16 KV passed exact 8K, 32K, and 128K retrieval. Near-262K remains a future stress gate.
 17. Test repeated-prefix retrieval after every metadata, rejection, and collective combination.
 18. Run excluded graph capture, JIT, and sustained node warmup before every official 2-4 minute window.
 
