@@ -14,6 +14,9 @@ from vllm.model_executor.layers.fla.ops import (
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     fused_gdn_gating,
 )
+from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
+    fused_gdn_gating,
+)
 from vllm.platforms import current_platform
 from vllm.utils.torch_utils import set_random_seed
 
