@@ -34,19 +34,15 @@ def _sm70_dflash2_gemma_fused_add_rms_kernel(
     row = tl.program_id(0)
     cols = tl.arange(0, BLOCK_SIZE)
     mask = cols < hidden_size
-    values = tl.load(
-        x + row * hidden_size + cols, mask=mask, other=0.0
-    ).to(tl.float32)
-    values += tl.load(
-        residual + row * hidden_size + cols, mask=mask, other=0.0
-    ).to(tl.float32)
+    values = tl.load(x + row * hidden_size + cols, mask=mask, other=0.0).to(tl.float32)
+    values += tl.load(residual + row * hidden_size + cols, mask=mask, other=0.0).to(
+        tl.float32
+    )
     tl.store(residual_out + row * hidden_size + cols, values, mask=mask)
 
     variance = tl.sum(tl.where(mask, values * values, 0.0), axis=0)
     inverse_rms = tl.rsqrt(variance / hidden_size + epsilon)
-    gemma_weight = (
-        tl.load(weight + cols, mask=mask, other=0.0).to(tl.float32) + 1.0
-    )
+    gemma_weight = tl.load(weight + cols, mask=mask, other=0.0).to(tl.float32) + 1.0
     tl.store(
         normalized_out + row * hidden_size + cols,
         values * inverse_rms * gemma_weight,

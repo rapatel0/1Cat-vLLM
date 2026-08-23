@@ -58,12 +58,8 @@ def test_qwen35_gdn_split_graph_replay_reads_current_projection_values():
     mixed_qkvz = torch.randn(
         (num_rows, qkv_size + z_size), dtype=torch.float16, device="cuda"
     )
-    mixed_ba = torch.randn(
-        (num_rows, 2 * ba_size), dtype=torch.float16, device="cuda"
-    )
-    _sm70_materialize_qwen35_gdn_splits(
-        mixed_qkvz, mixed_ba, qkv_size, z_size, ba_size
-    )
+    mixed_ba = torch.randn((num_rows, 2 * ba_size), dtype=torch.float16, device="cuda")
+    _sm70_materialize_qwen35_gdn_splits(mixed_qkvz, mixed_ba, qkv_size, z_size, ba_size)
     torch.cuda.synchronize()
 
     graph = torch.cuda.CUDAGraph()
