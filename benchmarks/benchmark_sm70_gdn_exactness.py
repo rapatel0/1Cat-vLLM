@@ -769,7 +769,27 @@ def _load_or_create_spec_decode_cudagraph_inputs(
         payload = _torch_load(Path(args.input_file))
         if "inputs" not in payload:
             raise ValueError(f"{args.input_file} does not contain saved inputs")
-        return payload["inputs"]
+        inputs = payload["inputs"]
+        available_steps = int(inputs["mixed_qkv_seq"].shape[0])
+        if args.steps > available_steps:
+            raise ValueError(
+                f"--steps={args.steps} exceeds the {available_steps} saved steps"
+            )
+        if args.steps < available_steps:
+            inputs = dict(inputs)
+            for name in (
+                "mixed_qkv_seq",
+                "a_seq",
+                "b_seq",
+                "query_start_loc_seq",
+                "state_indices_seq",
+                "num_accepted_tokens_seq",
+                "query_lens",
+                "z_seq",
+            ):
+                if name in inputs:
+                    inputs[name] = inputs[name][: args.steps].contiguous()
+        return inputs
     return _make_spec_decode_cudagraph_inputs(args)
 
 
@@ -852,13 +872,7 @@ def _add_spec_projection_inputs(
 def _load_or_create_spec_projection_inputs(
     args: argparse.Namespace,
 ) -> dict[str, torch.Tensor]:
-    if args.input_file:
-        payload = _torch_load(Path(args.input_file))
-        if "inputs" not in payload:
-            raise ValueError(f"{args.input_file} does not contain saved inputs")
-        inputs = payload["inputs"]
-    else:
-        inputs = _make_spec_decode_cudagraph_inputs(args)
+    inputs = _load_or_create_spec_decode_cudagraph_inputs(args)
     return _add_spec_projection_inputs(args, inputs)
 
 
@@ -2364,6 +2378,9 @@ def run_spec_decode_cudagraph_case(args: argparse.Namespace) -> int:
             a,
             b,
             cuda_inputs["dt_bias"],
+            beta_dtype=(
+                torch.float32 if args.beta_output_dtype == "float32" else b.dtype
+            ),
         )
         core_out, _ = fused_recurrent_gated_delta_rule(
             q=query,
@@ -2529,6 +2546,7 @@ def run_spec_decode_cudagraph_case(args: argparse.Namespace) -> int:
             "conv_width": args.conv_width,
             "dtype": args.dtype,
             "state_dtype": args.state_dtype,
+            "beta_output_dtype": args.beta_output_dtype,
             "seed": args.seed,
             "scale": scale,
             "silu": args.silu,
@@ -2650,6 +2668,9 @@ def run_spec_mixed_qkv_candidate_case(args: argparse.Namespace) -> int:
             a,
             b,
             cuda_inputs["dt_bias"],
+            beta_dtype=(
+                torch.float32 if args.beta_output_dtype == "float32" else b.dtype
+            ),
         )
         core_out, _ = fused_recurrent_gated_delta_rule(
             q=query,
@@ -2871,6 +2892,7 @@ def run_spec_mixed_qkv_candidate_case(args: argparse.Namespace) -> int:
             "conv_width": args.conv_width,
             "dtype": args.dtype,
             "state_dtype": args.state_dtype,
+            "beta_output_dtype": args.beta_output_dtype,
             "seed": args.seed,
             "scale": scale,
             "silu": args.silu,
@@ -4463,6 +4485,12 @@ def make_parser() -> argparse.ArgumentParser:
     spec_cg.add_argument("--conv-width", type=int, default=4)
     spec_cg.add_argument("--dtype", choices=("float16", "bfloat16"), default="float16")
     spec_cg.add_argument(
+        "--beta-output-dtype",
+        choices=("input", "float32"),
+        default="float32",
+        help="Materialize split-verifier beta in the input dtype or FP32.",
+    )
+    spec_cg.add_argument(
         "--state-dtype",
         choices=("same", "float16", "bfloat16", "float32"),
         default="same",
@@ -4504,6 +4532,12 @@ def make_parser() -> argparse.ArgumentParser:
     spec_mixed.add_argument("--conv-width", type=int, default=4)
     spec_mixed.add_argument(
         "--dtype", choices=("float16", "bfloat16"), default="float16"
+    )
+    spec_mixed.add_argument(
+        "--beta-output-dtype",
+        choices=("input", "float32"),
+        default="float32",
+        help="Materialize split-verifier beta in the input dtype or FP32.",
     )
     spec_mixed.add_argument(
         "--state-dtype",
