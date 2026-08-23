@@ -218,6 +218,12 @@ if TYPE_CHECKING:
     VLLM_SM70_MTP_PROFILE: bool = False
     VLLM_SM70_MTP_PROFILE_INTERVAL: int = 16
     VLLM_MTP_STOCHASTIC_TOKEN_MATCHING: bool = False
+    VLLM_QWEN38_EXL3_SM70_EXECUTOR_MODE: Literal["off", "shadow", "on"] = "off"
+    VLLM_QWEN38_EXL3_SM70_NVLINK_ISLAND_VERIFIED: bool = False
+    VLLM_QWEN38_EXL3_CHECKPOINT_REVISION: str | None = None
+    VLLM_QWEN38_EXL3_SM70_METADATA_COMPARE: bool = False
+    VLLM_QWEN38_EXL3_SM70_FAST_PREPROCESS: bool = False
+    VLLM_SM70_Q4_ATTN_METADATA_REUSE: bool = False
     VLLM_SM70_MTP_DUMP_STEP_DIR: str | None = None
     VLLM_SM70_MTP_DUMP_STEP_MAX: int = 512
     VLLM_SM70_MTP_DUMP_STEP_STEPS: str | None = None
@@ -355,6 +361,9 @@ if TYPE_CHECKING:
     VLLM_SM70_GDN_KKT_BK: str | None = None
     VLLM_SM70_GDN_KKT_WARPS: str | None = None
     VLLM_SM70_GDN_KKT_STAGES: str | None = None
+    VLLM_SM70_GDN_GROUPED_STATE_IDS: bool = False
+    VLLM_SM70_GDN_GROUPED_METADATA_KERNEL: bool = False
+    VLLM_SM70_GDN_SINGLE_SPEC_METADATA: bool = False
     VLLM_SM70_GDN_DELTA_H_SCHEDULE: bool = True
     VLLM_SM70_GDN_DELTA_H_BV: str | None = None
     VLLM_SM70_GDN_DELTA_H_WARPS: str | None = None
@@ -376,6 +385,8 @@ if TYPE_CHECKING:
     VLLM_SM70_QWEN_GDN_DISABLE_INPUT_CORE_OP: bool = False
     VLLM_SM70_QWEN_GDN_INPUT_PROJECTION_OP: bool = False
     VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP: bool = False
+    VLLM_SM70_FUSED_GDN_POST_CONV: bool = False
+    VLLM_SM70_FUSED_GDN_LIBRARY: str | None = None
     VLLM_SM70_GEMMA_RMS_NORM_EAGER: bool = False
     VLLM_SM70_GEMMA_RMS_NORM_COMPILE_NATIVE: bool = False
     VLLM_SM70_FUSED_SIGMOID_GATING_SCHED: bool = True
@@ -1554,9 +1565,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_REDUCER_BLOCKS", "4")
     ),
     "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS": lambda: int(
-        os.getenv(
-            "VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS", "0"
-        )
+        os.getenv("VLLM_SM70_AWQ_MLP_DOWN_TILE_OVERLAP_KERNEL_REDUCER_BLOCKS", "0")
     ),
     "VLLM_SM70_FP8_TUNE_SMALL_SHAPES": lambda: bool(
         int(os.getenv("VLLM_SM70_FP8_TUNE_SMALL_SHAPES", "1"))
@@ -1582,9 +1591,7 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # Warm up the accepted SM70 AWQ dense / dense-stage / active-expert
     # TurboMind routes before CUDA graph capture. This does not enable the old
     # compact AWQ MoE experiments.
-    "VLLM_SM70_AWQ_WARMUP": lambda: bool(
-        int(os.getenv("VLLM_SM70_AWQ_WARMUP", "1"))
-    ),
+    "VLLM_SM70_AWQ_WARMUP": lambda: bool(int(os.getenv("VLLM_SM70_AWQ_WARMUP", "1"))),
     "VLLM_SM70_AWQ_WARMUP_MAX_M": lambda: int(
         os.getenv("VLLM_SM70_AWQ_WARMUP_MAX_M", "16")
     ),
@@ -1634,7 +1641,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
                 if os.getenv(
                     "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH",
                     "0",
-                ).strip().lower()
+                )
+                .strip()
+                .lower()
                 in ("1", "true", "yes", "on")
                 else "1",
             )
@@ -1686,12 +1695,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_TOP1_CUSTOM_AR": lambda: bool(
         int(os.getenv("VLLM_SM70_TOP1_CUSTOM_AR", "0"))
     ),
-    "VLLM_SM70_F16_DENSE_ALLOWLIST": lambda: os.getenv(
-        "VLLM_SM70_F16_DENSE_ALLOWLIST"
-    ),
-    "VLLM_SM70_MOE_DENSE_ALLOWLIST": lambda: os.getenv(
-        "VLLM_SM70_MOE_DENSE_ALLOWLIST"
-    ),
+    "VLLM_SM70_F16_DENSE_ALLOWLIST": lambda: os.getenv("VLLM_SM70_F16_DENSE_ALLOWLIST"),
+    "VLLM_SM70_MOE_DENSE_ALLOWLIST": lambda: os.getenv("VLLM_SM70_MOE_DENSE_ALLOWLIST"),
     "VLLM_SM70_F16_DENSE_MAX_M": lambda: int(
         os.getenv("VLLM_SM70_F16_DENSE_MAX_M", "64")
     ),
@@ -1858,24 +1863,38 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_DECODE_EVENT_TRACE_EVERY": lambda: max(
         1, int(os.getenv("VLLM_SM70_DECODE_EVENT_TRACE_EVERY", "16"))
     ),
-    "VLLM_SM70_MTP_PROFILE": lambda: bool(
-        int(os.getenv("VLLM_SM70_MTP_PROFILE", "0"))
-    ),
+    "VLLM_SM70_MTP_PROFILE": lambda: bool(int(os.getenv("VLLM_SM70_MTP_PROFILE", "0"))),
     "VLLM_SM70_MTP_PROFILE_INTERVAL": lambda: max(
         1, int(os.getenv("VLLM_SM70_MTP_PROFILE_INTERVAL", "16"))
     ),
     "VLLM_MTP_STOCHASTIC_TOKEN_MATCHING": lambda: bool(
         int(os.getenv("VLLM_MTP_STOCHASTIC_TOKEN_MATCHING", "0"))
     ),
-    "VLLM_SM70_MTP_DUMP_STEP_DIR": lambda: os.getenv(
-        "VLLM_SM70_MTP_DUMP_STEP_DIR"
+    # Exact-model executor. The mode defaults to off and the second flag is an
+    # attestation emitted only after the deployment checks the four GPU UUIDs.
+    "VLLM_QWEN38_EXL3_SM70_EXECUTOR_MODE": lambda: os.getenv(
+        "VLLM_QWEN38_EXL3_SM70_EXECUTOR_MODE", "off"
     ),
+    "VLLM_QWEN38_EXL3_SM70_NVLINK_ISLAND_VERIFIED": lambda: bool(
+        int(os.getenv("VLLM_QWEN38_EXL3_SM70_NVLINK_ISLAND_VERIFIED", "0"))
+    ),
+    "VLLM_QWEN38_EXL3_CHECKPOINT_REVISION": lambda: os.getenv(
+        "VLLM_QWEN38_EXL3_CHECKPOINT_REVISION"
+    ),
+    "VLLM_QWEN38_EXL3_SM70_METADATA_COMPARE": lambda: bool(
+        int(os.getenv("VLLM_QWEN38_EXL3_SM70_METADATA_COMPARE", "0"))
+    ),
+    "VLLM_QWEN38_EXL3_SM70_FAST_PREPROCESS": lambda: bool(
+        int(os.getenv("VLLM_QWEN38_EXL3_SM70_FAST_PREPROCESS", "0"))
+    ),
+    "VLLM_SM70_Q4_ATTN_METADATA_REUSE": lambda: bool(
+        int(os.getenv("VLLM_SM70_Q4_ATTN_METADATA_REUSE", "0"))
+    ),
+    "VLLM_SM70_MTP_DUMP_STEP_DIR": lambda: os.getenv("VLLM_SM70_MTP_DUMP_STEP_DIR"),
     "VLLM_SM70_MTP_DUMP_STEP_MAX": lambda: int(
         os.getenv("VLLM_SM70_MTP_DUMP_STEP_MAX", "512")
     ),
-    "VLLM_SM70_MTP_DUMP_STEP_STEPS": lambda: os.getenv(
-        "VLLM_SM70_MTP_DUMP_STEP_STEPS"
-    ),
+    "VLLM_SM70_MTP_DUMP_STEP_STEPS": lambda: os.getenv("VLLM_SM70_MTP_DUMP_STEP_STEPS"),
     "VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP_EXACT_DRAFT_SEQ_LENS_CPU", "0"))
     ),
@@ -2158,15 +2177,11 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SPEC_DUMP_ALIGNMENT_STEPS": lambda: os.getenv(
         "VLLM_SPEC_DUMP_ALIGNMENT_STEPS"
     ),
-    "VLLM_DEBUG_MTP_LOAD": lambda: bool(
-        int(os.getenv("VLLM_DEBUG_MTP_LOAD", "0"))
-    ),
+    "VLLM_DEBUG_MTP_LOAD": lambda: bool(int(os.getenv("VLLM_DEBUG_MTP_LOAD", "0"))),
     "VLLM_DEBUG_MTP_LOAD_VERBOSE": lambda: bool(
         int(os.getenv("VLLM_DEBUG_MTP_LOAD_VERBOSE", "0"))
     ),
-    "VLLM_DFLASH_PROFILE": lambda: bool(
-        int(os.getenv("VLLM_DFLASH_PROFILE", "0"))
-    ),
+    "VLLM_DFLASH_PROFILE": lambda: bool(int(os.getenv("VLLM_DFLASH_PROFILE", "0"))),
     "VLLM_DFLASH_PROFILE_LOG_INTERVAL": lambda: max(
         1, int(os.getenv("VLLM_DFLASH_PROFILE_LOG_INTERVAL", "32"))
     ),
@@ -2298,29 +2313,30 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_GDN_KKT_BK": lambda: os.getenv("VLLM_SM70_GDN_KKT_BK"),
     "VLLM_SM70_GDN_KKT_WARPS": lambda: os.getenv("VLLM_SM70_GDN_KKT_WARPS"),
     "VLLM_SM70_GDN_KKT_STAGES": lambda: os.getenv("VLLM_SM70_GDN_KKT_STAGES"),
+    "VLLM_SM70_GDN_GROUPED_STATE_IDS": lambda: bool(
+        int(os.getenv("VLLM_SM70_GDN_GROUPED_STATE_IDS", "0"))
+    ),
+    "VLLM_SM70_GDN_GROUPED_METADATA_KERNEL": lambda: bool(
+        int(os.getenv("VLLM_SM70_GDN_GROUPED_METADATA_KERNEL", "0"))
+    ),
+    "VLLM_SM70_GDN_SINGLE_SPEC_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_GDN_SINGLE_SPEC_METADATA", "0"))
+    ),
     # Experimental SM70 GDN/FLA delta-state autotune search-space gate.
     "VLLM_SM70_GDN_DELTA_H_SCHEDULE": lambda: bool(
         int(os.getenv("VLLM_SM70_GDN_DELTA_H_SCHEDULE", "1"))
     ),
     "VLLM_SM70_GDN_DELTA_H_BV": lambda: os.getenv("VLLM_SM70_GDN_DELTA_H_BV"),
-    "VLLM_SM70_GDN_DELTA_H_WARPS": lambda: os.getenv(
-        "VLLM_SM70_GDN_DELTA_H_WARPS"
-    ),
-    "VLLM_SM70_GDN_DELTA_H_STAGES": lambda: os.getenv(
-        "VLLM_SM70_GDN_DELTA_H_STAGES"
-    ),
+    "VLLM_SM70_GDN_DELTA_H_WARPS": lambda: os.getenv("VLLM_SM70_GDN_DELTA_H_WARPS"),
+    "VLLM_SM70_GDN_DELTA_H_STAGES": lambda: os.getenv("VLLM_SM70_GDN_DELTA_H_STAGES"),
     # Experimental SM70 GDN/FLA output chunk autotune search-space gate.
     "VLLM_SM70_GDN_CHUNK_O_SCHEDULE": lambda: bool(
         int(os.getenv("VLLM_SM70_GDN_CHUNK_O_SCHEDULE", "1"))
     ),
     "VLLM_SM70_GDN_CHUNK_O_BK": lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_BK"),
     "VLLM_SM70_GDN_CHUNK_O_BV": lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_BV"),
-    "VLLM_SM70_GDN_CHUNK_O_WARPS": lambda: os.getenv(
-        "VLLM_SM70_GDN_CHUNK_O_WARPS"
-    ),
-    "VLLM_SM70_GDN_CHUNK_O_STAGES": lambda: os.getenv(
-        "VLLM_SM70_GDN_CHUNK_O_STAGES"
-    ),
+    "VLLM_SM70_GDN_CHUNK_O_WARPS": lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_WARPS"),
+    "VLLM_SM70_GDN_CHUNK_O_STAGES": lambda: os.getenv("VLLM_SM70_GDN_CHUNK_O_STAGES"),
     # Diagnostic-only correctness gate: compare latest prefill prep against
     # the 0.0.3-style q/k/v split plus fused_gdn_gating path.
     "VLLM_SM70_GDN_LEGACY_PREFILL_PREP": lambda: bool(
@@ -2399,6 +2415,12 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP": lambda: bool(
         int(os.getenv("VLLM_SM70_QWEN_GDN_OUTPUT_PROJECTION_OP", "0"))
     ),
+    # Experimental V100/TP4 q=4 verifier fusion. Register both variables so
+    # the API process copies them into EngineCore and its TP workers.
+    "VLLM_SM70_FUSED_GDN_POST_CONV": lambda: bool(
+        int(os.getenv("VLLM_SM70_FUSED_GDN_POST_CONV", "0"))
+    ),
+    "VLLM_SM70_FUSED_GDN_LIBRARY": lambda: os.getenv("VLLM_SM70_FUSED_GDN_LIBRARY"),
     # Diagnostic-only: keep Qwen3.5/Gemma RMSNorm arithmetic behind an opaque
     # custom-op boundary under the SM70 compile/FULL graph lane.
     "VLLM_SM70_GEMMA_RMS_NORM_EAGER": lambda: bool(
@@ -2493,23 +2515,25 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv(
             "VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH",
             "0",
-        ).strip().lower()
+        )
+        .strip()
+        .lower()
         in ("1", "true", "yes", "on")
     ),
     # Diagnostic-only profiling knob. The SM70 compile-graph quality profile
     # disables AOT cache reload by default due known token drift, but long
     # profiler runs need an explicit way to reuse compile artifacts.
     "VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING": lambda: bool(
-        os.getenv("VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING", "0")
-        .strip()
-        .lower()
+        os.getenv("VLLM_SM70_ALLOW_COMPILE_CACHE_FOR_PROFILING", "0").strip().lower()
         in ("1", "true", "yes", "on")
     ),
     "VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD": lambda: bool(
         os.getenv(
             "VLLM_SM70_SYNC_BEFORE_COMPILE_GRAPH_FORWARD",
             "0",
-        ).strip().lower()
+        )
+        .strip()
+        .lower()
         in ("1", "true", "yes", "on")
     ),
     # Optional 0.0.3 VLLM_COMPILE graph-preset parity knob. Keep it default-off:
@@ -2518,7 +2542,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv(
             "VLLM_SM70_FLASH_V100_0DOT3_ELIMINATE_NOOPS",
             "0",
-        ).strip().lower()
+        )
+        .strip()
+        .lower()
         in ("1", "true", "yes", "on")
     ),
     # Standalone default remains off for diagnostics. The SM70 Flash-V100
@@ -2528,7 +2554,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv(
             "VLLM_SM70_FLASH_V100_0DOT3_BENCHMARK_COMBO_KERNEL",
             "0",
-        ).strip().lower()
+        )
+        .strip()
+        .lower()
         in ("1", "true", "yes", "on")
     ),
     # During memory profiling, run the 1024-token dummy batch eagerly so the
@@ -2538,7 +2566,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv(
             "VLLM_SM70_FLASH_V100_0DOT3_EAGER_PROFILE_RUN",
             "1",
-        ).strip().lower()
+        )
+        .strip()
+        .lower()
         in ("1", "true", "yes", "on")
     ),
     # Experimental only. Old 0.0.3 Flash-V100 logs only captured decode FULL
@@ -2550,7 +2580,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv(
             "VLLM_SM70_FLASH_V100_0DOT3_DECODE_ONLY_CAPTURE",
             "0",
-        ).strip().lower()
+        )
+        .strip()
+        .lower()
         in ("1", "true", "yes", "on")
     ),
     # SM70 Flash-V100 production default: use the recovered 0.0.3-style
@@ -2561,7 +2593,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
         os.getenv(
             "VLLM_SM70_FLASH_V100_DECODE_GRAPH_NO_COMPILE",
             "0",
-        ).strip().lower()
+        )
+        .strip()
+        .lower()
         in ("1", "true", "yes", "on")
     ),
     "VLLM_SM70_FLASH_V100_DECODE_GRAPH_CAPTURE_SIZE": lambda: int(
@@ -2576,12 +2610,8 @@ environment_variables: dict[str, Callable[[], Any]] = {
     "VLLM_SM70_FLA_BV": lambda: os.getenv("VLLM_SM70_FLA_BV"),
     "VLLM_SM70_FLA_WARPS": lambda: os.getenv("VLLM_SM70_FLA_WARPS"),
     "VLLM_SM70_FLA_STAGES": lambda: os.getenv("VLLM_SM70_FLA_STAGES"),
-    "VLLM_SM70_FLA_TARGET_WAVES": lambda: os.getenv(
-        "VLLM_SM70_FLA_TARGET_WAVES"
-    ),
-    "VLLM_SM70_FLA_BV_CANDIDATES": lambda: os.getenv(
-        "VLLM_SM70_FLA_BV_CANDIDATES"
-    ),
+    "VLLM_SM70_FLA_TARGET_WAVES": lambda: os.getenv("VLLM_SM70_FLA_TARGET_WAVES"),
+    "VLLM_SM70_FLA_BV_CANDIDATES": lambda: os.getenv("VLLM_SM70_FLA_BV_CANDIDATES"),
     # If set, allow loading or unloading lora adapters in runtime,
     "VLLM_ALLOW_RUNTIME_LORA_UPDATING": lambda: (
         os.environ.get("VLLM_ALLOW_RUNTIME_LORA_UPDATING", "0").strip().lower()

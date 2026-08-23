@@ -328,6 +328,113 @@ def test_full_cuda_graph_spec_replay_tail_uses_pad_slot(local_gdn_model):
     ]
 
 
+def test_single_spec_prebuilt_metadata_matches_generic_builder(
+    monkeypatch, local_gdn_model
+):
+    """The runner-side grouped kernel may bypass only Python construction.
+
+    Populate one builder through the generic MTP3 path, copy its persistent
+    tensors as the grouped kernel would, and prove the fast-return metadata is
+    the same scalar contract and the same tensor contents.
+    """
+    # Exercise the generic CPU reference even when the serving pod enables the
+    # optional single-request Triton path globally.
+    monkeypatch.setenv("VLLM_SM70_GDN_SINGLE_SPEC_METADATA", "0")
+    generic_builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=3,
+        use_full_cuda_graph=True,
+        mamba_cache_mode="align",
+        max_cudagraph_capture_size=4,
+    )
+    prebuilt_builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=3,
+        use_full_cuda_graph=True,
+        mamba_cache_mode="align",
+        max_cudagraph_capture_size=4,
+    )
+    batch = BatchSpec(seq_lens=[35], query_lens=[4])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        block_table_tensor=torch.tensor(
+            [[0, 0, 10, 11, 12, 13]], dtype=torch.int32, device=DEVICE
+        ),
+        num_actual_tokens=4,
+    )
+    current_state_block_ids = torch.tensor(
+        [[10, 11, 12, 13]], dtype=torch.int32, device=DEVICE
+    )
+    accepted = torch.tensor([2], dtype=torch.int32, device=DEVICE)
+    selectors = torch.tensor([3], dtype=torch.int32, device=DEVICE)
+
+    generic = generic_builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=accepted,
+        spec_state_slot_selectors=selectors,
+        num_decode_draft_tokens_cpu=torch.tensor([3], dtype=torch.int32),
+        current_state_block_ids=current_state_block_ids,
+    )
+
+    persistent_names = (
+        "spec_state_indices_tensor",
+        "spec_sequence_masks",
+        "spec_token_indx",
+        "spec_query_start_loc",
+        "num_accepted_tokens",
+        "spec_state_slot_selectors",
+    )
+    for name in persistent_names:
+        getattr(prebuilt_builder, name).copy_(getattr(generic_builder, name))
+
+    prebuilt = prebuilt_builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=accepted,
+        spec_state_slot_selectors=selectors,
+        num_decode_draft_tokens_cpu=torch.tensor([3], dtype=torch.int32),
+        current_state_block_ids=current_state_block_ids,
+        single_spec_real_query_tokens=4,
+    )
+
+    scalar_names = (
+        "num_prefills",
+        "num_prefill_tokens",
+        "num_decodes",
+        "num_decode_tokens",
+        "num_spec_decodes",
+        "num_spec_decode_tokens",
+        "num_actual_tokens",
+    )
+    for name in scalar_names:
+        assert getattr(prebuilt, name) == getattr(generic, name)
+
+    tensor_names = (
+        "spec_query_start_loc",
+        "spec_state_indices_tensor",
+        "spec_sequence_masks",
+        "spec_token_indx",
+        "non_spec_token_indx",
+        "num_accepted_tokens",
+        "spec_state_slot_selectors",
+    )
+    for name in tensor_names:
+        expected = getattr(generic, name)
+        actual = getattr(prebuilt, name)
+        assert expected is not None
+        assert actual is not None
+        assert torch.equal(actual, expected), name
+
+    # The optimized contract must return stable views of the builder's
+    # persistent graph buffers instead of allocating replacements.
+    assert prebuilt.spec_state_indices_tensor.data_ptr() == (
+        prebuilt_builder.spec_state_indices_tensor.data_ptr()
+    )
+    assert prebuilt.spec_query_start_loc.data_ptr() == (
+        prebuilt_builder.spec_query_start_loc.data_ptr()
+    )
+
+
 def test_full_cuda_graph_capture_single_token_decode_is_not_spec(local_gdn_model):
     builder = _create_gdn_builder(
         local_gdn_model,

@@ -444,6 +444,7 @@ if(VLLM_GPU_LANG STREQUAL "CUDA")
 
   if (MARLIN_SM70_ARCHS AND NOT MARLIN_OTHER_ARCHS)
     set(MARLIN_SM70_SRCS
+       "csrc/quantization/exl3/sm70_exl3_gemm.cu"
        "csrc/quantization/marlin/sm70_marlin_dispatch.cu"
        "csrc/quantization/marlin/marlin_int4_fp8_preprocess.cu"
        "csrc/quantization/marlin/sm70_gptq_marlin_repack.cu"

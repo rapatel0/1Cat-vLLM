@@ -560,6 +560,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
       "all_reduce_sum2(int fa, Tensor inp_a, Tensor inp_b, Tensor! out) -> ()");
   custom_ar.impl("all_reduce_sum2", torch::kCUDA, &all_reduce_sum2);
   custom_ar.def(
+      "all_reduce_gemma_rms_norm_sm70(int fa, Tensor inp, Tensor residual, "
+      "Tensor gamma, Tensor! norm_out, Tensor! residual_out, float epsilon, "
+      "int reg_buffer, int reg_buffer_sz_bytes) -> ()");
+  custom_ar.impl("all_reduce_gemma_rms_norm_sm70", torch::kCUDA,
+                 &all_reduce_gemma_rms_norm_sm70);
+  custom_ar.def(
       "top1_argmax(int fa, Tensor input_pair, Tensor! output, int reg_buffer, "
       "int reg_buffer_sz_bytes) -> ()");
   custom_ar.impl("top1_argmax", torch::kCUDA, &top1_argmax);

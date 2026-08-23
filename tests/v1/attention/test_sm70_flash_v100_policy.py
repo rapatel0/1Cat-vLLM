@@ -399,6 +399,139 @@ def test_flash_v100_smallq_cudagraph_metadata_uses_persistent_buffers(
     )
 
 
+def test_flash_v100_single_spec_uses_cpu_upper_bound_without_materializing_copy(
+    monkeypatch,
+    local_flash_v100_model,
+):
+    from tests.v1.attention.utils import (
+        BatchSpec,
+        create_common_attn_metadata,
+        create_standard_kv_cache_spec,
+        create_vllm_config,
+    )
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        FlashAttnV100MetadataBuilder,
+    )
+
+    monkeypatch.setenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16")
+    vllm_config = create_vllm_config(
+        model_name=local_flash_v100_model(),
+        max_model_len=256,
+        max_num_seqs=1,
+    )
+    builder = FlashAttnV100MetadataBuilder(
+        kv_cache_spec=create_standard_kv_cache_spec(vllm_config),
+        layer_names=["language_model.model.layers.3.self_attn.attn"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[8], query_lens=[4]),
+        block_size=16,
+        device=torch.device("cpu"),
+        arange_block_indices=True,
+    )
+    upper_bound = torch.tensor([11], dtype=torch.int32)
+    common._seq_lens_cpu = None
+    common.seq_lens_cpu_upper_bound = upper_bound
+    metadata = SimpleNamespace()
+
+    builder._attach_common_flash_metadata(
+        metadata,
+        common,
+        single_spec_real_query_tokens=4,
+    )
+
+    assert metadata.seq_lens_cpu is None
+    assert metadata.seq_lens_cpu_upper_bound.data_ptr() == upper_bound.data_ptr()
+    assert metadata.flash_v100_single_spec_has_prefix_context is True
+    assert common._seq_lens_cpu is None
+    assert metadata.query_start_loc_cpu.data_ptr() == (
+        common.query_start_loc_cpu.data_ptr()
+    )
+
+
+def test_flash_v100_prebuilt_q4_attaches_persistent_views(
+    monkeypatch,
+    local_flash_v100_model,
+):
+    from tests.v1.attention.utils import (
+        BatchSpec,
+        create_common_attn_metadata,
+        create_standard_kv_cache_spec,
+        create_vllm_config,
+    )
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        FlashAttnV100MetadataBuilder,
+    )
+
+    monkeypatch.setenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16")
+    vllm_config = create_vllm_config(
+        model_name=local_flash_v100_model(),
+        max_model_len=256,
+        max_num_seqs=1,
+    )
+    vllm_config.compilation_config.cudagraph_capture_sizes = [1, 2, 4]
+    vllm_config.compilation_config.max_cudagraph_capture_size = 4
+    builder = FlashAttnV100MetadataBuilder(
+        kv_cache_spec=create_standard_kv_cache_spec(vllm_config),
+        layer_names=["language_model.model.layers.3.self_attn.attn"],
+        vllm_config=vllm_config,
+        device=torch.device("cpu"),
+    )
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[8], query_lens=[4]),
+        block_size=16,
+        device=torch.device("cpu"),
+        arange_block_indices=True,
+    )
+    block_cols = common.block_table_tensor.shape[1]
+    builder._smallq_decode_block_table = torch.empty(
+        (4, block_cols), dtype=torch.int32
+    )
+    builder._smallq_decode_seq_lens = torch.empty((4,), dtype=torch.int32)
+    builder._smallq_query_start_loc = torch.empty((2,), dtype=torch.int32)
+    builder._smallq_buffer_shape = (4, 1, block_cols)
+    persistent_block_ptr = builder._smallq_decode_block_table.data_ptr()
+    persistent_lens_ptr = builder._smallq_decode_seq_lens.data_ptr()
+    persistent_query_ptr = builder._smallq_query_start_loc.data_ptr()
+
+    metadata = SimpleNamespace(
+        num_actual_tokens=4,
+        max_query_len=4,
+        seq_lens_cpu_upper_bound=torch.tensor([11], dtype=torch.int32),
+    )
+    builder._attach_prebuilt_single_spec_q4_metadata(metadata, common)
+
+    assert metadata.smallq_decode_block_table.data_ptr() == persistent_block_ptr
+    assert metadata.smallq_decode_seq_lens.data_ptr() == persistent_lens_ptr
+    assert metadata.smallq_query_start_loc.data_ptr() == persistent_query_ptr
+    assert tuple(metadata.smallq_decode_block_table.shape) == (
+        4,
+        common.block_table_tensor.shape[1],
+    )
+    assert tuple(metadata.smallq_decode_seq_lens.shape) == (4,)
+    assert tuple(metadata.smallq_query_start_loc.shape) == (2,)
+    assert metadata.smallq_decode_max_seq_len_hint == 11
+    assert metadata.smallq_decode_workspace_seq_capacity_hint == (
+        block_cols * builder.block_size
+    )
+
+    refreshed_upper_bound = torch.tensor([19], dtype=torch.int32)
+    common.seq_lens_cpu_upper_bound = refreshed_upper_bound
+    common.max_seq_len = 19
+    builder.refresh_prebuilt_single_spec_q4_metadata(metadata, common)
+
+    assert metadata.seq_lens_cpu_upper_bound.data_ptr() == (
+        refreshed_upper_bound.data_ptr()
+    )
+    assert metadata.max_seq_len == 19
+    assert metadata.smallq_decode_max_seq_len_hint == 19
+    assert metadata.smallq_decode_block_table.data_ptr() == persistent_block_ptr
+    assert metadata.smallq_decode_seq_lens.data_ptr() == persistent_lens_ptr
+    assert metadata.smallq_query_start_loc.data_ptr() == persistent_query_ptr
+
+
 def test_flash_v100_smallq_metadata_masks_cudagraph_padding(
     monkeypatch,
     local_flash_v100_model,

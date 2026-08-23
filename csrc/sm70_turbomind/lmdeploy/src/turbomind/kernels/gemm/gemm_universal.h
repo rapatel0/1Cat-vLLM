@@ -182,7 +182,8 @@ __device__ __forceinline__ bool TryRunTileAllReduceReducerCta(const EpiloguePara
         return false;
     }
 
-    if (tile_ar.world_size != 2 || tile_ar.rank_data == nullptr || tile_ar.output == nullptr ||
+    if ((tile_ar.world_size != 2 && tile_ar.world_size != 4) ||
+        tile_ar.rank_data == nullptr || tile_ar.output == nullptr ||
         tile_ar.self_signal == nullptr || tile_ar.tile_numel <= 0 || tile_ar.output_numel <= 0 ||
         (tile_ar.tile_numel & 1) || (tile_ar.output_numel & 1) || tile_ar.producer_grid_x <= 0 ||
         tile_ar.producer_grid_y <= 0) {
@@ -194,7 +195,16 @@ __device__ __forceinline__ bool TryRunTileAllReduceReducerCta(const EpiloguePara
         return true;
     }
 
-    const int tile_count = (tile_ar.output_numel + tile_ar.tile_numel - 1) / tile_ar.tile_numel;
+    const bool row_strided = tile_ar.rows > 0;
+    if (row_strided &&
+        (tile_ar.row_stride <= 0 || tile_ar.tile_columns <= 0 ||
+         (tile_ar.row_stride & 1) || (tile_ar.tile_columns & 1) ||
+         tile_ar.output_numel != tile_ar.rows * tile_ar.row_stride)) {
+        return true;
+    }
+    const int tile_count = row_strided
+        ? (tile_ar.row_stride + tile_ar.tile_columns - 1) / tile_ar.tile_columns
+        : (tile_ar.output_numel + tile_ar.tile_numel - 1) / tile_ar.tile_numel;
     if (tile_count <= 0 || tile_count > vllm::sm70_tile_runtime::kMaxBlocks) {
         return true;
     }
@@ -205,6 +215,8 @@ __device__ __forceinline__ bool TryRunTileAllReduceReducerCta(const EpiloguePara
         *reinterpret_cast<const vllm::sm70_tile_runtime::RankData*>(tile_ar.rank_data);
     const auto* rank0 = reinterpret_cast<const half2*>(rank_data.ptrs[0]);
     const auto* rank1 = reinterpret_cast<const half2*>(rank_data.ptrs[1]);
+    const auto* rank2 = reinterpret_cast<const half2*>(rank_data.ptrs[2]);
+    const auto* rank3 = reinterpret_cast<const half2*>(rank_data.ptrs[3]);
     auto* output      = reinterpret_cast<half2*>(tile_ar.output);
 
     for (int tile_id = reducer_id; tile_id < tile_count; tile_id += tile_ar.kernel_reducer_blocks) {
@@ -222,8 +234,44 @@ __device__ __forceinline__ bool TryRunTileAllReduceReducerCta(const EpiloguePara
 
         __syncthreads();
 
-        for (int idx = h2_begin + tid; idx < h2_end; idx += blockDim.x) {
-            output[idx] = __hadd2(rank0[idx], rank1[idx]);
+        if (row_strided) {
+            const int col_begin = tile_id * tile_ar.tile_columns;
+            const int col_end   = min(col_begin + tile_ar.tile_columns, tile_ar.row_stride);
+            const int tile_h2   = (col_end - col_begin) / 2;
+            for (int linear = tid; linear < tile_ar.rows * tile_h2; linear += blockDim.x) {
+                const int row = linear / tile_h2;
+                const int idx = row * (tile_ar.row_stride / 2) + col_begin / 2 + linear % tile_h2;
+                const float2 v0 = __half22float2(rank0[idx]);
+                const float2 v1 = __half22float2(rank1[idx]);
+                float x = v0.x + v1.x;
+                float y = v0.y + v1.y;
+                if (tile_ar.world_size == 4) {
+                    const float2 v2 = __half22float2(rank2[idx]);
+                    const float2 v3 = __half22float2(rank3[idx]);
+                    x += v2.x;
+                    y += v2.y;
+                    x += v3.x;
+                    y += v3.y;
+                }
+                output[idx] = __floats2half2_rn(x, y);
+            }
+        }
+        else if (tile_ar.world_size == 2) {
+            // Preserve the original AWQ TP2 numerical contract.
+            for (int idx = h2_begin + tid; idx < h2_end; idx += blockDim.x) {
+                output[idx] = __hadd2(rank0[idx], rank1[idx]);
+            }
+        }
+        else {
+            for (int idx = h2_begin + tid; idx < h2_end; idx += blockDim.x) {
+                const float2 v0 = __half22float2(rank0[idx]);
+                const float2 v1 = __half22float2(rank1[idx]);
+                const float2 v2 = __half22float2(rank2[idx]);
+                const float2 v3 = __half22float2(rank3[idx]);
+                output[idx] = __floats2half2_rn(
+                    ((v0.x + v1.x) + v2.x) + v3.x,
+                    ((v0.y + v1.y) + v2.y) + v3.y);
+            }
         }
 
         __syncthreads();

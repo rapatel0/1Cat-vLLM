@@ -186,6 +186,23 @@ class DeviceCommunicatorBase:
     ) -> torch.Tensor:
         return self.all_reduce(input_a + input_b)
 
+    def all_reduce_gemma_rms_norm_sm70(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        reduced = self.all_reduce(input_)
+        residual_out = reduced.float() + residual.float()
+        inverse_rms = torch.rsqrt(
+            residual_out.square().mean(dim=-1, keepdim=True) + epsilon
+        )
+        norm_out = (
+            residual_out * inverse_rms * (gamma.float() + 1.0)
+        ).to(input_.dtype)
+        return norm_out, residual_out
+
     def all_gather(self, input_: torch.Tensor, dim: int = -1) -> torch.Tensor:
         if dim < 0:
             # Convert negative dim to positive.

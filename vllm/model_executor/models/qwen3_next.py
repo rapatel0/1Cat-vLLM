@@ -24,6 +24,7 @@ from vllm.distributed import (
     get_pp_group,
     get_tensor_model_parallel_world_size,
     tensor_model_parallel_all_gather,
+    tensor_model_parallel_all_reduce,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.attention import Attention
@@ -780,8 +781,43 @@ class Qwen3NextDecoderLayer(nn.Module):
                     self.attn_layer_scale.to(hidden_states.dtype) + 1
                 )
 
-        # Fully Connected
-        hidden_states, residual = self.post_attention_layernorm(hidden_states, residual)
+        # Fully Connected.  The exact Qwen3.8/EXL3/SM70 path leaves attention
+        # output projections rank-local so their all-reduce can share the
+        # already-qualified cooperative residual + Gemma RMSNorm boundary.
+        # Layer zero and unsupported shapes deliberately take the ordinary
+        # reduction before the unchanged norm implementation.
+        if getattr(self, "_sm70_post_attention_local_output", False):
+            # Do not inspect the dynamically marked token dimension here.
+            # The opaque collective custom op selects its cooperative kernel
+            # for M in {1, 2, 4} and falls back to the ordinary reduction plus
+            # RMSNorm for every other row count.  A Python membership test
+            # specializes the AOT graph to its capture row count.
+            can_fuse_post_attention = (
+                hidden_states.dtype is torch.float16
+                and residual.dtype is torch.float32
+                and hidden_states.ndim == 2
+                and hidden_states.shape[1] == 5120
+                and residual.shape == hidden_states.shape
+            )
+            if can_fuse_post_attention:
+                hidden_states, residual = (
+                    torch.ops.vllm.all_reduce_gemma_rms_norm_sm70(
+                        hidden_states,
+                        residual,
+                        self.post_attention_layernorm.weight,
+                        self.post_attention_layernorm.variance_epsilon,
+                        group_name=self._sm70_post_attention_tp_group_name,
+                    )
+                )
+            else:
+                hidden_states = tensor_model_parallel_all_reduce(hidden_states)
+                hidden_states, residual = self.post_attention_layernorm(
+                    hidden_states, residual
+                )
+        else:
+            hidden_states, residual = self.post_attention_layernorm(
+                hidden_states, residual
+            )
         hidden_states = _sm70_dump_qwen_layer_tensor(
             "post_attn_norm_out",
             self.layer_idx,

@@ -31,6 +31,37 @@ from vllm.v1.utils import copy_slice
 from vllm.v1.worker.block_table import MultiGroupBlockTable
 
 
+def _sm70_compact_topk20_eligible(
+    num_reqs: int,
+    all_random: bool,
+    no_top_k: bool,
+    top_k_cpu: np.ndarray,
+    no_top_p: bool,
+    top_p_cpu: np.ndarray,
+    temperature_cpu: np.ndarray,
+) -> bool:
+    """Validate the exact production compact-sampler contract on CPU."""
+    return (
+        num_reqs == 1
+        and all_random
+        and not no_top_k
+        and int(top_k_cpu[0]) == 20
+        and not no_top_p
+        and np.isclose(
+            float(top_p_cpu[0]),
+            0.95,
+            rtol=0.0,
+            atol=1e-6,
+        )
+        and np.isclose(
+            float(temperature_cpu[0]),
+            1.0,
+            rtol=0.0,
+            atol=1e-6,
+        )
+    )
+
+
 @dataclass
 class CachedRequestState:
     req_id: str
@@ -848,6 +879,15 @@ class InputBatch:
 
     def _make_sampling_metadata(self) -> SamplingMetadata:
         num_reqs = self.num_reqs
+        sm70_compact_topk20_eligible = _sm70_compact_topk20_eligible(
+            num_reqs,
+            self.all_random,
+            self.no_top_k,
+            self.top_k_cpu,
+            self.no_top_p,
+            self.top_p_cpu,
+            self.temperature_cpu,
+        )
         if not self.all_greedy:
             temperature = copy_slice(
                 self.temperature_cpu_tensor, self.temperature, num_reqs
@@ -949,6 +989,7 @@ class InputBatch:
             bad_words_token_ids=self.bad_words_token_ids,
             logitsprocs=self.logitsprocs,
             thinking_budget_state_holder=self.thinking_budget_state_holder,
+            sm70_compact_topk20_eligible=sm70_compact_topk20_eligible,
         )
 
     def get_pooling_params(self) -> list[PoolingParams]:

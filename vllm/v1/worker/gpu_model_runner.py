@@ -46,6 +46,7 @@ from vllm.distributed.eplb.eplb_state import EplbState
 from vllm.distributed.kv_transfer import get_kv_transfer_group, has_kv_transfer_group
 from vllm.distributed.kv_transfer.kv_connector.utils import copy_kv_blocks
 from vllm.distributed.parallel_state import (
+    TensorMetadata,
     get_dcp_group,
     get_pp_group,
     get_tp_group,
@@ -128,8 +129,6 @@ from vllm.utils.torch_utils import (
     is_quantized_kv_cache,
     kv_cache_dtype_str_to_dtype,
 )
-
-
 from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
@@ -138,9 +137,18 @@ from vllm.v1.attention.backend import (
     AttentionType,
     CommonAttentionMetadata,
 )
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
 from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100MetadataBuilder
 from vllm.v1.attention.backends.flex_attention import FlexAttentionMetadataBuilder
+from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+
+try:
+    from vllm.v1.attention.backends.gdn_attn import (
+        _build_grouped_single_request_gdn_spec_metadata_kernel,
+    )
+except ImportError:
+    # Staged serving trees can intentionally lag the optional grouped GDN
+    # metadata experiment. Keep the generic builder available in that case.
+    _build_grouped_single_request_gdn_spec_metadata_kernel = None
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.attention.backends.utils import (
     NULL_BLOCK_ID,
@@ -226,6 +234,20 @@ from vllm.v1.worker.gpu_input_batch import CachedRequestState, InputBatch
 from vllm.v1.worker.gpu_ubatch_wrapper import UBatchWrapper
 from vllm.v1.worker.kv_connector_model_runner_mixin import KVConnectorModelRunnerMixin
 from vllm.v1.worker.lora_model_runner_mixin import LoRAModelRunnerMixin
+from vllm.v1.worker.pp_mtp_payload import (
+    correct_optimistic_num_computed,
+    pack_pp_mtp_payload,
+    pp_mtp_payload_width,
+    reconcile_pp_num_tokens_no_spec,
+    request_fingerprint,
+    unpack_pp_mtp_payload,
+    validate_pp_mtp_payload,
+)
+from vllm.v1.worker.qwen38_v100_executor import (
+    Qwen38V100Executor,
+    Qwen38V100StepReason,
+    Qwen38V100SupportReason,
+)
 from vllm.v1.worker.ubatch_utils import (
     UBatchSlices,
     check_ubatch_thresholds,
@@ -257,6 +279,36 @@ _SM70_MTP_STEP_DUMP_COUNTER = 0
 _SM70_DECODE_EVENT_TRACE_CONFIG_LOGGED = False
 
 
+def _populate_grouped_gdn_state_block_ids(
+    destination: torch.Tensor,
+    gdn_kv_cache_group_ids: Sequence[int],
+    req_ids: Sequence[str],
+    requests: Mapping[str, Any],
+    mamba_state_idx: Mapping[str, int],
+    max_spec_state_slots: int,
+    num_reqs_padded: int,
+) -> None:
+    """Populate every GDN cache group's recurrent-state IDs in one buffer.
+
+    Keeping the cache-group dimension makes it possible to commit the whole
+    table with one H2D while preserving the distinct block allocation of each
+    hybrid KV-cache group.
+    """
+    destination[:, :num_reqs_padded].fill_(PAD_SLOT_ID)
+    for kv_cache_gid in gdn_kv_cache_group_ids:
+        group_destination = destination[kv_cache_gid]
+        for req_idx, req_id in enumerate(req_ids):
+            state_block_idx = mamba_state_idx.get(req_id)
+            if state_block_idx is None:
+                continue
+            block_ids = requests[req_id].block_ids[kv_cache_gid]
+            for offset in range(max_spec_state_slots):
+                block_idx = state_block_idx + offset
+                if not 0 <= block_idx < len(block_ids):
+                    break
+                group_destination[req_idx, offset] = block_ids[block_idx]
+
+
 def _dflash_ddtree_debug_enabled() -> bool:
     return os.getenv("VLLM_DFLASH_DDTREE_DEBUG", "0") == "1"
 
@@ -273,11 +325,15 @@ def _count_contiguous_spec_tokens(output_token_ids: torch.Tensor) -> torch.Tenso
         device=output_token_ids.device,
         dtype=torch.int32,
     )
-    first_invalid = torch.where(
-        valid_token_mask,
-        output_token_ids.shape[1],
-        token_offsets,
-    ).min(dim=1).values
+    first_invalid = (
+        torch.where(
+            valid_token_mask,
+            output_token_ids.shape[1],
+            token_offsets,
+        )
+        .min(dim=1)
+        .values
+    )
     return first_invalid.to(torch.int32)
 
 
@@ -309,9 +365,7 @@ def _maybe_dump_sm70_mtp_step(phase: str, payload: dict[str, object]) -> None:
     global _SM70_MTP_STEP_DUMP_COUNTER
     _SM70_MTP_STEP_DUMP_COUNTER += 1
     step = _SM70_MTP_STEP_DUMP_COUNTER
-    target_steps = _sm70_parse_step_filter(
-        os.getenv("VLLM_SM70_MTP_DUMP_STEP_STEPS")
-    )
+    target_steps = _sm70_parse_step_filter(os.getenv("VLLM_SM70_MTP_DUMP_STEP_STEPS"))
     if target_steps is not None:
         if step not in target_steps:
             return
@@ -674,9 +728,7 @@ def _sm70_dump_compile_graph_inputs(
                     "num_prefills": getattr(metadata, "num_prefills", None),
                     "num_decodes": getattr(metadata, "num_decodes", None),
                     "num_decode_tokens": getattr(metadata, "num_decode_tokens", None),
-                    "num_spec_decodes": getattr(
-                        metadata, "num_spec_decodes", None
-                    ),
+                    "num_spec_decodes": getattr(metadata, "num_spec_decodes", None),
                     "num_spec_decode_tokens": getattr(
                         metadata, "num_spec_decode_tokens", None
                     ),
@@ -730,13 +782,11 @@ def _sm70_dump_compile_graph_inputs(
             ),
             "logits_indices": _sm70_to_cpu_for_dump(logits_indices),
             "query_start_loc_cpu": query_start_loc.cpu[: num_reqs_padded + 1].clone(),
-            "query_start_loc_gpu": query_start_loc.gpu[
-                : num_reqs_padded + 1
-            ].detach().cpu(),
+            "query_start_loc_gpu": query_start_loc.gpu[: num_reqs_padded + 1]
+            .detach()
+            .cpu(),
             "seq_lens": seq_lens[:num_reqs_padded].detach().cpu(),
-            "num_computed_tokens": num_computed_tokens[
-                :num_reqs_padded
-            ].detach().cpu(),
+            "num_computed_tokens": num_computed_tokens[:num_reqs_padded].detach().cpu(),
             "idx_mapping": _sm70_to_cpu_for_dump(
                 getattr(input_batch, "idx_mapping", None)
             ),
@@ -1099,6 +1149,44 @@ class GPUModelRunner(
             if self.speculative_config is not None
             else 0
         )
+        self.qwen38_v100_executor = Qwen38V100Executor.from_vllm_config(
+            vllm_config,
+            device,
+            mode_value=envs.VLLM_QWEN38_EXL3_SM70_EXECUTOR_MODE,
+            is_sm70=(
+                device.type == "cuda" and current_platform.is_device_capability(70)
+            ),
+            nvlink_island_verified=(envs.VLLM_QWEN38_EXL3_SM70_NVLINK_ISLAND_VERIFIED),
+            checkpoint_revision=envs.VLLM_QWEN38_EXL3_CHECKPOINT_REVISION,
+            metadata_compare=envs.VLLM_QWEN38_EXL3_SM70_METADATA_COMPARE,
+        )
+        self._qwen38_v100_step_reasons_seen: set[Qwen38V100StepReason] = set()
+        self._qwen38_v100_metadata_compare_seen: set[tuple[str, tuple[str, ...]]] = (
+            set()
+        )
+        self._qwen38_prepare_packet_active = False
+        self._qwen38_prepare_packet_committed = False
+        self._qwen38_prepare_input_ids_committed = False
+        self._qwen38_grouped_gdn_metadata_committed = False
+        self.single_spec_q4_attn_metadata_cache: dict[
+            tuple[int, int], tuple[tuple[object, ...], AttentionMetadata]
+        ] = {}
+        if (
+            self.qwen38_v100_executor.support.reason
+            is not Qwen38V100SupportReason.MODE_OFF
+        ):
+            logger.info_once(
+                "Qwen3.8 V100 executor mode=%s eligible=%s reason=%s detail=%s",
+                (
+                    self.qwen38_v100_executor.mode.value
+                    if self.qwen38_v100_executor.mode is not None
+                    else envs.VLLM_QWEN38_EXL3_SM70_EXECUTOR_MODE
+                ),
+                self.qwen38_v100_executor.support.eligible,
+                self.qwen38_v100_executor.support.reason.value,
+                self.qwen38_v100_executor.support.detail,
+                scope="global",
+            )
 
         # Broadcast PP output for external_launcher (torchrun)
         # to make sure we are synced across pp ranks
@@ -1140,6 +1228,21 @@ class GPUModelRunner(
         self._sm70_async_worker_input_prep_trace_step = 0
         self._sm70_async_staged_input_prep_active = False
         self._sm70_async_staged_input_prep_logged = False
+        self._sm70_async_spec_accept_gpu_authority_active = False
+        self._sm70_async_spec_accept_gpu_authority_logged = False
+        self._sm70_async_spec_accept_gpu_authority_enabled = (
+            os.getenv("VLLM_SM70_ASYNC_SPEC_ACCEPT_GPU_AUTHORITY", "0") == "1"
+        )
+        self._sm70_fused_rejection_aux_enabled = (
+            os.getenv("VLLM_SM70_FUSED_REJECTION_AUX", "0") == "1"
+        )
+        self._mamba_postprocess_supports_device_only_counts = (
+            "copy_counts_to_cpu"
+            in mamba_utils.postprocess_mamba_align_gpu.__code__.co_varnames
+        )
+        self._static_pp_intermediate_metadata_template: (
+            tuple[tuple[str, str, torch.dtype, torch.Size], ...] | None
+        ) = None
 
         # Sampler
         self.sampler = Sampler(logprobs_mode=self.model_config.logprobs_mode)
@@ -1168,6 +1271,7 @@ class GPUModelRunner(
         # self.model: nn.Module  # Set after load_model
         # Initialize in initialize_kv_cache
         self.kv_caches: list[torch.Tensor] = []
+        self._sm70_prompt_tail_cache: dict[int, dict[str, object]] = {}
         # Initialize in initialize_kv_cache_tensors
         self.cross_layers_kv_cache: torch.Tensor | None = None
         self.cross_layers_attn_backend: type[AttentionBackend] | None = None
@@ -1266,6 +1370,11 @@ class GPUModelRunner(
             self.rejection_sampler = RejectionSampler(
                 self.sampler, self.speculative_config, self.device
             )
+        else:
+            # The complete native-MTP drafter is intentionally local to the
+            # final target PP stage. Keep the attribute explicit elsewhere so
+            # feature checks never depend on a missing Python attribute.
+            self.drafter = None
 
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
         if self.speculative_config:
@@ -1278,12 +1387,63 @@ class GPUModelRunner(
             self.use_async_scheduling
             and self.num_spec_tokens > 0
             and envs.VLLM_SM70_MTP_SYNC_ACCEPT_COUNTS
+            and (get_pp_group().world_size == 1 or get_pp_group().is_last_rank)
         )
         self.use_async_spec_decode = (
             self.use_async_scheduling
             and self.num_spec_tokens > 0
             and not self.sync_spec_decode_accept_counts
         )
+        pp_group = get_pp_group()
+        self.pp_mtp_enabled = (
+            self.use_async_scheduling
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and pp_group.world_size > 1
+        )
+        if self.pp_mtp_enabled and self.model_config.is_hybrid:
+            if self.cache_config.mamba_cache_mode != "align":
+                raise ValueError(
+                    "pipeline-parallel native MTP on a hybrid model requires "
+                    "mamba_cache_mode='align'"
+                )
+            if envs.VLLM_MAMBA_ALIGN_CPU_POSTPROCESS:
+                raise ValueError(
+                    "pipeline-parallel native MTP requires GPU Mamba align "
+                    "postprocessing"
+                )
+        self._pp_mtp_payload_epoch = 0
+        self._pp_mtp_payload: torch.Tensor | None = None
+        self._pp_mtp_request_fingerprints_cpu: torch.Tensor | None = None
+        self._pp_mtp_request_fingerprints_gpu: torch.Tensor | None = None
+        self._pp_mtp_committed_token_ids: torch.Tensor | None = None
+        self._pp_mtp_pending_scheduler_output = None
+        self._pp_mtp_gpu_counts_active = False
+        if self.pp_mtp_enabled:
+            self._pp_mtp_payload = torch.full(
+                (self.max_num_reqs, pp_mtp_payload_width(self.num_spec_tokens)),
+                -1,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self._pp_mtp_request_fingerprints_cpu = torch.full(
+                (self.max_num_reqs,),
+                -1,
+                dtype=torch.int64,
+                pin_memory=self.pin_memory,
+            )
+            self._pp_mtp_request_fingerprints_gpu = torch.full(
+                (self.max_num_reqs,),
+                -1,
+                dtype=torch.int64,
+                device=self.device,
+            )
+            self._pp_mtp_committed_token_ids = torch.full(
+                (self.max_num_reqs,),
+                -1,
+                dtype=torch.int32,
+                device=self.device,
+            )
 
         # Request states.
         self.requests: dict[str, CachedRequestState] = {}
@@ -1423,6 +1583,9 @@ class GPUModelRunner(
             self.max_spec_state_slots,
             dtype=torch.int32,
         )
+        self.grouped_mamba_state_block_ids: CpuGpuBuffer | None = None
+        self.gdn_kv_cache_group_ids: tuple[int, ...] = ()
+        self.grouped_gdn_spec_metadata_tensors: dict[str, torch.Tensor] | None = None
 
         # Only relevant for models using M-RoPE (e.g, Qwen2-VL)
         if self.uses_mrope:
@@ -1678,7 +1841,10 @@ class GPUModelRunner(
             return False
         if self.speculative_config is not None or self.num_spec_tokens:
             return False
-        if self.model_config.is_encoder_decoder or scheduler_output.scheduled_encoder_inputs:
+        if (
+            self.model_config.is_encoder_decoder
+            or scheduler_output.scheduled_encoder_inputs
+        ):
             return False
         if scheduler_output.scheduled_spec_decode_tokens:
             return False
@@ -1692,9 +1858,97 @@ class GPUModelRunner(
             return False
         return True
 
+    @staticmethod
+    def _sm70_async_spec_stays_in_state_block(
+        prev_state_idx: int,
+        optimistic_computed: int,
+        scheduled_tokens: int,
+        block_size: int,
+        max_rejected_tokens: int,
+    ) -> bool:
+        min_computed = max(0, optimistic_computed - max_rejected_tokens)
+        possible_state_indices = {
+            cdiv(computed + scheduled_tokens, block_size) - 1
+            for computed in range(min_computed, optimistic_computed + 1)
+        }
+        return possible_state_indices == {prev_state_idx}
+
+    def _can_use_sm70_async_spec_accept_gpu_authority(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_reqs: int,
+        prev_req_id_to_index: Mapping[str, int] | None,
+    ) -> bool:
+        if not (
+            self._sm70_async_spec_accept_gpu_authority_enabled
+            and self.use_async_spec_decode
+            and self.device.type == "cuda"
+            and current_platform.is_device_capability(70)
+            and self.speculative_config is not None
+            and self.speculative_config.method == "mtp"
+            and self.cache_config.mamba_cache_mode == "align"
+            and num_reqs == 1
+            and self.input_batch.prev_sampled_token_ids is not None
+            and prev_req_id_to_index
+        ):
+            return False
+
+        req_id = self.input_batch.req_ids[0]
+        if prev_req_id_to_index.get(req_id) != 0:
+            return False
+        draft_tokens = scheduler_output.scheduled_spec_decode_tokens.get(req_id)
+        if draft_tokens is None or len(draft_tokens) != self.num_spec_tokens:
+            return False
+        if scheduler_output.scheduled_ddtree_payloads:
+            return False
+
+        prev_state_idx = self.mamba_state_idx.get(req_id)
+        if prev_state_idx is None:
+            return False
+        _, mamba_spec = mamba_utils.get_mamba_groups(self.kv_cache_config)
+        scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+        # The proof below is for the fixed q=4 verifier cycle. A shortened or
+        # otherwise reshaped scheduler step can have different state-copy
+        # semantics even when it still carries three draft IDs.
+        if scheduled_tokens != 1 + self.num_spec_tokens:
+            return False
+        optimistic_computed = self.requests[req_id].num_computed_tokens
+        can_use_gpu_authority = self._sm70_async_spec_stays_in_state_block(
+            prev_state_idx,
+            optimistic_computed,
+            scheduled_tokens,
+            mamba_spec.block_size,
+            self.num_spec_tokens,
+        )
+        if (
+            can_use_gpu_authority
+            and not self._sm70_async_spec_accept_gpu_authority_logged
+        ):
+            logger.info(
+                "Using GPU-authoritative accepted counts for steady-state "
+                "batch-1 SM70 async MTP decode"
+            )
+            self._sm70_async_spec_accept_gpu_authority_logged = True
+        return can_use_gpu_authority
+
     def _copy_buffer_to_gpu(
         self, buffer: CpuGpuBuffer, n: int | None = None
     ) -> torch.Tensor:
+        packed_buffers = (
+            self.query_start_loc,
+            self.discard_request_mask,
+            self.num_accepted_tokens,
+            self.spec_state_slot_selectors,
+            self.prev_positions,
+            self.prev_num_draft_tokens,
+            self.req_indices,
+            self.query_pos,
+            self.num_scheduled_tokens,
+        )
+        if self._qwen38_prepare_packet_active and any(
+            buffer is candidate for candidate in packed_buffers
+        ):
+            return buffer.gpu if n is None else buffer.gpu[:n]
         if self._sm70_async_staged_input_prep_active:
             return buffer.copy_to_gpu_staged(n)
         return buffer.copy_to_gpu(n)
@@ -1709,6 +1963,11 @@ class GPUModelRunner(
         return dst.copy_(src, non_blocking=True)
 
     def _commit_block_table_to_gpu(self, num_reqs: int) -> None:
+        if (
+            self.qwen38_v100_executor.support.eligible
+            and self.input_batch.block_table.commit_block_table_qwen38_packed(num_reqs)
+        ):
+            return
         if self._sm70_async_staged_input_prep_active:
             self.input_batch.block_table.commit_block_table_staged(num_reqs)
         else:
@@ -1845,8 +2104,7 @@ class GPUModelRunner(
                     warmed.append("gdn_causal_conv1d")
                     break
         if warmed:
-            logger.info_once("SM70 auxiliary kernel warmup finished: %s",
-                             tuple(warmed))
+            logger.info_once("SM70 auxiliary kernel warmup finished: %s", tuple(warmed))
 
     # Note: used for model runner override.
     def _init_device_properties(self) -> None:
@@ -2024,6 +2282,14 @@ class GPUModelRunner(
         sync_valid_sampled_token_count: list[int] | None = None
         if self.sync_spec_decode_accept_counts:
             sync_valid_sampled_token_count = self._get_valid_sampled_token_count()
+        elif self.pp_mtp_enabled and not get_pp_group().is_last_rank:
+            # PP0 starts this tiny D2H on the dedicated copy stream as soon as
+            # PP1's payload arrives. By the next scheduler update the event is
+            # normally complete, so CPU recurrent-state indices can be exact
+            # without putting the payload collective itself on a host sync.
+            pp_valid_counts = self._get_valid_sampled_token_count()
+            if pp_valid_counts:
+                sync_valid_sampled_token_count = pp_valid_counts
 
         for i, req_id in enumerate(req_data.req_ids):
             req_state = self.requests[req_id]
@@ -2049,13 +2315,16 @@ class GPUModelRunner(
                 # when prev_num_draft_len > 0.
                 if req_index is None:
                     req_state.prev_num_draft_len = 0
-                elif self.sync_spec_decode_accept_counts:
+                elif sync_valid_sampled_token_count is not None:
                     assert self.input_batch.prev_req_id_to_index is not None
-                    assert sync_valid_sampled_token_count is not None
                     prev_req_index = self.input_batch.prev_req_id_to_index[req_id]
-                    num_accepted = sync_valid_sampled_token_count[prev_req_index] - 1
-                    num_rejected = req_state.prev_num_draft_len - num_accepted
-                    num_computed_tokens -= num_rejected
+                    valid_count = sync_valid_sampled_token_count[prev_req_index]
+                    num_accepted = valid_count - 1
+                    num_computed_tokens = correct_optimistic_num_computed(
+                        num_computed_tokens,
+                        req_state.prev_num_draft_len,
+                        valid_count,
+                    )
                     req_state.output_token_ids.extend([-1] * num_accepted)
                 else:
                     # Optimistically assume all accepted; queue up a correction
@@ -2064,9 +2333,10 @@ class GPUModelRunner(
                     optimistic_num_accepted = req_state.prev_num_draft_len
                     req_state.output_token_ids.extend([-1] * optimistic_num_accepted)
 
-                    deferred_spec_decode_corrections.append(
-                        (req_id, optimistic_num_accepted, req_state)
-                    )
+                    if is_last_rank or get_pp_group().world_size == 1:
+                        deferred_spec_decode_corrections.append(
+                            (req_id, optimistic_num_accepted, req_state)
+                        )
 
                     prev_req_index = (
                         self.input_batch.prev_req_id_to_index.get(req_id)
@@ -2087,10 +2357,7 @@ class GPUModelRunner(
             req_state.num_computed_tokens = num_computed_tokens
 
             if not is_last_rank:
-                if (
-                    not req_data.new_token_ids
-                    or not req_data.new_token_ids[i]
-                ):
+                if not req_data.new_token_ids or not req_data.new_token_ids[i]:
                     # Async scheduled PP: Sampled tokens propagated via GPU broadcast.
                     new_token_ids: list[int] = []
                 else:
@@ -2121,6 +2388,19 @@ class GPUModelRunner(
                         + num_output_tokens
                     )
                     self.input_batch.num_tokens_no_spec[req_index] = end_idx
+
+            if not is_last_rank and self.use_async_scheduling:
+                # Keep the placeholder-only output list at the scheduler's
+                # current optimistic length. PP MTP separately uses the GPU
+                # acceptance counts to correct computed positions and the
+                # persistent input-batch end before placing the next drafts.
+                current_output_tokens = len(req_state.output_token_ids)
+                if current_output_tokens > num_output_tokens:
+                    del req_state.output_token_ids[num_output_tokens:]
+                elif current_output_tokens < num_output_tokens:
+                    req_state.output_token_ids.extend(
+                        [-1] * (num_output_tokens - current_output_tokens)
+                    )
 
             # Update the block IDs.
             if not resumed_from_preemption:
@@ -2169,6 +2449,17 @@ class GPUModelRunner(
                     start_token_index,
                     num_computed_tokens + len(new_token_ids),
                 )
+                if self.pp_mtp_enabled and self.use_async_scheduling:
+                    # PP0 receives the mandatory token immediately, but the
+                    # rejection-corrected computed position also includes any
+                    # accepted drafts from that step. Advance through the next
+                    # mandatory token before placing the new draft slots. Do
+                    # not use num_output_tokens: async placeholders make it
+                    # optimistic until the scheduler consumes the result.
+                    end_token_index = reconcile_pp_num_tokens_no_spec(
+                        start_token_index,
+                        num_computed_tokens,
+                    )
                 if end_token_index > start_token_index:
                     if new_token_ids:
                         # Add new_token_ids to token_ids_cpu.
@@ -2251,9 +2542,12 @@ class GPUModelRunner(
 
     def _update_states_after_model_execute(
         self,
-        output_token_ids: torch.Tensor,
+        output_token_ids: torch.Tensor | None,
         scheduler_output: "SchedulerOutput",
         ddtree_accepted_node_indices: torch.Tensor | None = None,
+        *,
+        valid_sampled_token_count: torch.Tensor | None = None,
+        copy_counts_to_cpu: bool = True,
     ) -> None:
         """Update the cached states after model execution.
 
@@ -2268,10 +2562,13 @@ class GPUModelRunner(
 
         # Count only the contiguous accepted prefix. Values after the first -1
         # are rejected/padding slots and may contain stale token ids.
-        num_reqs = output_token_ids.size(0)
-        num_accepted_tokens = _count_contiguous_spec_tokens(
-            output_token_ids
-        )
+        if valid_sampled_token_count is None:
+            assert output_token_ids is not None
+            num_reqs = output_token_ids.size(0)
+            num_accepted_tokens = _count_contiguous_spec_tokens(output_token_ids)
+        else:
+            num_reqs = self.input_batch.num_reqs
+            num_accepted_tokens = valid_sampled_token_count[:num_reqs]
         spec_state_slot_selectors = num_accepted_tokens
         if (
             ddtree_accepted_node_indices is not None
@@ -2292,6 +2589,8 @@ class GPUModelRunner(
             # before the previous postprocess kernel consumes them.
             mamba_bufs = self._get_mamba_bufs()
             if envs.VLLM_MAMBA_ALIGN_CPU_POSTPROCESS:
+                if not copy_counts_to_cpu:
+                    raise RuntimeError("PP MTP requires GPU mamba align postprocess")
                 self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                     self.num_accepted_tokens.gpu[:num_reqs]
                 )
@@ -2309,10 +2608,13 @@ class GPUModelRunner(
                     mamba_bufs.preprocess,
                 )
             else:
-                self.input_batch.spec_num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-                    self.spec_state_slot_selectors.gpu[:num_reqs],
-                    non_blocking=True,
-                )
+                if copy_counts_to_cpu:
+                    self.input_batch.spec_num_accepted_tokens_cpu_tensor[
+                        :num_reqs
+                    ].copy_(
+                        self.spec_state_slot_selectors.gpu[:num_reqs],
+                        non_blocking=True,
+                    )
                 mamba_utils.stage_postprocess_inputs_to_gpu(
                     mamba_bufs.postprocess_align,
                     scheduler_output,
@@ -2321,13 +2623,18 @@ class GPUModelRunner(
                     self.requests,
                     self.mamba_state_idx,
                 )
+                postprocess_count_kwargs: dict[str, bool] = {}
+                if self._mamba_postprocess_supports_device_only_counts:
+                    postprocess_count_kwargs["copy_counts_to_cpu"] = copy_counts_to_cpu
+                elif not copy_counts_to_cpu:
+                    raise RuntimeError(
+                        "device-only PP MTP requires a compatible Mamba postprocess"
+                    )
                 mamba_utils.postprocess_mamba_align_gpu(
                     bufs=mamba_bufs,
                     num_reqs=num_reqs,
                     num_accepted_tokens_gpu=self.num_accepted_tokens.gpu,
-                    spec_state_slot_selectors_gpu=(
-                        self.spec_state_slot_selectors.gpu
-                    ),
+                    spec_state_slot_selectors_gpu=(self.spec_state_slot_selectors.gpu),
                     num_accepted_tokens_cpu_tensor=(
                         self.input_batch.num_accepted_tokens_cpu_tensor
                     ),
@@ -2343,11 +2650,26 @@ class GPUModelRunner(
                         if scheduler_output.scheduled_ddtree_payloads
                         else None
                     ),
+                    **postprocess_count_kwargs,
                 )
+                if self._sm70_async_spec_accept_gpu_authority_active:
+                    postprocess_ctx = mamba_bufs.postprocess_align
+                    assert postprocess_ctx is not None
+                    self.num_accepted_tokens.gpu[:num_reqs].copy_(
+                        postprocess_ctx.num_accepted_tokens_out[:num_reqs]
+                    )
+                    self.spec_state_slot_selectors.gpu[:num_reqs].copy_(
+                        postprocess_ctx.spec_state_slot_selectors_out[:num_reqs]
+                    )
 
-            assert self.num_accepted_tokens_event is not None
-            self.num_accepted_tokens_event.record()
+            if copy_counts_to_cpu:
+                assert self.num_accepted_tokens_event is not None
+                self.num_accepted_tokens_event.record()
         else:
+            if not copy_counts_to_cpu:
+                raise RuntimeError(
+                    "device-only PP MTP state update requires mamba align mode"
+                )
             self.input_batch.num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
                 self.num_accepted_tokens.gpu[:num_reqs], non_blocking=True
             )
@@ -2460,9 +2782,7 @@ class GPUModelRunner(
         expected_parents = () if num_nodes == 0 else (-1,) + tuple(range(num_nodes - 1))
         expected_depths = tuple(range(1, num_nodes + 1))
         return (
-            tree == flat
-            and parents == expected_parents
-            and depths == expected_depths
+            tree == flat and parents == expected_parents and depths == expected_depths
         )
 
     @classmethod
@@ -2555,7 +2875,9 @@ class GPUModelRunner(
 
         forward_context = self.compilation_config.static_forward_context
         seen_cache_ptrs: set[int] = set()
-        for kv_cache_gid, kv_cache_group in enumerate(self.kv_cache_config.kv_cache_groups):
+        for kv_cache_gid, kv_cache_group in enumerate(
+            self.kv_cache_config.kv_cache_groups
+        ):
             slot_mapping = slot_mappings_by_group.get(kv_cache_gid)
             if slot_mapping is None:
                 continue
@@ -2621,7 +2943,8 @@ class GPUModelRunner(
         tensors: list[torch.Tensor] = [hidden_states]
         if aux_hidden_states is not None:
             tensors.extend(
-                tensor for tensor in aux_hidden_states
+                tensor
+                for tensor in aux_hidden_states
                 if isinstance(tensor, torch.Tensor)
             )
 
@@ -2854,16 +3177,15 @@ class GPUModelRunner(
         (-1 for new requests).
         """
 
+        if self._qwen38_prepare_input_ids_committed:
+            return
+
         if self.input_batch.prev_sampled_token_ids is None:
             # Normal scheduling case
             self._copy_buffer_to_gpu(self.input_ids, total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
-                self._copy_buffer_to_gpu(
-                    self.inputs_embeds, total_num_scheduled_tokens
-                )
-                self._copy_buffer_to_gpu(
-                    self.is_token_ids, total_num_scheduled_tokens
-                )
+                self._copy_buffer_to_gpu(self.inputs_embeds, total_num_scheduled_tokens)
+                self._copy_buffer_to_gpu(self.is_token_ids, total_num_scheduled_tokens)
             return
 
         # Async scheduling case, where some decode requests from the previous
@@ -2915,12 +3237,8 @@ class GPUModelRunner(
             # we need to copy the input_ids_cpu to the GPU first.
             self._copy_buffer_to_gpu(self.input_ids, total_num_scheduled_tokens)
             if self.enable_prompt_embeds:
-                self._copy_buffer_to_gpu(
-                    self.inputs_embeds, total_num_scheduled_tokens
-                )
-                self._copy_buffer_to_gpu(
-                    self.is_token_ids, total_num_scheduled_tokens
-                )
+                self._copy_buffer_to_gpu(self.inputs_embeds, total_num_scheduled_tokens)
+                self._copy_buffer_to_gpu(self.is_token_ids, total_num_scheduled_tokens)
         if num_common_tokens == 0:
             # No requests in common with the previous iteration
             # So input_ids.cpu will have all the input ids.
@@ -2953,16 +3271,6 @@ class GPUModelRunner(
         # Scatter the draft tokens after the sampled tokens are scattered.
         if not spec_flattened_indices:
             return
-
-        if (
-            self.speculative_config is not None
-            and self.speculative_config.method == "mtp"
-            and get_pp_group().world_size > 1
-            and not get_pp_group().is_last_rank
-        ):
-            self._pp_materialize_mtp_draft_token_ids(
-                scheduled_spec_tokens, prev_positions, num_reqs
-            )
 
         if self._draft_token_ids is None:
             raise RuntimeError(
@@ -2998,11 +3306,20 @@ class GPUModelRunner(
         # because input_ids dtype is torch.int32,
         # so convert draft_token_ids to torch.int32 here.
         draft_token_ids = self._draft_token_ids.to(dtype=torch.int32)
+        selected_draft_token_ids = draft_token_ids.flatten()[
+            prev_draft_token_indices_tensor
+        ]
+        if self.pp_mtp_enabled and not get_pp_group().is_last_rank:
+            torch._assert_async(
+                selected_draft_token_ids.ge(0).all(),
+                "native-MTP PP payload has fewer real drafts than the async "
+                "scheduler requested",
+            )
 
         self.input_ids.gpu.scatter_(
             dim=0,
             index=draft_tokens_index_tensor,
-            src=draft_token_ids.flatten()[prev_draft_token_indices_tensor],
+            src=selected_draft_token_ids,
         )
 
     def _get_encoder_seq_lens(
@@ -3067,6 +3384,33 @@ class GPUModelRunner(
         assert total_num_scheduled_tokens > 0
         num_reqs = self.input_batch.num_reqs
         assert num_reqs > 0
+        scheduled_drafts = scheduler_output.scheduled_spec_decode_tokens
+        # Compute the carry mapping before deciding whether the packed q=4
+        # path can also assemble verifier input IDs on the GPU.
+        self._compute_prev_positions(num_reqs)
+        previous_index = int(self.prev_positions.np[0]) if num_reqs == 1 else -1
+        self._qwen38_prepare_packet_active = (
+            self.qwen38_v100_executor.support.eligible
+            and num_reqs == 1
+            and total_num_scheduled_tokens == 4
+            and len(scheduled_drafts) == 1
+            and len(next(iter(scheduled_drafts.values()), ())) == 3
+            and not scheduler_output.scheduled_ddtree_payloads
+            and hasattr(torch.ops.qwen38_control, "scatter_prepare_inputs")
+            and self.qwen38_v100_executor.can_fuse_q4_input_ids(
+                prev_index=previous_index,
+                input_ids=self.input_ids,
+                prev_sampled_token_ids=self.input_batch.prev_sampled_token_ids,
+                draft_token_ids=(
+                    self._draft_token_ids
+                    if isinstance(self._draft_token_ids, torch.Tensor)
+                    else None
+                ),
+            )
+        )
+        self._qwen38_prepare_packet_committed = False
+        self._qwen38_prepare_input_ids_committed = False
+        self._qwen38_grouped_gdn_metadata_committed = False
         self._ddtree_parent_metadata = None
         spec_config = self.speculative_config
         if (
@@ -3084,7 +3428,8 @@ class GPUModelRunner(
 
         # OPTIMIZATION: Start copying the block table first.
         # This way, we can overlap the copy with the following CPU operations.
-        self._commit_block_table_to_gpu(num_reqs)
+        if not self._qwen38_prepare_packet_active:
+            self._commit_block_table_to_gpu(num_reqs)
 
         # Get request indices.
         # E.g., [2, 5, 3] -> [0, 0, 1, 1, 1, 1, 1, 2, 2, 2]
@@ -3200,7 +3545,13 @@ class GPUModelRunner(
         # Build prev_positions mapping: current pos -> prev pos (-1 if new).
         # Used for gathering from previous iteration's GPU tensors.
         prev_req_id_to_index = self.input_batch.prev_req_id_to_index
-        self._compute_prev_positions(num_reqs)
+        self._sm70_async_spec_accept_gpu_authority_active = (
+            self._can_use_sm70_async_spec_accept_gpu_authority(
+                scheduler_output,
+                num_reqs,
+                prev_req_id_to_index,
+            )
+        )
 
         num_tokens = [self.requests[r].num_tokens for r in self.input_batch.req_ids]
         num_tokens_np = np.array(num_tokens, dtype=np.int32)
@@ -3212,9 +3563,53 @@ class GPUModelRunner(
         )
         self._copy_buffer_to_gpu(self.discard_request_mask, num_reqs)
 
+        pp_mtp_gpu_counts_active = (
+            self.pp_mtp_enabled
+            and not get_pp_group().is_last_rank
+            and self.valid_sampled_token_count_gpu is not None
+            and bool(prev_req_id_to_index)
+        )
+        self._pp_mtp_gpu_counts_active = pp_mtp_gpu_counts_active
+        if pp_mtp_gpu_counts_active:
+            self._copy_buffer_to_gpu(self.prev_positions, num_reqs)
+            previous_indices = self.prev_positions.gpu[:num_reqs]
+            new_requests = previous_indices.lt(0)
+            safe_previous_indices = previous_indices.clamp_min(0).to(torch.int64)
+            assert self.valid_sampled_token_count_gpu is not None
+            state_count_source = self.valid_sampled_token_count_gpu
+            state_selector_source = self.valid_sampled_token_count_gpu
+            if (
+                self.model_config.is_hybrid
+                and self.cache_config.mamba_cache_mode == "align"
+            ):
+                postprocess_ctx = self._get_mamba_bufs().postprocess_align
+                assert postprocess_ctx is not None
+                state_count_source = postprocess_ctx.num_accepted_tokens_out
+                state_selector_source = postprocess_ctx.spec_state_slot_selectors_out
+            aligned_state_counts = state_count_source[safe_previous_indices]
+            aligned_state_counts = torch.where(
+                new_requests,
+                torch.ones_like(aligned_state_counts),
+                aligned_state_counts,
+            )
+            aligned_state_selectors = state_selector_source[safe_previous_indices]
+            aligned_state_selectors = torch.where(
+                new_requests,
+                torch.ones_like(aligned_state_selectors),
+                aligned_state_selectors,
+            )
+            self.num_accepted_tokens.gpu[:num_reqs].copy_(aligned_state_counts)
+            self.spec_state_slot_selectors.gpu[:num_reqs].copy_(aligned_state_selectors)
+            self.num_accepted_tokens.gpu[num_reqs:].fill_(1)
+            self.spec_state_slot_selectors.gpu[num_reqs:].fill_(1)
+
         # Sync num_accepted_tokens from CPU (set by
         # _update_states_after_model_execute for hybrid models).
-        if self.num_accepted_tokens_event is not None:
+        if (
+            self.num_accepted_tokens_event is not None
+            and not self._sm70_async_spec_accept_gpu_authority_active
+            and not pp_mtp_gpu_counts_active
+        ):
             sm70_trace_event_sync(
                 self.num_accepted_tokens_event,
                 "GPUModelRunner.num_accepted_tokens_event.synchronize",
@@ -3228,9 +3623,7 @@ class GPUModelRunner(
                     prev_idx_or_zero
                 ].copy()
                 align_counts[new_mask] = 1
-                self.input_batch.num_accepted_tokens_cpu[:num_reqs] = (
-                    align_counts
-                )
+                self.input_batch.num_accepted_tokens_cpu[:num_reqs] = align_counts
                 spec_counts = self.input_batch.spec_num_accepted_tokens_cpu[
                     prev_idx_or_zero
                 ]
@@ -3251,7 +3644,7 @@ class GPUModelRunner(
             self.spec_state_slot_selectors.np[num_reqs:].fill(1)
             self._copy_buffer_to_gpu(self.num_accepted_tokens)
             self._copy_buffer_to_gpu(self.spec_state_slot_selectors)
-        else:
+        elif self.num_accepted_tokens_event is None:
             self.num_accepted_tokens.np.fill(1)
             self.num_accepted_tokens.gpu.fill_(1)
             self.spec_state_slot_selectors.np.fill(1)
@@ -3270,6 +3663,7 @@ class GPUModelRunner(
         # CPU values are optimistic (all drafts accepted). The kernel
         # corrects on GPU using the previous step's
         # valid_sampled_token_count_gpu. Otherwise, just copy from CPU.
+        deferred_num_computed_update = False
         if (
             self.use_async_spec_decode
             and self.valid_sampled_token_count_gpu is not None
@@ -3277,17 +3671,21 @@ class GPUModelRunner(
         ):
             self._copy_buffer_to_gpu(self.prev_positions, num_reqs)
             self._copy_buffer_to_gpu(self.prev_num_draft_tokens)
-            cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs].to(
-                device=self.device, non_blocking=True
-            )
-            update_num_computed_tokens_for_batch_change(
-                self.num_computed_tokens,
-                self.num_accepted_tokens.gpu[:num_reqs],
-                self.prev_positions.gpu[:num_reqs],
-                self.valid_sampled_token_count_gpu,
-                self.prev_num_draft_tokens.gpu,
-                cpu_values,
-            )
+            if self._qwen38_prepare_packet_active:
+                deferred_num_computed_update = True
+            else:
+                cpu_values = self.input_batch.num_computed_tokens_cpu_tensor[
+                    :num_reqs
+                ].to(device=self.device, non_blocking=True)
+                update_num_computed_tokens_for_batch_change(
+                    self.num_computed_tokens,
+                    self.num_accepted_tokens.gpu[:num_reqs],
+                    self.prev_positions.gpu[:num_reqs],
+                    self.valid_sampled_token_count_gpu,
+                    self.prev_num_draft_tokens.gpu,
+                    cpu_values,
+                    update_num_accepted_tokens=not pp_mtp_gpu_counts_active,
+                )
         else:
             self.num_computed_tokens[:num_reqs].copy_(
                 self.input_batch.num_computed_tokens_cpu_tensor[:num_reqs],
@@ -3302,6 +3700,75 @@ class GPUModelRunner(
         self.num_scheduled_tokens.np[:num_reqs] = num_scheduled_tokens
         self._copy_buffer_to_gpu(self.num_scheduled_tokens, num_reqs)
         num_scheduled_tokens_gpu = self.num_scheduled_tokens.gpu[:num_reqs]
+        if self._qwen38_prepare_packet_active:
+            grouped_state_ids = self.grouped_mamba_state_block_ids
+            grouped_gdn_metadata = self.grouped_gdn_spec_metadata_tensors
+            if (
+                grouped_state_ids is not None
+                and grouped_gdn_metadata is not None
+                and self.gdn_kv_cache_group_ids == (0, 1, 2)
+            ):
+                _populate_grouped_gdn_state_block_ids(
+                    grouped_state_ids.cpu,
+                    self.gdn_kv_cache_group_ids,
+                    self.input_batch.req_ids[:num_reqs],
+                    self.requests,
+                    self.mamba_state_idx,
+                    self.max_spec_state_slots,
+                    num_reqs,
+                )
+            else:
+                grouped_state_ids = None
+                grouped_gdn_metadata = None
+            packet_cpu_num_computed = (
+                self.qwen38_v100_executor.commit_q4_prepare_packet(
+                block_tables=self.input_batch.block_table,
+                query_start_loc=self.query_start_loc,
+                discard_request_mask=self.discard_request_mask,
+                num_accepted_tokens=self.num_accepted_tokens,
+                state_slot_selectors=self.spec_state_slot_selectors,
+                prev_positions=self.prev_positions,
+                prev_num_draft_tokens=self.prev_num_draft_tokens,
+                num_computed_tokens_cpu=(
+                    self.input_batch.num_computed_tokens_cpu_tensor
+                ),
+                num_computed_tokens_gpu=self.num_computed_tokens,
+                req_indices=self.req_indices,
+                query_pos=self.query_pos,
+                num_scheduled_tokens=self.num_scheduled_tokens,
+                input_ids=self.input_ids,
+                prev_sampled_token_ids=(
+                    self.input_batch.prev_sampled_token_ids
+                ),
+                draft_token_ids=(
+                    self._draft_token_ids
+                    if isinstance(self._draft_token_ids, torch.Tensor)
+                    else None
+                ),
+                grouped_state_ids=grouped_state_ids,
+                grouped_gdn_metadata=grouped_gdn_metadata,
+            )
+            )
+            if packet_cpu_num_computed is None:
+                raise RuntimeError(
+                    "Qwen3.8 prepare packet became ineligible after copies were staged"
+                )
+            self._qwen38_prepare_packet_active = False
+            self._qwen38_prepare_packet_committed = True
+            self._qwen38_prepare_input_ids_committed = True
+            self._qwen38_grouped_gdn_metadata_committed = (
+                self.qwen38_v100_executor.last_q4_gdn_metadata_fused
+            )
+            if deferred_num_computed_update:
+                update_num_computed_tokens_for_batch_change(
+                    self.num_computed_tokens,
+                    self.num_accepted_tokens.gpu[:num_reqs],
+                    self.prev_positions.gpu[:num_reqs],
+                    self.valid_sampled_token_count_gpu,
+                    self.prev_num_draft_tokens.gpu,
+                    packet_cpu_num_computed[:num_reqs],
+                    update_num_accepted_tokens=not pp_mtp_gpu_counts_active,
+                )
         self.positions[:total_num_scheduled_tokens] = (
             self.num_computed_tokens[req_indices_gpu].to(torch.int64)
             + self.query_pos.gpu[:total_num_scheduled_tokens]
@@ -3445,7 +3912,11 @@ class GPUModelRunner(
         else:
             max_seq_len = self.optimistic_seq_lens_cpu.numpy()[:num_reqs].max().item()
 
-        if use_spec_decode:
+        if (
+            use_spec_decode
+            and not self._sm70_async_spec_accept_gpu_authority_active
+            and not self._pp_mtp_gpu_counts_active
+        ):
             self.num_accepted_tokens.np[:num_reqs] = (
                 self.input_batch.num_accepted_tokens_cpu[:num_reqs]
             )
@@ -3454,10 +3925,11 @@ class GPUModelRunner(
             )
             self.num_accepted_tokens.np[num_reqs:].fill(1)
             self.spec_state_slot_selectors.np[num_reqs:].fill(1)
-            self._copy_buffer_to_gpu(self.num_accepted_tokens, num_reqs_padded)
-            self._copy_buffer_to_gpu(
-                self.spec_state_slot_selectors, num_reqs_padded
-            )
+            if not self._qwen38_prepare_packet_committed:
+                self._copy_buffer_to_gpu(self.num_accepted_tokens, num_reqs_padded)
+                self._copy_buffer_to_gpu(
+                    self.spec_state_slot_selectors, num_reqs_padded
+                )
 
         kv_cache_groups = self.kv_cache_config.kv_cache_groups
 
@@ -3546,6 +4018,36 @@ class GPUModelRunner(
             if kv_cache_gid in current_mamba_state_block_ids_by_gid:
                 return current_mamba_state_block_ids_by_gid[kv_cache_gid]
 
+            grouped_state_block_ids = self.grouped_mamba_state_block_ids
+            if grouped_state_block_ids is not None:
+                if self._qwen38_grouped_gdn_metadata_committed:
+                    current_mamba_state_block_ids_by_gid.update(
+                        (
+                            gid,
+                            grouped_state_block_ids.gpu[gid, :num_reqs_padded],
+                        )
+                        for gid in self.gdn_kv_cache_group_ids
+                    )
+                    return current_mamba_state_block_ids_by_gid[kv_cache_gid]
+                _populate_grouped_gdn_state_block_ids(
+                    grouped_state_block_ids.cpu,
+                    self.gdn_kv_cache_group_ids,
+                    self.input_batch.req_ids[:num_reqs],
+                    self.requests,
+                    self.mamba_state_idx,
+                    self.max_spec_state_slots,
+                    num_reqs_padded,
+                )
+                self._copy_buffer_to_gpu(grouped_state_block_ids)
+                current_mamba_state_block_ids_by_gid.update(
+                    (
+                        gid,
+                        grouped_state_block_ids.gpu[gid, :num_reqs_padded],
+                    )
+                    for gid in self.gdn_kv_cache_group_ids
+                )
+                return current_mamba_state_block_ids_by_gid[kv_cache_gid]
+
             state_block_ids = self.current_mamba_state_block_ids
             state_block_ids.cpu[:num_reqs_padded].fill_(PAD_SLOT_ID)
             for req_idx, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
@@ -3561,9 +4063,9 @@ class GPUModelRunner(
                     else:
                         break
             self._copy_buffer_to_gpu(state_block_ids, num_reqs_padded)
-            current_mamba_state_block_ids_by_gid[kv_cache_gid] = (
-                state_block_ids.gpu[:num_reqs_padded]
-            )
+            current_mamba_state_block_ids_by_gid[kv_cache_gid] = state_block_ids.gpu[
+                :num_reqs_padded
+            ]
             return current_mamba_state_block_ids_by_gid[kv_cache_gid]
 
         if self.dcp_world_size > 1:
@@ -3595,6 +4097,119 @@ class GPUModelRunner(
         cached_attn_metadata: dict[
             tuple[KVCacheSpec, type[AttentionMetadataBuilder]], AttentionMetadata
         ] = {}
+        grouped_gdn_metadata_prebuilt = False
+        grouped_gdn_real_query_tokens: int | None = None
+        single_spec_flash_q4_prebuilt = False
+        grouped_metadata = self.grouped_gdn_spec_metadata_tensors
+        if for_cudagraph_capture or ubatch_slices is not None or not use_spec_decode:
+            self.single_spec_q4_attn_metadata_cache.clear()
+
+        def _maybe_build_grouped_gdn_metadata() -> None:
+            nonlocal grouped_gdn_metadata_prebuilt, grouped_gdn_real_query_tokens
+            nonlocal single_spec_flash_q4_prebuilt
+            if (
+                grouped_metadata is None
+                or grouped_gdn_metadata_prebuilt
+                or for_cudagraph_capture
+                or ubatch_slices is not None
+            ):
+                return
+            query_lens_cpu = (
+                cm_base.query_start_loc_cpu[1:] - cm_base.query_start_loc_cpu[:-1]
+            )
+            batch_size = int(cm_base.num_actual_tokens)
+            real_query_tokens = int(query_lens_cpu[0].item())
+            single_live_spec = (
+                num_reqs == 1
+                and self.max_spec_state_slots == 4
+                and int(self.num_decode_draft_tokens.cpu[0].item())
+                == self.num_spec_tokens
+                and real_query_tokens == self.max_spec_state_slots
+                and int(torch.count_nonzero(query_lens_cpu).item()) == 1
+                and ddtree_parent_metadata is None
+                and not os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR")
+                and batch_size <= grouped_metadata["spec_state_indices_tensor"].shape[1]
+                and real_query_tokens <= batch_size
+            )
+            if not single_live_spec:
+                return
+
+            # Populate and commit the source state-ID table before the grouped
+            # kernel consumes every cache-group slice.
+            _get_current_mamba_state_block_ids(self.gdn_kv_cache_group_ids[0])
+            grouped_state_ids = self.grouped_mamba_state_block_ids
+            assert grouped_state_ids is not None
+            state_outputs = grouped_metadata["spec_state_indices_tensor"]
+            mask_outputs = grouped_metadata["spec_sequence_masks"]
+            token_outputs = grouped_metadata["spec_token_indx"]
+            query_outputs = grouped_metadata["spec_query_start_loc"]
+            accepted_outputs = grouped_metadata["num_accepted_tokens"]
+            selector_outputs = grouped_metadata["spec_state_slot_selectors"]
+            num_groups = len(self.gdn_kv_cache_group_ids)
+            if not self._qwen38_grouped_gdn_metadata_committed:
+                assert (
+                    _build_grouped_single_request_gdn_spec_metadata_kernel is not None
+                )
+                _build_grouped_single_request_gdn_spec_metadata_kernel[
+                    (batch_size, num_groups)
+                ](
+                    grouped_state_ids.gpu,
+                    grouped_state_ids.gpu.stride(0),
+                    self.num_accepted_tokens.gpu,
+                    self.spec_state_slot_selectors.gpu,
+                    state_outputs,
+                    state_outputs.stride(0),
+                    state_outputs.stride(1),
+                    mask_outputs,
+                    mask_outputs.stride(0),
+                    token_outputs,
+                    token_outputs.stride(0),
+                    query_outputs,
+                    query_outputs.stride(0),
+                    accepted_outputs,
+                    accepted_outputs.stride(0),
+                    selector_outputs,
+                    selector_outputs.stride(0),
+                    batch_size=batch_size,
+                    real_query_tokens=real_query_tokens,
+                    state_width=self.max_spec_state_slots,
+                    state_block_size=self.max_spec_state_slots,
+                    capture_only=False,
+                    pad_slot_id=PAD_SLOT_ID,
+                )
+            flash_builder = self.single_spec_flash_builder
+            flash_kv_cache_gid = self.single_spec_flash_kv_cache_gid
+            if flash_builder is not None and flash_kv_cache_gid is not None:
+                flash_source_block_table = _get_block_table(flash_kv_cache_gid)[:1]
+                if (
+                    self._qwen38_grouped_gdn_metadata_committed
+                    and os.getenv(
+                        "VLLM_QWEN38_FLASH_Q4_PREP_IN_ATTENTION",
+                        "0",
+                    )
+                    == "1"
+                    and hasattr(
+                        torch.ops.qwen38_control,
+                        "prebuild_flash_q4_metadata",
+                    )
+                ):
+                    # Validate and bind the persistent buffers now, but defer
+                    # their mutation to the first full-attention layer.  That
+                    # makes the producer and Flash consumer part of the same
+                    # attention/CUDA-graph partition; a side-effect-only op at
+                    # model entry was not ordered across that split boundary.
+                    flash_builder.graph_prebuild_single_spec_q4_args(
+                        flash_source_block_table,
+                        self.seq_lens[:1],
+                    )
+                else:
+                    flash_builder.prebuild_single_spec_q4(
+                        flash_source_block_table,
+                        self.seq_lens[:1],
+                    )
+                single_spec_flash_q4_prebuilt = True
+            grouped_gdn_metadata_prebuilt = True
+            grouped_gdn_real_query_tokens = real_query_tokens
 
         def _build_attn_group_metadata(
             kv_cache_gid: int,
@@ -3628,12 +4243,21 @@ class GPUModelRunner(
                     ],
                 )
                 if isinstance(builder, GDNAttentionMetadataBuilder):
+                    _maybe_build_grouped_gdn_metadata()
                     extra_attn_metadata_args["spec_state_slot_selectors"] = (
                         self.spec_state_slot_selectors.gpu[:num_reqs_padded]
                     )
-                if (
-                    ddtree_parent_metadata is not None
-                    and isinstance(builder, GDNAttentionMetadataBuilder)
+                    if (
+                        _build_grouped_single_request_gdn_spec_metadata_kernel
+                        is not None
+                    ):
+                        extra_attn_metadata_args["single_spec_real_query_tokens"] = (
+                            grouped_gdn_real_query_tokens
+                            if grouped_gdn_metadata_prebuilt
+                            else None
+                        )
+                if ddtree_parent_metadata is not None and isinstance(
+                    builder, GDNAttentionMetadataBuilder
                 ):
                     extra_attn_metadata_args["ddtree_parent_ids"] = (
                         ddtree_parent_metadata.parent_ids
@@ -3661,20 +4285,94 @@ class GPUModelRunner(
                     builder,
                     (FlexAttentionMetadataBuilder, FlashAttnV100MetadataBuilder),
                 )
-                and ddtree_parent_metadata is not None
             ):
-                extra_attn_metadata_args = dict(
-                    ddtree_parent_ids=ddtree_parent_metadata.parent_ids,
-                    ddtree_num_tree_tokens_cpu=(
-                        ddtree_parent_metadata.num_tree_tokens_cpu
-                    ),
+                if ddtree_parent_metadata is not None:
+                    extra_attn_metadata_args = dict(
+                        ddtree_parent_ids=ddtree_parent_metadata.parent_ids,
+                        ddtree_num_tree_tokens_cpu=(
+                            ddtree_parent_metadata.num_tree_tokens_cpu
+                        ),
+                    )
+                if (
+                    isinstance(builder, FlashAttnV100MetadataBuilder)
+                    and grouped_gdn_metadata_prebuilt
+                ):
+                    extra_attn_metadata_args["single_spec_real_query_tokens"] = (
+                        grouped_gdn_real_query_tokens
+                    )
+                    extra_attn_metadata_args["single_spec_q4_prebuilt"] = (
+                        single_spec_flash_q4_prebuilt
+                    )
+
+            q4_reuse_key: tuple[object, ...] | None = None
+            reuse_slot = (kv_cache_gid, attn_gid)
+            can_reuse_gdn = (
+                isinstance(builder, GDNAttentionMetadataBuilder)
+                and grouped_gdn_metadata_prebuilt
+            )
+            can_reuse_flash = (
+                isinstance(builder, FlashAttnV100MetadataBuilder)
+                and grouped_gdn_metadata_prebuilt
+                and single_spec_flash_q4_prebuilt
+            )
+            if (
+                envs.VLLM_SM70_Q4_ATTN_METADATA_REUSE
+                and ubid is None
+                and not for_cudagraph_capture
+                and grouped_gdn_real_query_tokens == 4
+                and cascade_attn_prefix_len == 0
+                and len(self.input_batch.req_ids) == 1
+                and (can_reuse_gdn or can_reuse_flash)
+            ):
+                pointer_tensors = (
+                    common_attn_metadata.query_start_loc,
+                    common_attn_metadata.query_start_loc_cpu,
+                    common_attn_metadata.seq_lens,
+                    common_attn_metadata.seq_lens_cpu_upper_bound,
+                    common_attn_metadata.block_table_tensor,
+                    common_attn_metadata.slot_mapping,
                 )
+                if all(tensor is not None for tensor in pointer_tensors):
+                    q4_reuse_key = (
+                        self.input_batch.req_ids[0],
+                        kv_cache_gid,
+                        attn_gid,
+                        id(builder),
+                        int(common_attn_metadata.num_actual_tokens),
+                        int(common_attn_metadata.num_reqs),
+                        int(common_attn_metadata.max_query_len),
+                        tuple(
+                            (
+                                tensor.data_ptr(),
+                                tuple(tensor.shape),
+                                tuple(tensor.stride()),
+                                tensor.dtype,
+                                tensor.device,
+                            )
+                            for tensor in pointer_tensors
+                            if tensor is not None
+                        ),
+                    )
+
+            reused_entry = self.single_spec_q4_attn_metadata_cache.get(reuse_slot)
 
             if for_cudagraph_capture:
                 builder_path = "capture"
                 attn_metadata_i = builder.build_for_cudagraph_capture(
                     common_attn_metadata
                 )
+            elif (
+                q4_reuse_key is not None
+                and reused_entry is not None
+                and reused_entry[0] == q4_reuse_key
+            ):
+                builder_path = "q4_reused"
+                attn_metadata_i = reused_entry[1]
+                if isinstance(builder, FlashAttnV100MetadataBuilder):
+                    builder.refresh_prebuilt_single_spec_q4_metadata(
+                        attn_metadata_i,
+                        common_attn_metadata,
+                    )
             elif (
                 cache_key in cached_attn_metadata
                 and builder.supports_update_block_table
@@ -3694,6 +4392,14 @@ class GPUModelRunner(
                 )
                 if builder.supports_update_block_table:
                     cached_attn_metadata[cache_key] = attn_metadata_i
+
+            if q4_reuse_key is None:
+                self.single_spec_q4_attn_metadata_cache.pop(reuse_slot, None)
+            elif builder_path != "q4_reused":
+                self.single_spec_q4_attn_metadata_cache[reuse_slot] = (
+                    q4_reuse_key,
+                    attn_metadata_i,
+                )
 
             if trace_builders:
                 logger.info(
@@ -3736,10 +4442,7 @@ class GPUModelRunner(
                 cm.block_table_tensor = _get_block_table(kv_cache_gid)
                 cm.slot_mapping = slot_mappings[kv_cache_gid]
 
-            if (
-                hasattr(self, "drafter")
-                and spec_decode_common_attn_metadata is None
-            ):
+            if self.drafter is not None and spec_decode_common_attn_metadata is None:
                 if isinstance(
                     self.drafter,
                     (
@@ -4063,6 +4766,16 @@ class GPUModelRunner(
         num_draft_tokens: np.ndarray,
         cu_num_scheduled_tokens: np.ndarray,
     ) -> SpecDecodeMetadata:
+        static_metadata = self.qwen38_v100_executor.make_q4_spec_decode_metadata(
+            num_draft_tokens=num_draft_tokens,
+            cu_num_scheduled_tokens=cu_num_scheduled_tokens,
+            input_ids=self.input_ids.gpu,
+        )
+        if (
+            static_metadata is not None
+            and self.qwen38_v100_executor.static_metadata_enabled
+        ):
+            return static_metadata
         # Inputs:
         # cu_num_scheduled_tokens:  [  4, 104, 107, 207, 209]
         # num_draft_tokens:         [  3,   0,   2,   0,   1]
@@ -4128,7 +4841,7 @@ class GPUModelRunner(
         draft_token_ids = self.input_ids.gpu[logits_indices]
         draft_token_ids = draft_token_ids[target_logits_indices + 1]
 
-        return SpecDecodeMetadata(
+        reference_metadata = SpecDecodeMetadata(
             draft_token_ids=draft_token_ids,
             num_draft_tokens=num_draft_tokens.tolist(),
             cu_num_draft_tokens=cu_num_draft_tokens,
@@ -4137,6 +4850,19 @@ class GPUModelRunner(
             bonus_logits_indices=bonus_logits_indices,
             logits_indices=logits_indices,
         )
+        if static_metadata is not None and self.qwen38_v100_executor.metadata_compare:
+            mismatches = self.qwen38_v100_executor.compare_and_store_shadow_metadata(
+                static_metadata,
+                reference_metadata,
+            )
+            key = ("construction", mismatches)
+            if key not in self._qwen38_v100_metadata_compare_seen:
+                self._qwen38_v100_metadata_compare_seen.add(key)
+                logger.warning(
+                    "Qwen3.8 V100 metadata compare phase=construction mismatches=%s",
+                    mismatches,
+                )
+        return reference_metadata
 
     def _prepare_kv_sharing_fast_prefill(
         self,
@@ -4839,9 +5565,7 @@ class GPUModelRunner(
 
         num_reqs = self.input_batch.num_reqs
         query_start_loc_cpu = self.query_start_loc.cpu[: num_reqs + 1].clone()
-        query_start_loc_gpu = self.query_start_loc.gpu[
-            : num_reqs + 1
-        ].detach().cpu()
+        query_start_loc_gpu = self.query_start_loc.gpu[: num_reqs + 1].detach().cpu()
 
         metadata: dict[str, Any] = {
             "num_reqs": num_reqs,
@@ -4972,6 +5696,18 @@ class GPUModelRunner(
                 sampling_metadata=sampling_metadata,
             )
 
+        late_mismatches = self.qwen38_v100_executor.compare_late_shadow_metadata(
+            spec_decode_metadata
+        )
+        if late_mismatches is not None:
+            key = ("pre_sample", late_mismatches)
+            if key not in self._qwen38_v100_metadata_compare_seen:
+                self._qwen38_v100_metadata_compare_seen.add(key)
+                logger.warning(
+                    "Qwen3.8 V100 metadata compare phase=pre_sample mismatches=%s",
+                    late_mismatches,
+                )
+
         if logits is None:
             logits = self.model.compute_logits(sample_hidden_states)
         assert logits is not None
@@ -4998,15 +5734,12 @@ class GPUModelRunner(
                         else None
                     )
                     _dflash_ddtree_debug_log(
-                        "greedy sampler used reqs=%d first_accepted=%s "
-                        "first_output=%s",
+                        "greedy sampler used reqs=%d first_accepted=%s first_output=%s",
                         len(ddtree_result.verification_results),
                         None
                         if first_result is None
                         else first_result.accepted_node_indices,
-                        None
-                        if first_result is None
-                        else first_result.output_token_ids,
+                        None if first_result is None else first_result.output_token_ids,
                     )
                 return ddtree_result.sampler_output
             _dflash_ddtree_debug_log(
@@ -5358,9 +6091,7 @@ class GPUModelRunner(
             try:
                 yield
             finally:
-                self._sm70_async_staged_input_prep_active = (
-                    previous_staged_input_prep
-                )
+                self._sm70_async_staged_input_prep_active = previous_staged_input_prep
                 if trace_log:
                     logger.info(
                         "SM70 async worker trace kind=input_prep step=%d "
@@ -5376,9 +6107,7 @@ class GPUModelRunner(
         # stream ordering without blocking the CPU here.
         if skip_sync:
             if not self._sm70_async_staged_input_prep_logged:
-                logger.info(
-                    "SM70 async staged input prep enabled for no-MTP decode."
-                )
+                logger.info("SM70 async staged input prep enabled for no-MTP decode.")
                 self._sm70_async_staged_input_prep_logged = True
             trace_body_t0 = time.perf_counter() if trace_log else 0.0
         else:
@@ -5602,6 +6331,84 @@ class GPUModelRunner(
             cudagraph_stats,
         )
 
+    def get_static_pp_intermediate_metadata(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> list[tuple[str, Any]] | None:
+        """Predict steady-state PP tensor metadata without a CPU handshake.
+
+        Native-MTP async scheduling produces a fixed-width decode batch.  Both
+        PP stages see the same SchedulerOutput, so they can independently
+        derive the CUDA-graph padded tensor shape and post P2P communication
+        before the producing stage finishes.  Dynamic shapes keep using the
+        regular send_object/recv_object metadata path.
+        """
+        if not (
+            self.pp_mtp_enabled
+            and os.getenv("VLLM_SM70_PP_STATIC_INTERMEDIATE_METADATA", "0") == "1"
+            and len(scheduler_output.num_scheduled_tokens) == 1
+            and len(scheduler_output.scheduled_spec_decode_tokens) == 1
+            and self.uniform_decode_query_len > 1
+        ):
+            return None
+
+        num_scheduled_tokens_np = np.fromiter(
+            scheduler_output.num_scheduled_tokens.values(), dtype=np.int32
+        )
+        if (
+            num_scheduled_tokens_np.size != 1
+            or int(num_scheduled_tokens_np[0]) != self.uniform_decode_query_len
+        ):
+            return None
+        draft_tokens = next(
+            iter(scheduler_output.scheduled_spec_decode_tokens.values())
+        )
+        if len(draft_tokens) + 1 != self.uniform_decode_query_len:
+            return None
+
+        _, batch_desc, _, _, _ = self._determine_batch_execution_and_padding(
+            num_tokens=int(num_scheduled_tokens_np[0]),
+            num_reqs=1,
+            num_scheduled_tokens_np=num_scheduled_tokens_np,
+            max_num_scheduled_tokens=int(num_scheduled_tokens_np[0]),
+            use_cascade_attn=False,
+        )
+
+        template = self._static_pp_intermediate_metadata_template
+        if template is None:
+            prototype = self.model.make_empty_intermediate_tensors(
+                batch_size=1,
+                dtype=self.model_config.dtype,
+                device=self.device,
+            )
+            template = tuple(
+                (
+                    key,
+                    value.device.type,
+                    # The SM70 fused all-reduce + Gemma RMSNorm path keeps
+                    # the inter-stage residual accumulator in FP32 even
+                    # though the model's generic empty-tensor factory uses
+                    # model dtype for every entry. The sender-side metadata
+                    # assertion below remains the authority for this opt-in
+                    # fast path.
+                    torch.float32 if key == "residual" else value.dtype,
+                    value.shape[1:],
+                )
+                for key, value in prototype.items()
+            )
+            self._static_pp_intermediate_metadata_template = template
+
+        return [
+            (
+                key,
+                TensorMetadata(
+                    device,
+                    dtype,
+                    torch.Size((batch_desc.num_tokens, *tail_shape)),
+                ),
+            )
+            for key, device, dtype, tail_shape in template
+        ]
+
     def _register_layerwise_nvtx_hooks(self) -> None:
         """
         Register layerwise NVTX hooks if --enable-layerwise-nvtx-tracing is enabled
@@ -5721,6 +6528,172 @@ class GPUModelRunner(
         num_reqs = self.input_batch.num_reqs
         return bool(self.discard_request_mask.np[:num_reqs].all())
 
+    def _sm70_prompt_tail_key(self) -> int | None:
+        if self.input_batch.num_reqs != 1:
+            return None
+        prompt_len = int(self.input_batch.num_prompt_tokens[0])
+        if prompt_len <= 0:
+            return None
+        tokens = self.input_batch.token_ids_cpu[0, :prompt_len]
+        return hash(tokens.tobytes())
+
+    def _sm70_prompt_tail_len(self) -> int:
+        prompt_len = int(self.input_batch.num_prompt_tokens[0])
+        block_size = max(int(self.cache_config.block_size or 16), 1)
+        return prompt_len % block_size
+
+    def _sm70_tail_page_views(self) -> list[torch.Tensor]:
+        req_id = self.input_batch.req_ids[0]
+        req_state = self.requests.get(req_id)
+        if req_state is None or req_state.block_ids is None:
+            return []
+        state_idx = self.mamba_state_idx.get(req_id)
+        ctx = self.compilation_config.static_forward_context
+        pages: list[torch.Tensor] = []
+        mamba_pages = 0
+        for gid, group in enumerate(self.kv_cache_config.kv_cache_groups):
+            if gid >= len(req_state.block_ids):
+                return []
+            block_ids = req_state.block_ids[gid]
+            if not block_ids:
+                return []
+            if isinstance(group.kv_cache_spec, MambaSpec):
+                if state_idx is None or not (0 <= state_idx < len(block_ids)):
+                    return []
+                bid = int(block_ids[state_idx])
+            else:
+                bid = int(block_ids[-1])
+            if bid < 0:
+                return []
+            for name in group.layer_names:
+                layer = ctx.get(name)
+                cache = getattr(layer, "kv_cache", None) if layer is not None else None
+                tensors: list[torch.Tensor] = []
+                if torch.is_tensor(cache):
+                    tensors = [cache]
+                elif isinstance(cache, (list, tuple)):
+                    tensors = [t for t in cache if torch.is_tensor(t)]
+                for tensor in tensors:
+                    if tensor.ndim < 1 or bid >= tensor.shape[0]:
+                        return []
+                    pages.append(tensor[bid])
+                    if isinstance(group.kv_cache_spec, MambaSpec):
+                        mamba_pages += 1
+        if mamba_pages <= 0:
+            return []
+        return pages
+
+    def _sm70_prompt_tail_will_replay(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_tokens: int,
+    ) -> bool:
+        if os.getenv("VLLM_SM70_PROMPT_TAIL_CACHE", "1") != "1":
+            return False
+        if self.input_batch.num_reqs != 1:
+            return False
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return False
+        tail = self._sm70_prompt_tail_len()
+        if tail <= 1 or num_tokens != tail:
+            return False
+        key = self._sm70_prompt_tail_key()
+        return bool(key is not None and key in self._sm70_prompt_tail_cache)
+
+    def _sm70_collapse_cached_prompt_tail(
+        self, scheduler_output: "SchedulerOutput"
+    ) -> "SchedulerOutput":
+        if os.getenv("VLLM_SM70_PROMPT_TAIL_CACHE", "1") != "1":
+            return scheduler_output
+        if self.input_batch.num_reqs != 1:
+            return scheduler_output
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return scheduler_output
+        req_id = self.input_batch.req_ids[0]
+        scheduled = int(scheduler_output.num_scheduled_tokens.get(req_id, 0))
+        tail = self._sm70_prompt_tail_len()
+        if tail <= 1 or scheduled != tail:
+            return scheduler_output
+        key = self._sm70_prompt_tail_key()
+        if key is None or key not in self._sm70_prompt_tail_cache:
+            return scheduler_output
+        prompt_len = int(self.input_batch.num_prompt_tokens[0])
+        self.input_batch.num_computed_tokens[0] = prompt_len - 1
+        req_state = self.requests.get(req_id)
+        if req_state is not None:
+            req_state.num_computed_tokens = prompt_len - 1
+        tokens = dict(scheduler_output.num_scheduled_tokens)
+        tokens[req_id] = 1
+        return replace(
+            scheduler_output,
+            num_scheduled_tokens=tokens,
+            total_num_scheduled_tokens=sum(tokens.values()),
+        )
+
+    def _sm70_try_load_prompt_tail(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_tokens: int,
+    ) -> object | None:
+        if os.getenv("VLLM_SM70_PROMPT_TAIL_CACHE", "1") != "1":
+            return None
+        if self.input_batch.num_reqs != 1:
+            return None
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return None
+        tail = self._sm70_prompt_tail_len()
+        if tail <= 1 or num_tokens != tail:
+            return None
+        key = self._sm70_prompt_tail_key()
+        entry = self._sm70_prompt_tail_cache.get(key) if key is not None else None
+        if entry is None:
+            return None
+        hidden = entry.get("hidden")
+        pages = entry.get("pages")
+        if not torch.is_tensor(hidden) or hidden.shape[0] != tail:
+            return None
+        dest = self._sm70_tail_page_views()
+        if not isinstance(pages, list) or not dest or len(pages) != len(dest):
+            return None
+        try:
+            for src, dst in zip(pages, dest):
+                if not torch.is_tensor(src) or src.shape != dst.shape:
+                    return None
+                dst.copy_(src)
+        except Exception:
+            return None
+        return hidden
+
+    def _sm70_try_save_prompt_tail(
+        self,
+        scheduler_output: "SchedulerOutput",
+        num_tokens: int,
+        hidden_states: object,
+    ) -> None:
+        if os.getenv("VLLM_SM70_PROMPT_TAIL_CACHE", "1") != "1":
+            return
+        if self.input_batch.num_reqs != 1:
+            return
+        if scheduler_output.scheduled_spec_decode_tokens:
+            return
+        tail = self._sm70_prompt_tail_len()
+        if tail <= 1 or num_tokens != tail:
+            return
+        if not torch.is_tensor(hidden_states) or hidden_states.shape[0] < tail:
+            return
+        key = self._sm70_prompt_tail_key()
+        if key is None:
+            return
+        views = self._sm70_tail_page_views()
+        if not views:
+            return
+        pages = [page.detach().clone() for page in views]
+        self._sm70_prompt_tail_cache.clear()
+        self._sm70_prompt_tail_cache[key] = {
+            "hidden": hidden_states[:tail].detach().clone(),
+            "pages": pages,
+        }
+
     @torch.inference_mode()
     def execute_model(
         self,
@@ -5751,6 +6724,7 @@ class GPUModelRunner(
         trace_slot_mapping_ms = 0.0
         trace_attn_metadata_ms = 0.0
         trace_model_preprocess_ms = 0.0
+        qwen38_q4_shape_matched = False
 
         if self.routed_experts_initialized:
             self.routed_experts_capturer.clear_buffer()
@@ -5845,6 +6819,39 @@ class GPUModelRunner(
                 scheduler_output,
                 num_scheduled_tokens_np,
             )
+            if self.qwen38_v100_executor.support.eligible:
+                step_decision = self.qwen38_v100_executor.observe_verify_q4(
+                    num_reqs=num_reqs,
+                    num_tokens=num_tokens_unpadded,
+                    spec_decode_metadata=spec_decode_metadata,
+                )
+                qwen38_q4_shape_matched = step_decision.shape_matched
+                if step_decision.reason not in self._qwen38_v100_step_reasons_seen:
+                    self._qwen38_v100_step_reasons_seen.add(step_decision.reason)
+                    log_fn = (
+                        logger.warning
+                        if step_decision.reason
+                        is Qwen38V100StepReason.EXECUTION_NOT_IMPLEMENTED
+                        else logger.info
+                    )
+                    log_fn(
+                        "Qwen3.8 V100 executor step shape_matched=%s "
+                        "should_execute=%s reason=%s detail=%s",
+                        step_decision.shape_matched,
+                        step_decision.should_execute,
+                        step_decision.reason.value,
+                        step_decision.detail,
+                    )
+                elif (
+                    step_decision.shape_matched
+                    and self.qwen38_v100_executor.eligible_steps % 256 == 0
+                ):
+                    logger.info(
+                        "Qwen3.8 V100 executor shadow summary observed=%d "
+                        "shape_matched=%d",
+                        self.qwen38_v100_executor.observed_steps,
+                        self.qwen38_v100_executor.eligible_steps,
+                    )
             if trace_log:
                 trace_prepare_inputs_ms = (
                     time.perf_counter() - trace_prepare_inputs_t0
@@ -5922,32 +6929,68 @@ class GPUModelRunner(
 
             if self.cache_config.mamba_cache_mode == "align":
                 trace_mamba_t0 = time.perf_counter() if trace_log else 0.0
-                # preprocess_mamba reads req_state.num_computed_tokens (CPU)
-                # to decide copy operations, so we must apply deferred
-                # corrections before it runs.
-                if deferred_state_corrections_fn:
+                # preprocess_mamba normally needs the rejection-corrected CPU
+                # token count before deciding whether to move the running GDN
+                # state. The batch-one SM70 authority predicate is stricter: it
+                # proves every possible accepted count stays in the same state
+                # block, so preprocess_mamba cannot issue a state copy and does
+                # not consume the exact intra-block count. Keep the correction
+                # deferred in that case; it will synchronize after the target
+                # forward has been launched, overlapping the tiny D2H with the
+                # verifier instead of leaving it on the launch-critical path.
+                if (
+                    deferred_state_corrections_fn
+                    and not self._sm70_async_spec_accept_gpu_authority_active
+                ):
                     deferred_state_corrections_fn()
                     deferred_state_corrections_fn = None
                 mamba_bufs = self._get_mamba_bufs()
-                mamba_utils.preprocess_mamba(
-                    scheduler_output,
-                    self.kv_cache_config,
-                    self.cache_config,
-                    self.mamba_state_idx,
-                    self.input_batch,
-                    self.requests,
-                    self.compilation_config.static_forward_context,
-                    self.model.get_mamba_state_copy_func(),
-                    mamba_bufs.preprocess,
-                )
+                if self._pp_mtp_gpu_counts_active:
+                    postprocess_ctx = mamba_bufs.postprocess_align
+                    assert postprocess_ctx is not None
+                    prev_state_idx_buf = postprocess_ctx.preprocess_prev_state_idx_buf
+                    curr_state_idx_buf = postprocess_ctx.preprocess_curr_state_idx_buf
+                    assert prev_state_idx_buf is not None
+                    assert curr_state_idx_buf is not None
+                    mamba_utils.stage_preprocess_mamba_indices_to_gpu(
+                        scheduler_output,
+                        self.mamba_state_idx,
+                        self.input_batch,
+                        self.requests,
+                        mamba_bufs.preprocess.mamba_spec,
+                        prev_state_idx_buf,
+                        curr_state_idx_buf,
+                        num_reqs,
+                    )
+                    postprocess_ctx.run_fused_preprocess(
+                        num_reqs,
+                        self.num_accepted_tokens.gpu,
+                        self.spec_state_slot_selectors.gpu,
+                    )
+                else:
+                    mamba_utils.preprocess_mamba(
+                        scheduler_output,
+                        self.kv_cache_config,
+                        self.cache_config,
+                        self.mamba_state_idx,
+                        self.input_batch,
+                        self.requests,
+                        self.compilation_config.static_forward_context,
+                        self.model.get_mamba_state_copy_func(),
+                        mamba_bufs.preprocess,
+                    )
                 # preprocess_mamba resets num_accepted_tokens_cpu to 1
                 # for requests whose state was copied to a new block.
                 # Re-sync to GPU so the mamba kernel reads from the
                 # correct initial state slot (init_token_idx = 0).
-                self.num_accepted_tokens.np[:num_reqs] = (
-                    self.input_batch.num_accepted_tokens_cpu[:num_reqs]
-                )
-                self._copy_buffer_to_gpu(self.num_accepted_tokens, num_reqs)
+                if (
+                    not self._sm70_async_spec_accept_gpu_authority_active
+                    and not self._pp_mtp_gpu_counts_active
+                ):
+                    self.num_accepted_tokens.np[:num_reqs] = (
+                        self.input_batch.num_accepted_tokens_cpu[:num_reqs]
+                    )
+                    self._copy_buffer_to_gpu(self.num_accepted_tokens, num_reqs)
                 if trace_log:
                     trace_mamba_preprocess_ms = (
                         time.perf_counter() - trace_mamba_t0
@@ -5996,16 +7039,47 @@ class GPUModelRunner(
                 ) * 1000.0
 
             trace_model_preprocess_t0 = time.perf_counter() if trace_log else 0.0
-            (
-                input_ids,
-                inputs_embeds,
-                positions,
-                intermediate_tensors,
-                model_kwargs,
-                ec_connector_output,
-            ) = self._preprocess(
-                scheduler_output, num_tokens_padded, intermediate_tensors
-            )
+            q4_model_inputs = None
+            if (
+                envs.VLLM_QWEN38_EXL3_SM70_FAST_PREPROCESS
+                and qwen38_q4_shape_matched
+                and num_tokens_unpadded == 4
+                and num_tokens_padded == 4
+                and num_reqs == 1
+                and intermediate_tensors is None
+                and not self.supports_mm_inputs
+                and not self.enable_prompt_embeds
+                and not self.uses_mrope
+                and self.uses_xdrope_dim == 0
+                and not self.model_config.is_encoder_decoder
+                and not self.is_pooling_model
+                and not scheduler_output.scheduled_encoder_inputs
+            ):
+                q4_model_inputs = (
+                    self.qwen38_v100_executor.prepare_q4_text_model_inputs(
+                        input_ids=self.input_ids.gpu,
+                        positions=self.positions,
+                    )
+                )
+            if q4_model_inputs is not None:
+                input_ids, positions = q4_model_inputs
+                inputs_embeds = None
+                model_kwargs = {}
+                ec_connector_output = None
+                logger.info_once(
+                    "Using Qwen3.8 EXL3 SM70 fixed-q4 text preprocessing"
+                )
+            else:
+                (
+                    input_ids,
+                    inputs_embeds,
+                    positions,
+                    intermediate_tensors,
+                    model_kwargs,
+                    ec_connector_output,
+                ) = self._preprocess(
+                    scheduler_output, num_tokens_padded, intermediate_tensors
+                )
             if trace_log:
                 trace_model_preprocess_ms = (
                     time.perf_counter() - trace_model_preprocess_t0
@@ -6030,9 +7104,7 @@ class GPUModelRunner(
             )
 
         if trace_log:
-            trace_preprocess_ms = (
-                time.perf_counter() - trace_preprocess_t0
-            ) * 1000.0
+            trace_preprocess_ms = (time.perf_counter() - trace_preprocess_t0) * 1000.0
 
         # Set cudagraph mode to none if calc_kv_scales is true.
         # KV scales calculation involves dynamic operations that are incompatible
@@ -6076,17 +7148,24 @@ class GPUModelRunner(
                 defer_finalize=defer_kv_connector_finalize,
             ) as kv_connector_output,
         ):
-            model_output = self._model_forward(
-                input_ids=input_ids,
-                positions=positions,
-                intermediate_tensors=intermediate_tensors,
-                inputs_embeds=inputs_embeds,
-                **model_kwargs,
+            cached_output = self._sm70_try_load_prompt_tail(
+                scheduler_output, num_tokens_unpadded
             )
+            if cached_output is not None:
+                model_output = cached_output
+            else:
+                model_output = self._model_forward(
+                    input_ids=input_ids,
+                    positions=positions,
+                    intermediate_tensors=intermediate_tensors,
+                    inputs_embeds=inputs_embeds,
+                    **model_kwargs,
+                )
+                self._sm70_try_save_prompt_tail(
+                    scheduler_output, num_tokens_unpadded, model_output
+                )
         if trace_log:
-            trace_forward_submit_ms = (
-                time.perf_counter() - trace_forward_t0
-            ) * 1000.0
+            trace_forward_submit_ms = (time.perf_counter() - trace_forward_t0) * 1000.0
         self._sm70_mtp_profile_finish(
             mtp_profile_events, "target_forward", mtp_forward_start
         )
@@ -6106,6 +7185,12 @@ class GPUModelRunner(
                 if not get_pp_group().is_last_rank:
                     # Return the intermediate tensors.
                     assert isinstance(hidden_states, IntermediateTensors)
+                    if self.pp_mtp_enabled:
+                        if self._pp_mtp_pending_scheduler_output is not None:
+                            raise RuntimeError(
+                                "previous non-final PP MTP step was not consumed"
+                            )
+                        self._pp_mtp_pending_scheduler_output = scheduler_output
                     self.kv_connector_output = kv_connector_output
                     return hidden_states
 
@@ -6164,9 +7249,7 @@ class GPUModelRunner(
                 )
 
         if trace_log:
-            trace_postprocess_ms = (
-                time.perf_counter() - trace_postprocess_t0
-            ) * 1000.0
+            trace_postprocess_ms = (time.perf_counter() - trace_postprocess_t0) * 1000.0
 
         sample_hidden_ready_event = _record_sm70_sample_hidden_ready_event(
             sample_hidden_states, cudagraph_mode
@@ -6258,7 +7341,10 @@ class GPUModelRunner(
             self.kv_connector_output = None
             # receive sampled token ids from the last PP rank.
             if self.use_async_scheduling and not get_pp_group().is_last_rank:
-                self._pp_receive_prev_sampled_token_ids_to_input_batch()
+                if self.pp_mtp_enabled:
+                    self._pp_receive_mtp_result_payload()
+                else:
+                    self._pp_receive_prev_sampled_token_ids_to_input_batch()
             # In case of PP with kv transfer, we need to pass through the
             # kv_connector_output
             if trace_log:
@@ -6297,9 +7383,7 @@ class GPUModelRunner(
             sample_hidden_states, sample_hidden_ready_event
         )
         if trace_log:
-            trace_wait_hidden_ms = (
-                time.perf_counter() - trace_wait_hidden_t0
-            ) * 1000.0
+            trace_wait_hidden_ms = (time.perf_counter() - trace_wait_hidden_t0) * 1000.0
 
         trace_logits_t0 = time.perf_counter() if trace_log else 0.0
         if grammar_output is not None and logits is None:
@@ -6350,6 +7434,11 @@ class GPUModelRunner(
             sampler_output.sampled_token_ids,
             scheduler_output,
             sampler_output.ddtree_accepted_node_indices,
+            valid_sampled_token_count=(
+                sampler_output.valid_sampled_token_count
+                if self._sm70_fused_rejection_aux_enabled
+                else None
+            ),
         )
         self._compact_ddtree_drafter_context(
             hidden_states,
@@ -6363,13 +7452,10 @@ class GPUModelRunner(
             # PP outputs have been broadcasted to all ranks at logits computation.
             # Therefore, here is no need to send sampled token ids again in this case.
             if not self.broadcast_pp_output and pp.world_size > 1 and pp.is_last_rank:
-                sampled_token_ids = sampler_output.sampled_token_ids
-                # MTP verification returns [num_reqs, num_spec_tokens + 1].
-                # Earlier PP stages need only the committed target token here;
-                # scheduled draft tokens are materialized separately below.
-                if self.speculative_config and self.speculative_config.method == "mtp":
-                    sampled_token_ids = sampled_token_ids[:, :1].contiguous()
-                self._pp_broadcast_prev_sampled_token_ids(sampled_token_ids)
+                if not self.pp_mtp_enabled:
+                    self._pp_broadcast_prev_sampled_token_ids(
+                        sampler_output.sampled_token_ids
+                    )
 
         self._draft_token_ids = None
         self._draft_probs = None
@@ -6404,6 +7490,10 @@ class GPUModelRunner(
                     spec_decode_metadata,
                     spec_decode_common_attn_metadata,
                     slot_mappings,
+                    rejection_valid_sampled_token_count=(
+                        sampler_output.valid_sampled_token_count
+                    ),
+                    rejection_next_token_ids=sampler_output.next_token_ids,
                 )
                 self._sm70_mtp_profile_finish(
                     None if mtp_profile_ctx is None else mtp_profile_ctx["events"],
@@ -6544,6 +7634,14 @@ class GPUModelRunner(
             # tokens on the CPU, so they are run after bookkeeping.
             propose_draft_token_ids(valid_sampled_token_ids)
 
+        if self.pp_mtp_enabled:
+            pp = get_pp_group()
+            if pp.is_last_rank:
+                self._pp_broadcast_mtp_result_payload(
+                    sampler_output.sampled_token_ids,
+                    self._draft_token_ids,
+                )
+
         # Finalize KV connector (wait_for_save + clear metadata) after
         # draft model runs. Deferred from target model forward to allow
         # draft model to also save its KV cache.
@@ -6662,6 +7760,120 @@ class GPUModelRunner(
             )
         return async_output
 
+    def _stage_pp_mtp_request_fingerprints(self) -> torch.Tensor:
+        fingerprints_cpu = self._pp_mtp_request_fingerprints_cpu
+        fingerprints_gpu = self._pp_mtp_request_fingerprints_gpu
+        assert fingerprints_cpu is not None
+        assert fingerprints_gpu is not None
+        num_reqs = self.input_batch.num_reqs
+        fingerprints_cpu.fill_(-1)
+        for index, req_id in enumerate(self.input_batch.req_ids[:num_reqs]):
+            fingerprints_cpu[index] = request_fingerprint(req_id)
+        fingerprints_gpu.copy_(fingerprints_cpu, non_blocking=True)
+        return fingerprints_gpu
+
+    def _pp_broadcast_mtp_result_payload(
+        self,
+        sampled_token_ids: torch.Tensor,
+        next_draft_token_ids: list[list[int]] | torch.Tensor | None,
+    ) -> None:
+        """Broadcast committed-result metadata and PP1's real next drafts."""
+        pp = get_pp_group()
+        assert pp.is_last_rank
+        payload = self._pp_mtp_payload
+        assert payload is not None
+        self._pp_mtp_payload_epoch += 1
+        request_fingerprints = self._stage_pp_mtp_request_fingerprints()
+        num_reqs = self.input_batch.num_reqs
+        request_valid = ~self.discard_request_mask.gpu[:num_reqs]
+        next_drafts_gpu = (
+            next_draft_token_ids if torch.is_tensor(next_draft_token_ids) else None
+        )
+        pack_pp_mtp_payload(
+            payload,
+            sampled_token_ids,
+            request_fingerprints,
+            request_valid,
+            self._pp_mtp_payload_epoch,
+            next_drafts_gpu,
+        )
+        # Fixed count and address on every step, including chunked prefill.
+        # A rank-local skip predicate can diverge and deadlock NCCL.
+        torch.distributed.broadcast(payload, src=pp.rank, group=pp.device_group)
+
+    def _pp_receive_mtp_result_payload(self) -> None:
+        """Receive and device-validate PP1's native-MTP result payload."""
+        pp = get_pp_group()
+        assert not pp.is_last_rank
+        payload = self._pp_mtp_payload
+        assert payload is not None
+        self._pp_mtp_payload_epoch += 1
+        request_fingerprints = self._stage_pp_mtp_request_fingerprints()
+        torch.distributed.broadcast(payload, src=pp.last_rank, group=pp.device_group)
+
+        num_reqs = self.input_batch.num_reqs
+        payload_ok = validate_pp_mtp_payload(
+            payload,
+            request_fingerprints,
+            ~self.discard_request_mask.gpu[:num_reqs],
+            self._pp_mtp_payload_epoch,
+            num_reqs,
+            self.num_spec_tokens,
+        )
+        torch._assert_async(
+            payload_ok,
+            "stale or malformed native-MTP pipeline payload",
+        )
+        committed, _, valid_sampled, _, next_draft_token_ids = unpack_pp_mtp_payload(
+            payload, num_reqs
+        )
+        committed_token_ids = self._pp_mtp_committed_token_ids
+        assert committed_token_ids is not None
+        committed_token_ids[:num_reqs].copy_(committed)
+        self._copy_valid_sampled_token_count(
+            committed_token_ids[:num_reqs], valid_sampled
+        )
+        # Keep this fixed-address GPU view alive across the next execute_model.
+        # Async scheduling intentionally publishes -1 placeholders; only PP1
+        # has the actual MTP samples, so PP0 must scatter from this payload.
+        self._draft_token_ids = next_draft_token_ids
+
+        if self.model_config.is_hybrid:
+            scheduler_output = self._pp_mtp_pending_scheduler_output
+            if scheduler_output is None:
+                raise RuntimeError(
+                    "missing scheduler output for non-final PP MTP GDN rollback"
+                )
+            self._update_states_after_model_execute(
+                None,
+                scheduler_output,
+                valid_sampled_token_count=valid_sampled,
+                copy_counts_to_cpu=False,
+            )
+        self._pp_mtp_pending_scheduler_output = None
+
+        self._pp_reconcile_received_token_bookkeeping()
+
+    def _pp_reconcile_received_token_bookkeeping(self) -> None:
+        """Maintain conservative CPU mirrors without reading accepted counts."""
+        num_reqs = self.input_batch.num_reqs
+        discard_req_indices = np.nonzero(self.discard_request_mask.np[:num_reqs])[0]
+        discard_req_indices_set = set(discard_req_indices)
+        prev_req_id_to_index: dict[str, int] = {}
+        for index, req_id in enumerate(self.input_batch.req_ids):
+            if index in discard_req_indices_set:
+                continue
+            prev_req_id_to_index[req_id] = index
+            if (req_state := self.requests.get(req_id)) is not None:
+                # The mandatory committed token is CPU-known even when the
+                # accepted draft prefix is not. Scheduler output reconciles the
+                # exact length before the following input is built.
+                req_state.output_token_ids.append(-1)
+            position = self.input_batch.num_tokens_no_spec[index]
+            self.input_batch.is_token_ids[index, position] = True
+            self.input_batch.num_tokens_no_spec[index] = position + 1
+        self.input_batch.prev_req_id_to_index = prev_req_id_to_index
+
     def _pp_broadcast_prev_sampled_token_ids(
         self, sampled_token_ids: torch.Tensor
     ) -> None:
@@ -6678,50 +7890,6 @@ class GPUModelRunner(
             torch.distributed.broadcast(
                 sampled_token_ids, src=pp.rank, group=pp.device_group
             )
-
-    def _pp_materialize_mtp_draft_token_ids(
-        self,
-        scheduled_spec_tokens: Mapping[str, Sequence[int]],
-        prev_positions: np.ndarray,
-        num_reqs: int,
-    ) -> None:
-        """Materialize scheduler-provided MTP tokens on a non-final PP stage.
-
-        Native MTP executes only on the final pipeline stage, but every stage
-        must verify the scheduler's draft slots on the next iteration. The
-        scheduler already broadcasts those exact token IDs to all workers;
-        rebuilding the small local tensor here avoids introducing a collective
-        into the asynchronous PP execution path.
-        """
-        assert self.num_spec_tokens is not None
-        max_prev_index = max(
-            (int(prev_positions[index]) for index in range(num_reqs)), default=-1
-        )
-        if max_prev_index < 0:
-            return
-
-        draft_token_ids = torch.zeros(
-            (max_prev_index + 1, self.num_spec_tokens),
-            dtype=torch.int64,
-            pin_memory=self.pin_memory,
-        )
-        for current_index in range(num_reqs):
-            previous_index = int(prev_positions[current_index])
-            if previous_index < 0:
-                continue
-            token_ids = scheduled_spec_tokens.get(
-                self.input_batch.req_ids[current_index], ()
-            )
-            if len(token_ids) > self.num_spec_tokens:
-                raise RuntimeError(
-                    "Scheduler supplied more native-MTP draft tokens than "
-                    f"configured: {len(token_ids)} > {self.num_spec_tokens}."
-                )
-            if token_ids:
-                draft_token_ids[previous_index, : len(token_ids)] = torch.tensor(
-                    token_ids, dtype=torch.int64
-                )
-        self._draft_token_ids = draft_token_ids.to(self.device, non_blocking=True)
 
     def _pp_receive_prev_sampled_token_ids_to_input_batch(self) -> None:
         """Receive sampled token ids broadcast from last PP stage"""
@@ -6899,6 +8067,8 @@ class GPUModelRunner(
         spec_decode_metadata: SpecDecodeMetadata | None,
         common_attn_metadata: CommonAttentionMetadata,
         slot_mappings: dict[str, torch.Tensor] | list[dict[str, torch.Tensor]] | None,
+        rejection_valid_sampled_token_count: torch.Tensor | None = None,
+        rejection_next_token_ids: torch.Tensor | None = None,
     ) -> list[list[int]] | torch.Tensor:
         num_scheduled_tokens = scheduler_output.total_num_scheduled_tokens
         spec_config = self.speculative_config
@@ -7059,14 +8229,30 @@ class GPUModelRunner(
                     "sampled_token_ids should be a torch.Tensor when"
                     "padded-batch is enabled."
                 )
-                next_token_ids, valid_sampled_tokens_count = (
-                    self.drafter.prepare_next_token_ids_padded(
-                        sampled_token_ids,
-                        self.requests,
-                        self.input_batch,
-                        self.discard_request_mask.gpu,
-                    )
+                reuse_rejection_aux = (
+                    self._sm70_fused_rejection_aux_enabled
+                    and rejection_valid_sampled_token_count is not None
+                    and rejection_next_token_ids is not None
+                    and spec_config.method == "mtp"
+                    and self.input_batch.num_reqs == 1
+                    and spec_decode_metadata is not None
+                    and spec_decode_metadata.num_draft_tokens == [3]
+                    and not self.discard_request_mask.np[0]
                 )
+                if reuse_rejection_aux:
+                    next_token_ids = rejection_next_token_ids
+                    valid_sampled_tokens_count = (
+                        rejection_valid_sampled_token_count
+                    )
+                else:
+                    next_token_ids, valid_sampled_tokens_count = (
+                        self.drafter.prepare_next_token_ids_padded(
+                            sampled_token_ids,
+                            self.requests,
+                            self.input_batch,
+                            self.discard_request_mask.gpu,
+                        )
+                    )
                 self._copy_valid_sampled_token_count(
                     next_token_ids, valid_sampled_tokens_count
                 )
@@ -7135,7 +8321,9 @@ class GPUModelRunner(
 
             if os.getenv("VLLM_SM70_MTP_DUMP_STEP_DIR") and spec_config.method == "mtp":
                 payload = {
-                    "req_ids": list(self.input_batch.req_ids[: self.input_batch.num_reqs]),
+                    "req_ids": list(
+                        self.input_batch.req_ids[: self.input_batch.num_reqs]
+                    ),
                     "sampled_token_ids": sampled_token_ids,
                     "next_token_ids": next_token_ids,
                     "token_indices_to_sample": token_indices_to_sample,
@@ -7219,9 +8407,7 @@ class GPUModelRunner(
                         draft_token_ids
                     )
             if hasattr(self.drafter, "take_last_ddtree_payloads"):
-                self._dflash_ddtree_payloads = (
-                    self.drafter.take_last_ddtree_payloads()
-                )
+                self._dflash_ddtree_payloads = self.drafter.take_last_ddtree_payloads()
                 first_payload = (
                     self._dflash_ddtree_payloads[0]
                     if self._dflash_ddtree_payloads
@@ -7282,7 +8468,7 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
-                if hasattr(self, "drafter"):
+                if self.drafter is not None:
                     logger.info_once("Loading drafter model...")
                     if hasattr(self.drafter, "load_model"):
                         self.drafter.load_model(self.model)
@@ -7374,6 +8560,8 @@ class GPUModelRunner(
         self.requires_sequential_video_encoding = hasattr(
             self.get_model(), "requires_sequential_video_encoding"
         )  # Temporary hack for dynamic res video w/o support for bs>1 yet
+
+        self.qwen38_v100_executor.initialize_persistent_buffers(self.device)
 
         if (
             self._moe_model is not None
@@ -7806,6 +8994,7 @@ class GPUModelRunner(
                 of max_query_len. Used to profile attention workspace that
                 scales with context length.
         """
+        self.single_spec_q4_attn_metadata_cache.clear()
         mm_config = self.vllm_config.model_config.multimodal_config
         if mm_config and mm_config.mm_encoder_only:
             # The current dummy run only covers LM execution, so we can skip it.
@@ -8144,10 +9333,14 @@ class GPUModelRunner(
             else:
                 hidden_states = outputs
 
-            if get_pp_group().is_last_rank and self.speculative_config and (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
-                or self.speculative_config.uses_extract_hidden_states()
+            if (
+                get_pp_group().is_last_rank
+                and self.speculative_config
+                and (
+                    self.speculative_config.use_eagle()
+                    or self.speculative_config.uses_draft_model()
+                    or self.speculative_config.uses_extract_hidden_states()
+                )
             ):
                 assert isinstance(
                     self.drafter,
@@ -8253,7 +9446,10 @@ class GPUModelRunner(
         dummy_metadata = SamplingMetadata(
             temperature=dummy_tensors(0.5),
             all_greedy=False,
-            all_random=False,
+            # The specialized rejection auxiliary graph must be captured with
+            # the same random-sampling branch replayed by production. Every
+            # dummy row already has temperature 0.5, so this is truthful.
+            all_random=self._sm70_fused_rejection_aux_enabled,
             top_p=dummy_tensors(0.9),
             top_k=dummy_tensors(logits.size(1) - 1),
             generators={},
@@ -8306,9 +9502,7 @@ class GPUModelRunner(
                 raise e
         if self.speculative_config:
             num_dummy_draft_tokens = max(1, self.num_spec_tokens)
-            draft_token_ids = [
-                [0] * num_dummy_draft_tokens for _ in range(num_reqs)
-            ]
+            draft_token_ids = [[0] * num_dummy_draft_tokens for _ in range(num_reqs)]
             dummy_spec_decode_metadata = SpecDecodeMetadata.make_dummy(
                 draft_token_ids, self.device
             )
@@ -8949,9 +10143,7 @@ class GPUModelRunner(
 
         capture_descs = dispatcher.get_capture_descs()
         capture_descs = [
-            (mode, descs)
-            for mode, descs in capture_descs
-            if mode == CUDAGraphMode.FULL
+            (mode, descs) for mode, descs in capture_descs if mode == CUDAGraphMode.FULL
         ]
         if not capture_descs:
             logger.debug("No separate MTP drafter CUDA graphs will be captured")
@@ -9123,9 +10315,13 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if hasattr(self, "drafter") and self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
+        if (
+            self.drafter is not None
+            and self.speculative_config
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -9176,9 +10372,13 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if hasattr(self, "drafter") and self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_extract_hidden_states()
+        if (
+            self.drafter is not None
+            and self.speculative_config
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_extract_hidden_states()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -9631,6 +10831,106 @@ class GPUModelRunner(
 
         # create metadata builders
         self.initialize_metadata_builders(kv_cache_config, kernel_block_sizes)
+
+        self.gdn_kv_cache_group_ids = tuple(
+            kv_cache_gid
+            for kv_cache_gid, attn_groups in enumerate(self.attn_groups)
+            if any(
+                isinstance(
+                    attn_group.get_metadata_builder(0),
+                    GDNAttentionMetadataBuilder,
+                )
+                for attn_group in attn_groups
+            )
+        )
+        use_grouped_gdn_state_ids = (
+            envs.VLLM_SM70_GDN_GROUPED_STATE_IDS
+            and self.speculative_config is not None
+            and self.cache_config.mamba_cache_mode == "align"
+            and len(self.gdn_kv_cache_group_ids) > 1
+        )
+        if use_grouped_gdn_state_ids:
+            self.grouped_mamba_state_block_ids = self._make_buffer(
+                len(kv_cache_config.kv_cache_groups),
+                self.max_num_reqs,
+                self.max_spec_state_slots,
+                dtype=torch.int32,
+            )
+            logger.info(
+                "Using one grouped GDN state-ID H2D for KV-cache groups %s",
+                self.gdn_kv_cache_group_ids,
+            )
+        else:
+            self.grouped_mamba_state_block_ids = None
+
+        use_grouped_gdn_metadata_kernel = (
+            use_grouped_gdn_state_ids
+            and _build_grouped_single_request_gdn_spec_metadata_kernel is not None
+            and envs.VLLM_SM70_GDN_GROUPED_METADATA_KERNEL
+            and self.gdn_kv_cache_group_ids
+            == tuple(range(len(self.gdn_kv_cache_group_ids)))
+            and not envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
+        )
+        gdn_builders: list[GDNAttentionMetadataBuilder] = []
+        if use_grouped_gdn_metadata_kernel:
+            for kv_cache_gid in self.gdn_kv_cache_group_ids:
+                group_builders = [
+                    attn_group.get_metadata_builder(0)
+                    for attn_group in self.attn_groups[kv_cache_gid]
+                    if isinstance(
+                        attn_group.get_metadata_builder(0),
+                        GDNAttentionMetadataBuilder,
+                    )
+                ]
+                if len(group_builders) != 1:
+                    gdn_builders = []
+                    break
+                gdn_builders.append(group_builders[0])
+
+        if gdn_builders:
+            tensor_attributes = (
+                "spec_state_indices_tensor",
+                "spec_sequence_masks",
+                "spec_token_indx",
+                "spec_query_start_loc",
+                "num_accepted_tokens",
+                "spec_state_slot_selectors",
+            )
+            grouped_tensors: dict[str, torch.Tensor] = {}
+            for attribute in tensor_attributes:
+                template = getattr(gdn_builders[0], attribute)
+                grouped = template.new_empty((len(gdn_builders), *template.shape))
+                grouped_tensors[attribute] = grouped
+                for group_index, builder in enumerate(gdn_builders):
+                    setattr(builder, attribute, grouped[group_index])
+            self.grouped_gdn_spec_metadata_tensors = grouped_tensors
+            logger.info(
+                "Using one grouped GDN spec-metadata kernel for %d cache groups",
+                len(gdn_builders),
+            )
+        else:
+            self.grouped_gdn_spec_metadata_tensors = None
+
+        self.single_spec_flash_kv_cache_gid: int | None = None
+        self.single_spec_flash_builder: FlashAttnV100MetadataBuilder | None = None
+        if gdn_builders:
+            flash_builders = [
+                (kv_cache_gid, builder)
+                for kv_cache_gid, attn_groups in enumerate(self.attn_groups)
+                for attn_group in attn_groups
+                if isinstance(
+                    (builder := attn_group.get_metadata_builder(0)),
+                    FlashAttnV100MetadataBuilder,
+                )
+            ]
+            expected_flash_gid = len(self.gdn_kv_cache_group_ids)
+            if len(flash_builders) == 1 and flash_builders[0][0] == expected_flash_gid:
+                self.single_spec_flash_kv_cache_gid = flash_builders[0][0]
+                self.single_spec_flash_builder = flash_builders[0][1]
+                logger.info(
+                    "Using fixed q=4 Flash metadata prebuild for KV-cache group %d",
+                    self.single_spec_flash_kv_cache_gid,
+                )
 
         # Reinitialize need to after initialize_attn_backend
         self.may_reinitialize_input_batch(kv_cache_config, kernel_block_sizes)

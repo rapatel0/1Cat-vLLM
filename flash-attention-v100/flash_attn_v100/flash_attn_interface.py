@@ -322,6 +322,30 @@ def _get_decode_partition_size(
     max_seq_len_hint: Optional[int] = None,
     batch_size_hint: Optional[int] = None,
 ) -> int:
+    small_batch_raw = os.getenv(
+        "VLLM_FLASH_V100_DECODE_SMALL_BATCH_PARTITION_SIZE"
+    )
+    if small_batch_raw is not None and batch_size_hint is not None:
+        try:
+            small_batch_value = int(small_batch_raw)
+            small_batch_max = int(
+                os.getenv(
+                    "VLLM_FLASH_V100_DECODE_SMALL_BATCH_PARTITION_MAX_BATCH",
+                    "4",
+                )
+            )
+        except ValueError as exc:
+            raise ValueError(
+                "VLLM_FLASH_V100_DECODE_SMALL_BATCH_PARTITION_SIZE and "
+                "VLLM_FLASH_V100_DECODE_SMALL_BATCH_PARTITION_MAX_BATCH "
+                "must be integers"
+            ) from exc
+        if batch_size_hint <= small_batch_max:
+            return _validate_decode_partition_size(
+                small_batch_value,
+                "VLLM_FLASH_V100_DECODE_SMALL_BATCH_PARTITION_SIZE",
+            )
+
     raw = os.getenv("VLLM_FLASH_V100_DECODE_PARTITION_SIZE")
     if raw is None:
         return _select_default_decode_partition_size(max_seq_len_hint)

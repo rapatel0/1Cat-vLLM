@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import functools
+import os
 from collections.abc import Callable
 from typing import Any, ParamSpec, TypeVar
 
@@ -147,7 +148,9 @@ class PostGradPassManager(CustomGraphPass):  # type: ignore[misc]
                 # AR+RMS, since both consume fused_add_rms_norm.
                 self.passes += [RocmAiterTritonAddRMSNormPadFusionPass(config)]
 
-            if self.pass_config.fuse_allreduce_rms:
+            if self.pass_config.fuse_allreduce_rms or os.getenv(
+                "VLLM_SM70_FUSED_AR_GEMMA_RMS_NORM", "0"
+            ) == "1":
                 if rocm_aiter_ops.is_enabled():
                     self.passes += [RocmAiterAllReduceFusionPass(config)]
                 else:

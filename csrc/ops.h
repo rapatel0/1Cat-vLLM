@@ -562,6 +562,17 @@ void all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,
                 fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
 void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
                      torch::Tensor& out);
+void all_reduce_gemma_rms_norm_sm70(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& gamma, torch::Tensor& norm_out,
+    torch::Tensor& residual_out, double epsilon, fptr_t reg_buffer,
+    int64_t reg_buffer_sz_bytes);
+void all_reduce_gemma_rms_norm_sm70_cooperative(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& gamma, torch::Tensor& norm_out,
+    torch::Tensor& residual_out, torch::Tensor& row_sums, double epsilon,
+    fptr_t reg_buffer, int64_t reg_buffer_sz_bytes, int64_t ctas_per_row,
+    int64_t threads);
 void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
                  fptr_t reg_buffer, int64_t reg_buffer_sz_bytes);
 void tile_runtime_all_reduce(fptr_t _fa, torch::Tensor& inp, torch::Tensor& out,

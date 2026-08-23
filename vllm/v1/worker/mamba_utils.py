@@ -213,6 +213,108 @@ def postprocess_mamba_fused_kernel(
 
 
 @triton.jit
+def preprocess_mamba_fused_kernel(
+    num_accepted_tokens_ptr,
+    spec_state_slot_selectors_ptr,
+    prev_state_idx_ptr,
+    curr_state_idx_ptr,
+    block_table_ptrs_ptr,
+    block_table_stride_req: tl.int64,
+    state_base_addrs_ptr,
+    state_block_strides_ptr,
+    state_elem_sizes_ptr,
+    state_inner_sizes_ptr,
+    state_conv_widths_ptr,
+    state_group_indices_ptr,
+    num_reqs,
+    COPY_BLOCK_SIZE: tl.constexpr,
+):
+    """Move accepted recurrent state when align mode advances a block."""
+    req_idx = tl.program_id(0)
+    state_idx = tl.program_id(1)
+    if req_idx >= num_reqs:
+        return
+
+    prev_state_idx = tl.load(prev_state_idx_ptr + req_idx)
+    curr_state_idx = tl.load(curr_state_idx_ptr + req_idx)
+    if prev_state_idx < 0 or prev_state_idx == curr_state_idx:
+        return
+
+    # The PP payload validator and fused postprocess guarantee both values are
+    # at least one. Keep these inputs read-only until every state program has
+    # consumed them; the separate reset launch below provides that barrier.
+    num_accepted = tl.load(num_accepted_tokens_ptr + req_idx)
+    state_slot_selector = tl.load(spec_state_slot_selectors_ptr + req_idx)
+    accept_token_bias = (num_accepted - 1).to(tl.int64)
+    state_slot_bias = (state_slot_selector - 1).to(tl.int64)
+
+    state_base_addr = tl.load(state_base_addrs_ptr + state_idx)
+    state_block_stride = tl.load(state_block_strides_ptr + state_idx)
+    state_elem_size = tl.load(state_elem_sizes_ptr + state_idx)
+    state_inner_size = tl.load(state_inner_sizes_ptr + state_idx)
+    state_conv_width = tl.load(state_conv_widths_ptr + state_idx)
+    group_idx = tl.load(state_group_indices_ptr + state_idx).to(tl.int64)
+
+    group_base_addr = tl.load(block_table_ptrs_ptr + group_idx)
+    block_table = group_base_addr.to(tl.pointer_type(tl.int32))
+    block_table += req_idx * block_table_stride_req
+    dest_block_id = tl.load(block_table + curr_state_idx).to(tl.int64)
+
+    if state_conv_width > 0:
+        src_block_id = tl.load(block_table + prev_state_idx).to(tl.int64)
+        positions_to_copy = state_conv_width.to(tl.int64) - accept_token_bias
+        if positions_to_copy <= 0:
+            return
+        if src_block_id == dest_block_id and accept_token_bias == 0:
+            return
+        # If src==dest and bias>0 this is an overlapping left shift. Iterating
+        # low-to-high is memmove-safe because every source address is above
+        # its destination address.
+        src_addr = (
+            state_base_addr
+            + src_block_id * state_block_stride
+            + accept_token_bias * state_inner_size * state_elem_size
+        )
+        dest_addr = state_base_addr + dest_block_id * state_block_stride
+        copy_size = positions_to_copy * state_inner_size * state_elem_size
+    else:
+        actual_src_state_idx = prev_state_idx.to(tl.int64) + state_slot_bias
+        src_block_id = tl.load(block_table + actual_src_state_idx).to(tl.int64)
+        if src_block_id == dest_block_id:
+            return
+        src_addr = state_base_addr + src_block_id * state_block_stride
+        dest_addr = state_base_addr + dest_block_id * state_block_stride
+        copy_size = state_inner_size * state_elem_size
+
+    offsets = tl.arange(0, COPY_BLOCK_SIZE)
+    for offset in range(0, copy_size, COPY_BLOCK_SIZE):
+        mask = offset + offsets < copy_size
+        src = (src_addr + offset + offsets).to(tl.pointer_type(tl.uint8))
+        dest = (dest_addr + offset + offsets).to(tl.pointer_type(tl.uint8))
+        value = tl.load(src, mask=mask)
+        tl.store(dest, value, mask=mask)
+
+
+@triton.jit
+def reset_mamba_preprocess_counts_kernel(
+    num_accepted_tokens_ptr,
+    spec_state_slot_selectors_ptr,
+    prev_state_idx_ptr,
+    curr_state_idx_ptr,
+    num_reqs,
+    BLOCK_SIZE: tl.constexpr,
+):
+    """Reset slot selection after the preceding state-copy kernel completes."""
+    req_idx = tl.program_id(0) * BLOCK_SIZE + tl.arange(0, BLOCK_SIZE)
+    in_bounds = req_idx < num_reqs
+    prev_state_idx = tl.load(prev_state_idx_ptr + req_idx, mask=in_bounds, other=-1)
+    curr_state_idx = tl.load(curr_state_idx_ptr + req_idx, mask=in_bounds, other=-1)
+    copied = in_bounds & (prev_state_idx >= 0) & (prev_state_idx != curr_state_idx)
+    tl.store(num_accepted_tokens_ptr + req_idx, 1, mask=copied)
+    tl.store(spec_state_slot_selectors_ptr + req_idx, 1, mask=copied)
+
+
+@triton.jit
 def batch_memcpy_kernel(src_ptrs, dst_ptrs, sizes, BLOCK_SIZE: tl.constexpr):
     pid = tl.program_id(0)
 
@@ -336,6 +438,8 @@ class MambaSpecDecodeGPUContext:
     num_scheduled_tokens_buf: CpuGpuBuffer | None = None
     num_computed_tokens_buf: CpuGpuBuffer | None = None
     num_draft_tokens_buf: CpuGpuBuffer | None = None
+    preprocess_prev_state_idx_buf: CpuGpuBuffer | None = None
+    preprocess_curr_state_idx_buf: CpuGpuBuffer | None = None
 
     # Flag to track if metadata has been populated
     is_initialized: bool = False
@@ -396,6 +500,8 @@ class MambaSpecDecodeGPUContext:
             num_scheduled_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_computed_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             num_draft_tokens_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            preprocess_prev_state_idx_buf=make_buffer(max_num_reqs, dtype=torch.int32),
+            preprocess_curr_state_idx_buf=make_buffer(max_num_reqs, dtype=torch.int32),
             is_initialized=False,
         )
 
@@ -592,6 +698,55 @@ class MambaSpecDecodeGPUContext:
             HAS_DDTREE_ACCEPTED_NODES=has_ddtree,
         )
 
+    def run_fused_preprocess(
+        self,
+        num_reqs: int,
+        num_accepted_tokens_gpu: torch.Tensor,
+        spec_state_slot_selectors_gpu: torch.Tensor,
+    ) -> None:
+        """Copy accepted align-mode state using device-resident counts."""
+        if num_reqs == 0:
+            return
+        if not self.is_initialized:
+            raise RuntimeError(
+                "GPU Mamba preprocess requires initialized state metadata"
+            )
+        prev_buf = self.preprocess_prev_state_idx_buf
+        curr_buf = self.preprocess_curr_state_idx_buf
+        assert prev_buf is not None and curr_buf is not None
+
+        total_states = self.num_layers * self.num_state_types
+        preprocess_mamba_fused_kernel[(num_reqs, total_states)](
+            num_accepted_tokens_gpu,
+            spec_state_slot_selectors_gpu,
+            prev_buf.gpu,
+            curr_buf.gpu,
+            self.block_table_ptrs,
+            self.block_table_stride_req,
+            self.state_base_addrs,
+            self.state_block_strides,
+            self.state_elem_sizes,
+            self.state_inner_sizes,
+            self.state_conv_widths,
+            self.state_group_indices,
+            num_reqs,
+            COPY_BLOCK_SIZE=1024,
+        )
+        # A separate launch is intentional: resetting the input counts from a
+        # single program in the 2-D copy grid would race other state programs
+        # that still need to read the original selector.
+        reset_block_size = triton.next_power_of_2(max(1, num_reqs))
+        # Both launches use the current PyTorch stream. Stream ordering keeps
+        # the original selectors live until every copy program has finished.
+        reset_mamba_preprocess_counts_kernel[(1,)](
+            num_accepted_tokens_gpu,
+            spec_state_slot_selectors_gpu,
+            prev_buf.gpu,
+            curr_buf.gpu,
+            num_reqs,
+            BLOCK_SIZE=reset_block_size,
+        )
+
 
 @dataclasses.dataclass
 class MambaBuffers:
@@ -700,6 +855,43 @@ def cleanup_mamba_state_idx(
     resumed_req_ids = scheduler_output.scheduled_cached_reqs.resumed_req_ids
     for req_id in itertools.chain(finished_req_ids, preempted_req_ids, resumed_req_ids):
         mamba_state_idx.pop(req_id, None)
+
+
+def stage_preprocess_mamba_indices_to_gpu(
+    scheduler_output: SchedulerOutput,
+    mamba_state_idx: dict[str, int],
+    input_batch: GPUInputBatch,
+    requests: dict[str, CachedRequestState],
+    mamba_spec: MambaSpec,
+    prev_state_idx_buf: CpuGpuBuffer,
+    curr_state_idx_buf: CpuGpuBuffer,
+    num_reqs: int,
+) -> None:
+    """Stage align-mode source/destination indices without reading GPU counts."""
+    cleanup_mamba_state_idx(scheduler_output, mamba_state_idx)
+    prev_indices = prev_state_idx_buf.np
+    curr_indices = curr_state_idx_buf.np
+    num_speculative_blocks = mamba_spec.num_speculative_blocks
+    block_size = mamba_spec.block_size
+
+    for index, req_id in enumerate(input_batch.req_ids[:num_reqs]):
+        req_state = requests[req_id]
+        prev_state_idx = mamba_state_idx.get(req_id)
+        if prev_state_idx is None:
+            prev_state_idx = (req_state.num_computed_tokens - 1) // block_size
+
+        num_scheduled_tokens = scheduler_output.num_scheduled_tokens[req_id]
+        num_blocks = (
+            cdiv(req_state.num_computed_tokens + num_scheduled_tokens, block_size)
+            + num_speculative_blocks
+        )
+        curr_state_idx = num_blocks - 1 - num_speculative_blocks
+        mamba_state_idx[req_id] = curr_state_idx
+        prev_indices[index] = prev_state_idx
+        curr_indices[index] = curr_state_idx
+
+    prev_state_idx_buf.copy_to_gpu(num_reqs)
+    curr_state_idx_buf.copy_to_gpu(num_reqs)
 
 
 def preprocess_mamba(
@@ -936,6 +1128,7 @@ def postprocess_mamba_align_gpu(
     forward_context: dict[str, Any],
     mamba_state_copy_funcs: tuple[MambaStateCopyFunc, ...],
     ddtree_accepted_node_indices: torch.Tensor | None = None,
+    copy_counts_to_cpu: bool = True,
 ) -> None:
     """GPU-side mamba postprocess for spec decode + hybrid + align mode.
 
@@ -986,12 +1179,13 @@ def postprocess_mamba_align_gpu(
     # ``num_accepted_tokens_gpu``; the kernel only overwrites entries to 1
     # when src_block_idx == dest_block_idx (copy within the same block), so
     # the original count is preserved for everyone else.
-    num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-        ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
-    )
-    spec_num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
-        ctx.spec_state_slot_selectors_out[:num_reqs], non_blocking=True
-    )
+    if copy_counts_to_cpu:
+        num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+            ctx.num_accepted_tokens_out[:num_reqs], non_blocking=True
+        )
+        spec_num_accepted_tokens_cpu_tensor[:num_reqs].copy_(
+            ctx.spec_state_slot_selectors_out[:num_reqs], non_blocking=True
+        )
 
 
 def stage_postprocess_metadata_to_gpu(

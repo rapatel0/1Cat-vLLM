@@ -1,6 +1,8 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
+
 import numpy as np
 import torch
 
@@ -13,6 +15,10 @@ from vllm.v1.utils import CpuGpuBuffer
 from vllm.v1.worker.cp_utils import get_total_cp_world_size
 
 logger = init_logger(__name__)
+
+_qwen38_control_packet_library = os.getenv("VLLM_QWEN38_CONTROL_PACKET_LIBRARY")
+if _qwen38_control_packet_library:
+    torch.ops.load_library(_qwen38_control_packet_library)
 
 
 class BlockTable:
@@ -319,6 +325,11 @@ class MultiGroupBlockTable:
                 block_sizes, kernel_block_sizes, max_num_blocks
             )
         ]
+        self._qwen38_control_packet_hosts: list[torch.Tensor] = []
+        self._qwen38_control_packet_events: list[torch.cuda.Event | None] = []
+        self._qwen38_control_packet_host_index = 0
+        self._qwen38_control_packet_device: torch.Tensor | None = None
+        self._qwen38_control_packet_widths: tuple[int, int, int, int] | None = None
 
     def append_row(self, block_ids: tuple[list[int], ...], row_idx: int) -> None:
         for i, block_table in enumerate(self.block_tables):
@@ -356,6 +367,79 @@ class MultiGroupBlockTable:
     def commit_block_table(self, num_reqs: int) -> None:
         for block_table in self.block_tables:
             block_table.commit_block_table(num_reqs)
+
+    def commit_block_table_qwen38_packed(self, num_reqs: int) -> bool:
+        """Commit the fixed batch-one four-group table with one pinned H2D.
+
+        The CUDA scatter preserves the stable per-group destination tensors so
+        existing attention and GDN consumers remain unchanged. Unsupported
+        layouts fail closed to the generic per-group copy path.
+        """
+        if (
+            not _qwen38_control_packet_library
+            or num_reqs != 1
+            or len(self.block_tables) != 4
+            or not hasattr(torch.ops.qwen38_control, "scatter_block_tables")
+        ):
+            return False
+
+        widths = tuple(
+            int(block_table.block_table.cpu.shape[1])
+            for block_table in self.block_tables
+        )
+        if len(widths) != 4 or sum(widths) > 256:
+            return False
+        typed_widths = (widths[0], widths[1], widths[2], widths[3])
+        if not self._qwen38_control_packet_hosts:
+            first = self.block_tables[0].block_table
+            self._qwen38_control_packet_hosts = [
+                torch.empty(
+                    sum(widths),
+                    dtype=torch.int32,
+                    device="cpu",
+                    pin_memory=self.block_tables[0].pin_memory,
+                )
+                for _ in range(2)
+            ]
+            self._qwen38_control_packet_events = [None, None]
+            self._qwen38_control_packet_device = torch.empty(
+                sum(widths), dtype=torch.int32, device=first.gpu.device
+            )
+            self._qwen38_control_packet_widths = typed_widths
+        elif self._qwen38_control_packet_widths != typed_widths:
+            return False
+
+        host_index = self._qwen38_control_packet_host_index
+        event = self._qwen38_control_packet_events[host_index]
+        if event is not None and not event.query():
+            event.synchronize()
+        host = self._qwen38_control_packet_hosts[host_index]
+        device = self._qwen38_control_packet_device
+        assert device is not None
+        offset = 0
+        for width, block_table in zip(widths, self.block_tables):
+            host[offset : offset + width].copy_(block_table.block_table.cpu[0])
+            offset += width
+        device.copy_(host, non_blocking=True)
+        destinations = [
+            block_table.block_table.gpu[0] for block_table in self.block_tables
+        ]
+        torch.ops.qwen38_control.scatter_block_tables(
+            device,
+            destinations[0],
+            destinations[1],
+            destinations[2],
+            destinations[3],
+            *widths,
+        )
+        if event is None:
+            event = torch.cuda.Event(blocking=False, interprocess=False)
+            self._qwen38_control_packet_events[host_index] = event
+        event.record(torch.cuda.current_stream(device.device))
+        self._qwen38_control_packet_host_index = (host_index + 1) % len(
+            self._qwen38_control_packet_hosts
+        )
+        return True
 
     def commit_block_table_staged(self, num_reqs: int) -> None:
         for block_table in self.block_tables:

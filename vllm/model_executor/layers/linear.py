@@ -1780,6 +1780,30 @@ class RowParallelLinear(LinearBase):
 
         param.load_row_parallel_weight(loaded_weight=loaded_weight)
 
+    def forward_fused_mlp(
+        self,
+        input_: torch.Tensor,
+        gate_up_layer: torch.nn.Module,
+    ) -> torch.Tensor | None:
+        """Run a quantizer-owned local MLP and preserve row-TP reduction."""
+
+        if (
+            not self.input_is_parallel
+            or self.bias is not None
+            or getattr(self, "_awq_sm70_prepared", False)
+            or getattr(self, "_sm70_f16_prepared", False)
+        ):
+            return None
+        fused_apply = getattr(self.quant_method, "apply_fused_mlp", None)
+        if fused_apply is None:
+            return None
+        output_parallel = fused_apply(self, gate_up_layer, input_)
+        if output_parallel is None:
+            return None
+        if self.reduce_results and self.tp_size > 1:
+            return tensor_model_parallel_all_reduce(output_parallel)
+        return output_parallel
+
     def forward(
         self,
         input_,

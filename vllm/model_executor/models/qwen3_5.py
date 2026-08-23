@@ -36,6 +36,7 @@ from vllm.compilation.decorators import support_torch_compile
 from vllm.config import VllmConfig
 from vllm.distributed import (
     get_pp_group,
+    get_tp_group,
 )
 from vllm.logger import init_logger
 from vllm.model_executor.layers.layernorm import (
@@ -46,9 +47,13 @@ from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     QwenGatedDeltaNetAttention,
     _qwen_gdn_run_recurrent_core,
+    _qwen_gdn_non_spec_metadata_tensors,
+    _qwen_gdn_try_sm70_fused_full,
+    _qwen_gdn_try_sm70_fused_post_conv,
     _resolve_qwen_gdn_kv_cache_args,
     _sm70_compile_graph_slice_dim,
     _sm70_dump_gdn_projection_tensor,
+    _sm70_qwen_gdn_input_core_boundary_enabled,
 )
 from vllm.model_executor.layers.mamba.mamba_utils import (
     MambaStateCopyFunc,
@@ -108,6 +113,7 @@ from .qwen3_vl import (
 from .utils import (
     AutoWeightsLoader,
     PPMissingLayer,
+    WeightsMapper,
     _merge_multimodal_embeddings,
     extract_layer_index,
     is_pp_missing_parameter,
@@ -198,6 +204,24 @@ def _uses_split_gdn_input_projections(
     quant_config: QuantizationConfig | None,
 ) -> bool:
     """Return True when qkv/z and b/a use different precisions."""
+    # EXL3 describes every logical matrix in tensor_storage instead of using
+    # the ignored-module lists used by GPTQ/AWQ.  Presence of independent a/b
+    # records means the checkpoint layout itself is split, regardless of
+    # whether those two narrow matrices are quantized.  Missing this case
+    # constructs a six-way fused qkvzba module; the EXL3 loader then supplies
+    # only qkvz and forward_cuda indexes beyond the end of that output.
+    tensor_storage = getattr(quant_config, "tensor_storage", None)
+    if isinstance(tensor_storage, dict):
+        storage_names = tuple(tensor_storage)
+        has_a = any(
+            name.endswith(".linear_attn.in_proj_a") for name in storage_names
+        )
+        has_b = any(
+            name.endswith(".linear_attn.in_proj_b") for name in storage_names
+        )
+        if has_a and has_b:
+            return True
+
     ignored_modules: list[str] = []
 
     def add_ignored_modules(value: object) -> None:
@@ -339,6 +363,29 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             )
             ba = _sm70_dump_gdn_projection_tensor("in_proj_ba", layer_name, ba)
             mixed_qkv = mixed_qkvz[..., :qkv_size]
+            raw_z = mixed_qkvz[..., qkv_size : qkv_size + z_size].reshape(
+                num_tokens, -1, self.head_v_dim
+            )
+            raw_b = ba[..., :ba_size]
+            raw_a = ba[..., ba_size : ba_size + ba_size]
+            conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
+                layer_name, hidden_states
+            )
+            fused_full_out = _qwen_gdn_try_sm70_fused_full(
+                self,
+                raw_mixed_qkv=mixed_qkv,
+                b=raw_b,
+                a=raw_a,
+                output_gate=raw_z,
+                layer_name=layer_name,
+                conv_state_cache=conv_state_cache,
+                ssm_state_cache=ssm_state_cache,
+            )
+            if fused_full_out is not None:
+                self._output_projection_from_normalized(
+                    fused_full_out, output, num_tokens
+                )
+                return
             if os.getenv("VLLM_SM70_GDN_FUSED_ZBA_EXTRACT", "0") == "1":
                 z, b, a = _sm70_gdn_extract_zba(
                     mixed_qkvz, ba, qkv_size, z_size, ba_size
@@ -392,6 +439,45 @@ class Qwen3_5GatedDeltaNet(QwenGatedDeltaNetAttention):
             layer_name,
             core_attn_out,
         )
+        if _sm70_qwen_gdn_input_core_boundary_enabled():
+            (
+                non_spec_query_start_loc,
+                non_spec_state_indices_tensor,
+            ) = _qwen_gdn_non_spec_metadata_tensors(
+                layer_name,
+                core_attn_out.device,
+            )
+            torch.ops.vllm.qwen_gdn_post_projection_q1(
+                mixed_qkv,
+                b,
+                a,
+                z,
+                core_attn_out,
+                conv_state_cache,
+                ssm_state_cache,
+                non_spec_query_start_loc,
+                non_spec_state_indices_tensor,
+                layer_name,
+            )
+            self._output_projection_from_normalized(
+                core_attn_out, output, num_tokens
+            )
+            return
+        if _qwen_gdn_try_sm70_fused_post_conv(
+            self,
+            mixed_qkv=mixed_qkv,
+            b=b,
+            a=a,
+            output_gate=z,
+            normalized_out=core_attn_out,
+            layer_name=layer_name,
+            conv_state_cache=conv_state_cache,
+            ssm_state_cache=ssm_state_cache,
+        ):
+            self._output_projection_from_normalized(
+                core_attn_out, output, num_tokens
+            )
+            return
         core_attn_out = _qwen_gdn_run_recurrent_core(
             self,
             mixed_qkv=mixed_qkv,
@@ -416,6 +502,7 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
 
         config = vllm_config.model_config.hf_text_config
         model_config = vllm_config.model_config
+        parallel_config = vllm_config.parallel_config
         cache_config = vllm_config.cache_config
         quant_config = vllm_config.quant_config
 
@@ -481,6 +568,29 @@ class Qwen3_5DecoderLayer(Qwen3NextDecoderLayer):
                     config.hidden_size,
                 ),
             )
+
+        self._sm70_post_attention_local_output = (
+            os.getenv("VLLM_QWEN38_SM70_FUSED_POST_ATTN_AR_NORM", "0") == "1"
+            and model_config.quantization == "exl3"
+            and config.model_type == "qwen3_5_text"
+            and config.hidden_size == 5120
+            and parallel_config.tensor_parallel_size == 4
+            and not self.layer_scale
+            # The target path is rank-aligned inside one captured verifier
+            # graph.  Applying the same cooperative boundary to the separately
+            # replayed MTP graph amplified inter-rank arrival skew before the
+            # next verifier cycle, so keep that module on its ordinary
+            # all-reduce until its complete cycle can be device-resident.
+            and ".mtp." not in f".{prefix}."
+        )
+        if self._sm70_post_attention_local_output:
+            projection = (
+                self.linear_attn.out_proj
+                if self.layer_type == "linear_attention"
+                else self.self_attn.o_proj
+            )
+            projection.reduce_results = False
+            self._sm70_post_attention_tp_group_name = get_tp_group().unique_name
 
 
 @support_torch_compile(
@@ -908,6 +1018,43 @@ class Qwen3_5ForCausalLM(Qwen3_5ForCausalLMBase):
         super().__init__(vllm_config=vllm_config, prefix=prefix)
         _mark_default_sm70_dense_modules(
             self, vllm_config.parallel_config.tensor_parallel_size
+        )
+
+
+class Qwen3_5EXL3TextForCausalLM(Qwen3_5ForCausalLM):
+    """Text-only view of a Qwen3.5 conditional-generation checkpoint.
+
+    The specialized Qwen3.8 EXL3 SM70 executor does not serve image or video
+    requests.  Loading only the language-model subtree makes vLLM compile the
+    token embedding inside the target CUDA graph instead of staging
+    ``inputs_embeds`` through the multimodal runner on every text step.
+    """
+
+    conditional_to_text_mapper = WeightsMapper(
+        orig_to_new_prefix={
+            "model.language_model.": "model.",
+            "model.visual.": None,
+        }
+    )
+    CHECKPOINT_MODULE_PREFIX = "model.language_model"
+
+    @classmethod
+    def checkpoint_module_prefix(cls, prefix: str = "") -> str:
+        return maybe_prefix(prefix, cls.CHECKPOINT_MODULE_PREFIX)
+
+    def __init__(self, *, vllm_config: VllmConfig, prefix: str = ""):
+        # EXL3 selects layouts and rank-local storage from fully-qualified
+        # checkpoint module names.  Preserve the namespace used by the inner
+        # language model of Qwen3_5ForConditionalGeneration even though this
+        # wrapper exposes that module directly as a causal LM.
+        checkpoint_prefix = self.checkpoint_module_prefix(prefix)
+        super().__init__(vllm_config=vllm_config, prefix=checkpoint_prefix)
+
+    def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
+        loader = AutoWeightsLoader(self, skip_prefixes=["mtp."])
+        return loader.load_weights(
+            weights,
+            mapper=self.conditional_to_text_mapper,
         )
 
 

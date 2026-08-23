@@ -275,6 +275,38 @@ class CustomAllreduce:
         ops.all_reduce_sum2(self._ptr, inp_a, inp_b, out)
         return out
 
+    def all_reduce_gemma_rms_norm_sm70(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        epsilon: float,
+        *,
+        registered: bool = False,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        norm_out = torch.empty_like(inp)
+        residual_out = torch.empty_like(inp, dtype=torch.float32)
+        row_sums = torch.empty(
+            (inp.shape[0], 4),
+            dtype=torch.float32,
+            device=inp.device,
+        )
+        reg_buffer = 0 if registered else self.buffer_ptrs[self.rank]
+        reg_buffer_size = 0 if registered else self.max_size
+        ops.all_reduce_gemma_rms_norm_sm70(
+            self._ptr,
+            inp,
+            residual,
+            gamma,
+            norm_out,
+            residual_out,
+            epsilon,
+            reg_buffer,
+            reg_buffer_size,
+            row_sums,
+        )
+        return norm_out, residual_out
+
     def top1_argmax(
         self,
         input_pair: torch.Tensor,
@@ -532,6 +564,59 @@ class CustomAllreduce:
                 return self.all_reduce_sum2(input_a, input_b)
             return self.all_reduce(input_a + input_b, registered=False)
         return None
+
+    def custom_all_reduce_gemma_rms_norm_sm70(
+        self,
+        inp: torch.Tensor,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        cooperative_available = hasattr(
+            torch.ops.qwen38_c2_ar,
+            "all_reduce_gemma_rms_norm_sm70_cooperative",
+        )
+        # The cooperative sidecar implements the verifier's four-row shape as
+        # well as the one- and two-row capture shapes.  Excluding M=4 here
+        # silently sent the real MTP3 target pass through the unfused
+        # all-reduce + residual + RMSNorm chain even though the loaded kernel
+        # accepts it.
+        supported_shapes = (
+            ((1, 5120), (2, 5120), (4, 5120))
+            if cooperative_available
+            else ((1, 5120), (4, 5120))
+        )
+        if (
+            self.disabled
+            or self.world_size != 4
+            or not self.fully_connected
+            or inp.dtype != torch.float16
+            or residual.dtype != torch.float32
+            or gamma.dtype != torch.float16
+            or inp.dim() != 2
+            or inp.shape not in supported_shapes
+            or residual.shape != inp.shape
+            or gamma.shape != (5120,)
+            or not is_weak_contiguous(inp)
+            or not is_weak_contiguous(residual)
+            or not is_weak_contiguous(gamma)
+        ):
+            return None
+        if self._IS_CAPTURING and torch.cuda.is_current_stream_capturing():
+            return self.all_reduce_gemma_rms_norm_sm70(
+                inp,
+                residual,
+                gamma,
+                epsilon,
+                registered=True,
+            )
+        return self.all_reduce_gemma_rms_norm_sm70(
+            inp,
+            residual,
+            gamma,
+            epsilon,
+            registered=False,
+        )
 
     def close(self):
         if not self.disabled and self._ptr:

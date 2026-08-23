@@ -35,6 +35,7 @@ from vllm.transformers_utils.configs.qwen3_5_moe import Qwen3_5MoeTextConfig
 from .interfaces import (
     MultiModalEmbeddings,
     SupportsMultiModal,
+    SupportsPP,
     _require_is_multimodal,
 )
 from .utils import (
@@ -123,6 +124,12 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         config: Qwen3_5TextConfig | Qwen3_5MoeTextConfig = model_config.hf_text_config
 
         self.config = config
+        # The native MTP layer is instantiated only on the final target PP
+        # stage. It is nevertheless a complete local decoder layer: it owns
+        # embedding/fusion, attention, norm, and the locally shared LM head.
+        # Never interpret the target model's global PP rank as the drafter's
+        # internal pipeline role.
+        self.standalone_draft = get_pp_group().world_size > 1
 
         self.vocab_size = config.vocab_size
 
@@ -197,7 +204,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         inputs_embeds: torch.Tensor | None = None,
         spec_step_idx: int = 0,
     ) -> torch.Tensor:
-        if get_pp_group().is_first_rank:
+        if self.standalone_draft or get_pp_group().is_first_rank:
             if inputs_embeds is None:
                 inputs_embeds = self.embed_input_ids(input_ids)
             assert hidden_states.shape[-1] == inputs_embeds.shape[-1]
@@ -218,7 +225,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
             residual=residual,
         )
 
-        if not get_pp_group().is_last_rank:
+        if not (self.standalone_draft or get_pp_group().is_last_rank):
             return IntermediateTensors(
                 {"hidden_states": hidden_states, "residual": residual}
             )
@@ -435,7 +442,7 @@ class Qwen3_5MultiTokenPredictor(nn.Module):
         "hidden_states": 0,
     }
 )
-class Qwen3_5MTP(nn.Module, SupportsMultiModal):
+class Qwen3_5MTP(nn.Module, SupportsMultiModal, SupportsPP):
     packed_modules_mapping = {
         "qkv_proj": [
             "q_proj",
@@ -507,11 +514,25 @@ class Qwen3_5MTP(nn.Module, SupportsMultiModal):
 
         super().__init__()
         self.config = config
+        pp_world_size = get_pp_group().world_size
         self.model = Qwen3_5MultiTokenPredictor(
             vllm_config=mtp_vllm_config,
             prefix=maybe_prefix(prefix, "mtp"),
-            share_target_embed_tokens=self.share_target_io_weights,
+            # Under PP the target embedding exists only on PP0 while the
+            # complete local drafter exists only on PP1. Allocate a TP-sharded
+            # PP1 copy and let the normal target-checkpoint remapping load it.
+            share_target_embed_tokens=(
+                self.share_target_io_weights and pp_world_size == 1
+            ),
         )
+        self.make_empty_intermediate_tensors = (
+            self.model.make_empty_intermediate_tensors
+        )
+        if self.share_target_io_weights and pp_world_size > 1:
+            logger.info(
+                "Qwen3_5MTP: using a TP-sharded local input-embedding copy "
+                "on the final PP stage; the LM head remains locally shared."
+            )
 
         if get_pp_group().is_last_rank:
             if self.share_target_io_weights:

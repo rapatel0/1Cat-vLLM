@@ -4,6 +4,8 @@ from abc import ABC, abstractmethod
 from collections.abc import Sequence
 from math import lcm
 
+from vllm.logger import init_logger
+
 from vllm.v1.core.block_pool import BlockPool
 from vllm.v1.core.kv_cache_metrics import KVCacheMetricsCollector
 from vllm.v1.core.kv_cache_utils import (
@@ -23,6 +25,8 @@ from vllm.v1.kv_cache_interface import (
     KVCacheSpec,
 )
 from vllm.v1.request import Request
+
+logger = init_logger(__name__)
 
 
 class KVCacheCoordinator(ABC):
@@ -483,6 +487,12 @@ class HybridKVCacheCoordinator(KVCacheCoordinator):
             for i, (_, group_ids, _) in enumerate(self.attention_groups)
             if any(gid in self.eagle_group_ids for gid in group_ids)
         }
+        logger.info(
+            "Hybrid KV cache groups block_sizes=%s lcm=%s eagle_groups=%s",
+            block_sizes,
+            self.lcm_block_size,
+            sorted(self.eagle_attn_group_indices),
+        )
 
     def cache_blocks(self, request: Request, num_computed_tokens: int) -> None:
         # Cache hits in this coordinator are always a multiple of

@@ -402,6 +402,21 @@ class CudaCommunicator(DeviceCommunicatorBase):
                 return out
         return self.all_reduce(input_a + input_b)
 
+    def all_reduce_gemma_rms_norm_sm70(
+        self, input_, residual, gamma, epsilon
+    ):
+        ca_comm = self.ca_comm
+        if self.use_custom_allreduce and ca_comm is not None and not ca_comm.disabled:
+            out = ca_comm.custom_all_reduce_gemma_rms_norm_sm70(
+                input_, residual, gamma, epsilon
+            )
+            if out is not None:
+                _trace_all_reduce_path(self, "sm70_fused_ar_gemma_rms", input_)
+                return out
+        return super().all_reduce_gemma_rms_norm_sm70(
+            input_, residual, gamma, epsilon
+        )
+
     def sm70_awq_mlp_down_tile_all_reduce(self, input_):
         if not self.use_sm70_awq_mlp_down_tile_ar:
             return None

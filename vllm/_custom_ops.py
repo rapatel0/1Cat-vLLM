@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from enum import IntEnum
 from typing import TYPE_CHECKING, Literal
 
@@ -18,6 +19,9 @@ from vllm.utils.math_utils import cdiv
 logger = init_logger(__name__)
 
 current_platform.import_kernels()
+_sm70_fused_ar_library = os.getenv("VLLM_SM70_FUSED_AR_GEMMA_LIBRARY")
+if _sm70_fused_ar_library:
+    torch.ops.load_library(_sm70_fused_ar_library)
 _repetition_penalties_cuda_unavailable = False
 
 if TYPE_CHECKING:
@@ -2973,6 +2977,57 @@ def all_reduce_sum2(
     out: torch.Tensor,
 ) -> None:
     torch.ops._C_custom_ar.all_reduce_sum2(fa, inp_a, inp_b, out)
+
+
+def all_reduce_gemma_rms_norm_sm70(
+    fa: int,
+    inp: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    norm_out: torch.Tensor,
+    residual_out: torch.Tensor,
+    epsilon: float,
+    reg_buffer: int,
+    reg_buffer_sz_bytes: int,
+    row_sums: torch.Tensor | None = None,
+) -> None:
+    if _sm70_fused_ar_library and hasattr(
+        torch.ops.qwen38_c2_ar,
+        "all_reduce_gemma_rms_norm_sm70_cooperative",
+    ):
+        if row_sums is None:
+            raise ValueError("cooperative SM70 fused all-reduce requires row_sums")
+        torch.ops.qwen38_c2_ar.all_reduce_gemma_rms_norm_sm70_cooperative(
+            fa,
+            inp,
+            residual,
+            gamma,
+            norm_out,
+            residual_out,
+            row_sums,
+            epsilon,
+            reg_buffer,
+            reg_buffer_sz_bytes,
+            4,
+            160,
+        )
+        return
+    operator = (
+        torch.ops.qwen38_c2_ar.all_reduce_gemma_rms_norm_sm70
+        if _sm70_fused_ar_library
+        else torch.ops._C_custom_ar.all_reduce_gemma_rms_norm_sm70
+    )
+    operator(
+        fa,
+        inp,
+        residual,
+        gamma,
+        norm_out,
+        residual_out,
+        epsilon,
+        reg_buffer,
+        reg_buffer_sz_bytes,
+    )
 
 
 def top1_argmax(

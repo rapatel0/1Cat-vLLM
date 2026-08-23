@@ -217,6 +217,13 @@ struct TileAllReduceParam {
     int   producer_grid_x;
     int   producer_grid_y;
     int   producer_grid_z;
+    // Optional row-strided tile description.  When rows is non-zero, one
+    // readiness signal covers [rows, tile_columns] values from a row-major
+    // matrix with row_stride columns.  This is used by the Qwen3.8 EXL3
+    // M<=4, N128 epilogue; zero preserves the original contiguous TP2 path.
+    int   rows;
+    int   row_stride;
+    int   tile_columns;
 };
 
 inline Operation transpose(Operation o)

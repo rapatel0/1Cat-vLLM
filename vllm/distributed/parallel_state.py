@@ -155,6 +155,32 @@ def all_reduce_sum2_fake(
     return torch.empty_like(tensor_a)
 
 
+def all_reduce_gemma_rms_norm_sm70(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    epsilon: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    assert group_name in _groups, f"Group {group_name} is not found."
+    group = _groups[group_name]()
+    if group is None:
+        raise ValueError(f"Group {group_name} is destroyed.")
+    return group._all_reduce_gemma_rms_norm_sm70_out_place(
+        tensor, residual, gamma, epsilon
+    )
+
+
+def all_reduce_gemma_rms_norm_sm70_fake(
+    tensor: torch.Tensor,
+    residual: torch.Tensor,
+    gamma: torch.Tensor,
+    epsilon: float,
+    group_name: str,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    return torch.empty_like(tensor), torch.empty_like(tensor, dtype=torch.float32)
+
+
 def sm70_awq_mlp_down_tile_all_reduce(
     tensor: torch.Tensor, group_name: str
 ) -> torch.Tensor:
@@ -336,6 +362,12 @@ direct_register_custom_op(
     op_name="all_reduce_sum2",
     op_func=all_reduce_sum2,
     fake_impl=all_reduce_sum2_fake,
+)
+
+direct_register_custom_op(
+    op_name="all_reduce_gemma_rms_norm_sm70",
+    op_func=all_reduce_gemma_rms_norm_sm70,
+    fake_impl=all_reduce_gemma_rms_norm_sm70_fake,
 )
 
 direct_register_custom_op(
@@ -643,6 +675,47 @@ class GroupCoordinator:
         if self.device_communicator is None:
             raise ValueError("No device communicator found")
         return self.device_communicator.all_reduce_sum2(input_a, input_b)
+
+    def all_reduce_gemma_rms_norm_sm70(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.world_size == 1:
+            residual_out = input_.float() + residual.float()
+            inverse_rms = torch.rsqrt(
+                residual_out.square().mean(dim=-1, keepdim=True) + epsilon
+            )
+            norm_out = (
+                residual_out * inverse_rms * (gamma.float() + 1.0)
+            ).to(input_.dtype)
+            return norm_out, residual_out
+        if self.use_custom_op_call:
+            return torch.ops.vllm.all_reduce_gemma_rms_norm_sm70(
+                input_,
+                residual,
+                gamma,
+                epsilon,
+                group_name=self.unique_name,
+            )
+        return self._all_reduce_gemma_rms_norm_sm70_out_place(
+            input_, residual, gamma, epsilon
+        )
+
+    def _all_reduce_gemma_rms_norm_sm70_out_place(
+        self,
+        input_: torch.Tensor,
+        residual: torch.Tensor,
+        gamma: torch.Tensor,
+        epsilon: float,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if self.device_communicator is None:
+            raise ValueError("No device communicator found")
+        return self.device_communicator.all_reduce_gemma_rms_norm_sm70(
+            input_, residual, gamma, epsilon
+        )
 
     def sm70_awq_mlp_down_tile_all_reduce(
         self, input_: torch.Tensor
@@ -1070,6 +1143,7 @@ class GroupCoordinator:
         dst: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        static_metadata_list: list[tuple[str, Any]] | None = None,
     ) -> list[Handle]:
         if self.world_size <= 1:
             return []
@@ -1096,7 +1170,14 @@ class GroupCoordinator:
         metadata_group = self.cpu_group
 
         metadata_list, tensor_list = _split_tensor_dict(tensor_dict)
-        self.send_object(metadata_list, dst=dst)
+        if static_metadata_list is None:
+            self.send_object(metadata_list, dst=dst)
+        elif metadata_list != static_metadata_list:
+            raise RuntimeError(
+                "pipeline tensor metadata changed while using the static "
+                f"metadata fast path: expected {static_metadata_list}, "
+                f"got {metadata_list}"
+            )
 
         tensor_keys = [k for k, v in tensor_dict.items() if isinstance(v, torch.Tensor)]
         assert len(tensor_keys) == len(tensor_list)
@@ -1164,6 +1245,7 @@ class GroupCoordinator:
         src: int | None = None,
         all_gather_group: "GroupCoordinator | None" = None,
         all_gather_tensors: dict[str, bool] | None = None,
+        static_metadata_list: list[tuple[str, Any]] | None = None,
     ) -> tuple[
         dict[str, torch.Tensor | Any] | None,
         list[Handle],
@@ -1193,7 +1275,9 @@ class GroupCoordinator:
         group = self.device_group
         metadata_group = self.cpu_group
 
-        recv_metadata_list = self.recv_object(src=src)
+        recv_metadata_list = static_metadata_list
+        if recv_metadata_list is None:
+            recv_metadata_list = self.recv_object(src=src)
         tensor_dict: dict[str, Any] = {}
         handles: list[Handle] = []
         postprocess: list[Callable[[], None]] = []

@@ -1165,13 +1165,34 @@ class SpecDecodeBaseProposer:
 
             # Rebuild attention metadata. When draft positions are constant
             # (e.g. Gemma4 MTP), common_attn_metadata is invariant across
-            # loop iterations so we build once and reuse.
+            # loop iterations so we build once and reuse. On SM70 MTP the
+            # slot/seq updates already happened above; reuse the first loop
+            # metadata instead of paying another Flash-V100 builder call.
             if not self.constant_draft_positions or token_index == 0:
-                _, per_layer_attn_metadata = (
-                    self.build_per_group_and_layer_attn_metadata(
-                        common_attn_metadata, draft_index=spec_step_idx
+                if token_index == 0:
+                    _, per_layer_attn_metadata = (
+                        self.build_per_group_and_layer_attn_metadata(
+                            common_attn_metadata, draft_index=spec_step_idx
+                        )
                     )
-                )
+                else:
+                    slot_mapping = common_attn_metadata.slot_mapping
+                    seq_lens = common_attn_metadata.seq_lens
+                    max_seq_len = common_attn_metadata.max_seq_len
+                    for md in per_layer_attn_metadata.values():
+                        if slot_mapping is not None and hasattr(md, "slot_mapping"):
+                            md.slot_mapping = slot_mapping
+                        if seq_lens is not None and hasattr(md, "seq_lens"):
+                            if (
+                                torch.is_tensor(md.seq_lens)
+                                and torch.is_tensor(seq_lens)
+                                and md.seq_lens.shape == seq_lens.shape
+                            ):
+                                md.seq_lens.copy_(seq_lens, non_blocking=True)
+                            else:
+                                md.seq_lens = seq_lens
+                        if hasattr(md, "max_seq_len"):
+                            md.max_seq_len = max_seq_len
 
             # copy inputs to buffer for cudagraph
             self.input_ids[:batch_size] = input_ids

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Benchmark the SM70 TP2 tile-runtime all-reduce prototype."""
+"""Benchmark the SM70 TP2/TP4 tile-runtime all-reduce prototype."""
 
 from __future__ import annotations
 
@@ -19,34 +19,67 @@ def _measure(
     ca: CustomAllreduce,
     tensor: torch.Tensor,
     mode: str,
+    standalone: bool,
     tile_numel: int,
     engine_blocks: int,
     producer_blocks: int,
     reducer_blocks: int,
     compute_iters: int,
+    rank_skew_iters: int,
+    mutate_input: bool,
     replays: int,
     warmup_replays: int,
 ) -> dict[str, Any]:
+    effective_compute_iters = compute_iters + dist.get_rank() * rank_skew_iters
     torch.cuda.synchronize()
     dist.barrier()
 
     graph = torch.cuda.CUDAGraph()
     with torch.cuda.graph(graph):
+        if mutate_input:
+            tensor.neg_()
         if mode == "inline":
-            output = ca.tile_runtime_all_reduce(
-                tensor,
-                tile_numel=tile_numel,
-                engine_blocks=engine_blocks,
-                compute_iters=compute_iters,
-            )
+            if standalone:
+                output = torch.empty_like(tensor)
+                torch.ops.qwen38_tile_ar.tile_runtime_all_reduce(
+                    ca._ptr,
+                    tensor,
+                    output,
+                    ca.buffer_ptrs[ca.rank],
+                    ca.max_size,
+                    tile_numel,
+                    engine_blocks,
+                    effective_compute_iters,
+                )
+            else:
+                output = ca.tile_runtime_all_reduce(
+                    tensor,
+                    tile_numel=tile_numel,
+                    engine_blocks=engine_blocks,
+                    compute_iters=effective_compute_iters,
+                )
         elif mode == "engine":
-            output = ca.tile_runtime_all_reduce_engine(
-                tensor,
-                tile_numel=tile_numel,
-                producer_blocks=producer_blocks,
-                reducer_blocks=reducer_blocks,
-                compute_iters=compute_iters,
-            )
+            if standalone:
+                output = torch.empty_like(tensor)
+                torch.ops.qwen38_tile_ar.tile_runtime_all_reduce_engine(
+                    ca._ptr,
+                    tensor,
+                    output,
+                    ca.buffer_ptrs[ca.rank],
+                    ca.max_size,
+                    tile_numel,
+                    producer_blocks,
+                    reducer_blocks,
+                    effective_compute_iters,
+                )
+            else:
+                output = ca.tile_runtime_all_reduce_engine(
+                    tensor,
+                    tile_numel=tile_numel,
+                    producer_blocks=producer_blocks,
+                    reducer_blocks=reducer_blocks,
+                    compute_iters=effective_compute_iters,
+                )
         else:
             raise ValueError(f"unknown mode: {mode}")
 
@@ -55,8 +88,15 @@ def _measure(
 
     graph.replay()
     torch.cuda.synchronize()
-    ref = tensor.clone()
-    dist.all_reduce(ref)
+    # Match packed_reduce exactly: rank-ordered FP32 accumulation followed by
+    # one downcast.  NCCL's FP16 reduction is a different numerical contract
+    # and can differ by one half ULP even when the tile engine is correct.
+    rank_inputs = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(rank_inputs, tensor)
+    ref_float = rank_inputs[0].float()
+    for rank_input in rank_inputs[1:]:
+        ref_float.add_(rank_input.float())
+    ref = ref_float.to(tensor.dtype)
     max_abs = (output - ref).abs().max().item()
     if max_abs != 0:
         raise RuntimeError(
@@ -79,6 +119,21 @@ def _measure(
     torch.cuda.synchronize()
     dist.barrier()
 
+    # Revalidate the last replay, not only the first.  With --mutate-input the
+    # graph flips every rank's input each epoch, exposing stale readiness flags
+    # that a constant input could conceal.
+    rank_inputs = [torch.empty_like(tensor) for _ in range(dist.get_world_size())]
+    dist.all_gather(rank_inputs, tensor)
+    ref_float = rank_inputs[0].float()
+    for rank_input in rank_inputs[1:]:
+        ref_float.add_(rank_input.float())
+    final_max_abs = (output - ref_float.to(tensor.dtype)).abs().max().item()
+    if final_max_abs != 0:
+        raise RuntimeError(
+            "tile runtime all-reduce final replay mismatch: "
+            f"tile_numel={tile_numel} final_max_abs={final_max_abs}"
+        )
+
     return {
         "avg_ms": start.elapsed_time(end) / replays,
         "mode": mode,
@@ -87,9 +142,14 @@ def _measure(
         "producer_blocks": producer_blocks,
         "reducer_blocks": reducer_blocks,
         "compute_iters": compute_iters,
+        "effective_compute_iters": effective_compute_iters,
+        "rank_skew_iters": rank_skew_iters,
+        "mutate_input": mutate_input,
         "total_numel": tensor.numel(),
         "dtype": str(tensor.dtype).replace("torch.", ""),
+        "standalone": standalone,
         "max_abs": max_abs,
+        "final_max_abs": final_max_abs,
     }
 
 
@@ -102,17 +162,30 @@ def main() -> None:
     parser.add_argument("--producer-blocks", default="0")
     parser.add_argument("--reducer-blocks", default="0")
     parser.add_argument("--compute-iters", default="0")
+    parser.add_argument(
+        "--rank-skew-iters",
+        type=int,
+        default=0,
+        help="add rank * this many producer-delay iterations",
+    )
+    parser.add_argument("--mutate-input", action="store_true")
     parser.add_argument("--replays", type=int, default=3000)
     parser.add_argument("--warmup-replays", type=int, default=100)
     parser.add_argument("--dtype", default="float16", choices=["float16", "float32"])
     parser.add_argument("--max-size-bytes", type=int, default=8 * 1024 * 1024)
     parser.add_argument("--json-out")
+    parser.add_argument(
+        "--library",
+        help="load a standalone qwen38_tile_ar experiment library",
+    )
     args = parser.parse_args()
 
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
     world_size = int(os.environ["WORLD_SIZE"])
     torch.cuda.set_device(local_rank)
+    if args.library:
+        torch.ops.load_library(args.library)
     dist.init_process_group(backend="nccl")
     gloo_group = dist.new_group(backend="gloo")
 
@@ -120,8 +193,10 @@ def main() -> None:
     ca = CustomAllreduce(group=gloo_group, device=local_rank, max_size=args.max_size_bytes)
 
     try:
-        if world_size != 2:
-            raise RuntimeError("SM70 tile runtime prototype benchmark requires TP2")
+        if world_size not in (2, 4):
+            raise RuntimeError(
+                "SM70 tile runtime prototype benchmark requires TP2 or TP4"
+            )
         if ca.disabled:
             raise RuntimeError("custom allreduce disabled")
 
@@ -159,11 +234,14 @@ def main() -> None:
                                     ca,
                                     tensor,
                                     mode,
+                                    bool(args.library),
                                     tile_numel,
                                     engine_blocks,
                                     0,
                                     0,
                                     compute_iters,
+                                    args.rank_skew_iters,
+                                    args.mutate_input,
                                     args.replays,
                                     args.warmup_replays,
                                 )
@@ -179,11 +257,14 @@ def main() -> None:
                                         ca,
                                         tensor,
                                         mode,
+                                        bool(args.library),
                                         tile_numel,
                                         0,
                                         producer_blocks,
                                         reducer_blocks,
                                         compute_iters,
+                                        args.rank_skew_iters,
+                                        args.mutate_input,
                                         args.replays,
                                         args.warmup_replays,
                                     )

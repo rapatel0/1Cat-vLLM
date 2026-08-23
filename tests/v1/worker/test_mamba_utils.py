@@ -398,6 +398,7 @@ def _run_gpu_postprocess(
     gpu_ctx.run_fused_postprocess(
         num_reqs=len(req_ids),
         num_accepted_tokens_gpu=t(num_accepted_tokens),
+        spec_state_slot_selectors_gpu=t(num_accepted_tokens),
         mamba_state_idx_gpu=t(mamba_state_idx),
         num_scheduled_tokens_gpu=t([num_scheduled_tokens[r] for r in req_ids]),
         num_computed_tokens_gpu=t(num_computed_tokens),

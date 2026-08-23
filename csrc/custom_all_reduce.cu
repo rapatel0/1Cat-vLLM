@@ -197,6 +197,112 @@ void all_reduce_sum2(fptr_t _fa, torch::Tensor& inp_a, torch::Tensor& inp_b,
   }
 }
 
+void all_reduce_gemma_rms_norm_sm70(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& gamma, torch::Tensor& norm_out,
+    torch::Tensor& residual_out, double epsilon, fptr_t _reg_buffer,
+    int64_t reg_buffer_sz_bytes) {
+#ifdef USE_ROCM
+  TORCH_CHECK(false, "SM70 fused allreduce Gemma RMSNorm is CUDA-only");
+#else
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK_EQ(inp.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(residual.scalar_type(), at::ScalarType::Float);
+  TORCH_CHECK_EQ(gamma.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(norm_out.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(residual_out.scalar_type(), at::ScalarType::Float);
+  TORCH_CHECK_EQ(inp.dim(), 2);
+  TORCH_CHECK(residual.sizes() == inp.sizes());
+  TORCH_CHECK(norm_out.sizes() == inp.sizes());
+  TORCH_CHECK(residual_out.sizes() == inp.sizes());
+  TORCH_CHECK_EQ(gamma.dim(), 1);
+  TORCH_CHECK_EQ(gamma.numel(), inp.size(1));
+  TORCH_CHECK(_is_weak_contiguous(inp));
+  TORCH_CHECK(_is_weak_contiguous(residual));
+  TORCH_CHECK(_is_weak_contiguous(gamma));
+  TORCH_CHECK(_is_weak_contiguous(norm_out));
+  TORCH_CHECK(_is_weak_contiguous(residual_out));
+
+  auto input_size = inp.numel() * inp.element_size();
+  auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+  if (reg_buffer) {
+    TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
+    AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size,
+                                  cudaMemcpyDeviceToDevice, stream));
+  } else {
+    reg_buffer = inp.data_ptr();
+  }
+
+  fa->allreduce_gemma_rms_norm_sm70(
+      stream, reinterpret_cast<half*>(reg_buffer),
+      reinterpret_cast<const float*>(residual.data_ptr()),
+      reinterpret_cast<const half*>(gamma.data_ptr()),
+      reinterpret_cast<half*>(norm_out.data_ptr()),
+      reinterpret_cast<float*>(residual_out.data_ptr()), inp.size(0),
+      inp.size(1), static_cast<float>(epsilon));
+#endif
+}
+
+void all_reduce_gemma_rms_norm_sm70_cooperative(
+    fptr_t _fa, torch::Tensor& inp, torch::Tensor& residual,
+    torch::Tensor& gamma, torch::Tensor& norm_out,
+    torch::Tensor& residual_out, torch::Tensor& row_sums, double epsilon,
+    fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes, int64_t ctas_per_row,
+    int64_t threads) {
+#ifdef USE_ROCM
+  TORCH_CHECK(false,
+              "SM70 cooperative fused allreduce Gemma RMSNorm is CUDA-only");
+#else
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  const at::cuda::OptionalCUDAGuard device_guard(device_of(inp));
+  auto stream = c10::cuda::getCurrentCUDAStream().stream();
+
+  TORCH_CHECK_EQ(inp.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(residual.scalar_type(), at::ScalarType::Float);
+  TORCH_CHECK_EQ(gamma.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(norm_out.scalar_type(), at::ScalarType::Half);
+  TORCH_CHECK_EQ(residual_out.scalar_type(), at::ScalarType::Float);
+  TORCH_CHECK_EQ(row_sums.scalar_type(), at::ScalarType::Float);
+  TORCH_CHECK_EQ(inp.dim(), 2);
+  TORCH_CHECK(residual.sizes() == inp.sizes());
+  TORCH_CHECK(norm_out.sizes() == inp.sizes());
+  TORCH_CHECK(residual_out.sizes() == inp.sizes());
+  TORCH_CHECK_EQ(gamma.dim(), 1);
+  TORCH_CHECK_EQ(gamma.numel(), inp.size(1));
+  TORCH_CHECK_EQ(row_sums.dim(), 2);
+  TORCH_CHECK_EQ(row_sums.size(0), inp.size(0));
+  TORCH_CHECK_EQ(row_sums.size(1), 4);
+  TORCH_CHECK(_is_weak_contiguous(inp));
+  TORCH_CHECK(_is_weak_contiguous(residual));
+  TORCH_CHECK(_is_weak_contiguous(gamma));
+  TORCH_CHECK(_is_weak_contiguous(norm_out));
+  TORCH_CHECK(_is_weak_contiguous(residual_out));
+  TORCH_CHECK(_is_weak_contiguous(row_sums));
+
+  auto input_size = inp.numel() * inp.element_size();
+  auto reg_buffer = reinterpret_cast<void*>(_reg_buffer);
+  if (reg_buffer) {
+    TORCH_CHECK_LE(input_size, reg_buffer_sz_bytes);
+    AT_CUDA_CHECK(cudaMemcpyAsync(reg_buffer, inp.data_ptr(), input_size,
+                                  cudaMemcpyDeviceToDevice, stream));
+  } else {
+    reg_buffer = inp.data_ptr();
+  }
+
+  fa->allreduce_gemma_rms_norm_sm70_cooperative(
+      stream, reinterpret_cast<half*>(reg_buffer),
+      reinterpret_cast<const float*>(residual.data_ptr()),
+      reinterpret_cast<const half*>(gamma.data_ptr()),
+      reinterpret_cast<half*>(norm_out.data_ptr()),
+      reinterpret_cast<float*>(residual_out.data_ptr()),
+      reinterpret_cast<float*>(row_sums.data_ptr()), inp.size(0), inp.size(1),
+      static_cast<float>(epsilon), ctas_per_row, threads);
+#endif
+}
+
 void top1_argmax(fptr_t _fa, torch::Tensor& input_pair, torch::Tensor& output,
                  fptr_t _reg_buffer, int64_t reg_buffer_sz_bytes) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);

@@ -418,8 +418,12 @@ class Scheduler(SchedulerInterface):
             # last chunk must be not smaller than `block_size`.
             block_size = self.cache_config.block_size
             last_cache_position = request.num_tokens - request.num_tokens % block_size
-            # eagle prune
-            if self.use_eagle:
+            # Eagle prunes the last matched block so MTP can recompute hidden
+            # states.  With hybrid GDN pages of 800 tokens that costs a 1k-token
+            # recompute / 2s TTFT.  Skip the prune when a block is larger than
+            # a normal attention page; the matching FullAttention hit path also
+            # keeps that last block.
+            if self.use_eagle and block_size <= 64:
                 last_cache_position = max(last_cache_position - block_size, 0)
             num_computed_tokens_after_sched = num_computed_tokens + num_new_tokens
             if num_computed_tokens_after_sched < last_cache_position:

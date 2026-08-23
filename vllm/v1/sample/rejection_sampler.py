@@ -31,12 +31,159 @@ logger = init_logger(__name__)
 
 _SPEC_ALIGNMENT_DUMP_COUNT = 0
 _SPEC_ALIGNMENT_STEP_COUNTER = 0
+_QWEN38_TARGET_REFERENCE_DUMP_COUNTER = 0
 
 PLACEHOLDER_TOKEN_ID: tl.constexpr = -1
 GREEDY_TEMPERATURE: tl.constexpr = 0
 # Maximum number of speculative draft tokens allowed per request in a single
 # step. This value is chosen to be large enough to handle typical use cases.
 MAX_SPEC_LEN = 128
+
+
+def _maybe_dump_qwen38_target_reference(
+    raw_target_logits: torch.Tensor,
+    metadata: SpecDecodeMetadata,
+) -> None:
+    """Dump the target row conditioned only on the committed request prefix."""
+    dump_dir = os.environ.get("VLLM_SM70_DUMP_SAMPLER_LOGITS_DIR")
+    if not dump_dir:
+        return
+    enable_file = os.environ.get("VLLM_SM70_DUMP_SAMPLER_LOGITS_ENABLE_FILE")
+    if enable_file and not os.path.exists(enable_file):
+        return
+    if metadata.num_draft_tokens != [3] or raw_target_logits.shape[0] != 3:
+        return
+
+    global _QWEN38_TARGET_REFERENCE_DUMP_COUNTER
+    _QWEN38_TARGET_REFERENCE_DUMP_COUNTER += 1
+    max_steps = int(os.environ.get("VLLM_SM70_DUMP_SAMPLER_LOGITS_MAX_STEPS", "0"))
+    if max_steps > 0 and max_steps < _QWEN38_TARGET_REFERENCE_DUMP_COUNTER:
+        return
+
+    os.makedirs(dump_dir, exist_ok=True)
+    reference_logits = raw_target_logits[:1]
+    torch.save(
+        {
+            "logits": reference_logits.detach().cpu(),
+            "stage": "target_committed_prefix",
+            "step": _QWEN38_TARGET_REFERENCE_DUMP_COUNTER,
+            "pid": os.getpid(),
+            "shape": tuple(reference_logits.shape),
+            "dtype": str(reference_logits.dtype),
+            "draft_token_ids": metadata.draft_token_ids.detach().cpu(),
+        },
+        os.path.join(
+            dump_dir,
+            (
+                f"target_reference_pid{os.getpid()}"
+                f"_step{_QWEN38_TARGET_REFERENCE_DUMP_COUNTER:04d}.pt"
+            ),
+        ),
+    )
+
+
+_SM70_COMPACT_TOP_K = 20
+
+
+@triton.jit(do_not_specialize=["max_spec_len"])
+def _sm70_compact_topk20_rejection_kernel(
+    output_token_ids_ptr,
+    cu_num_draft_tokens_ptr,
+    draft_token_ids_ptr,
+    target_topk_ids_ptr,
+    target_topk_probs_ptr,
+    bonus_token_ids_ptr,
+    uniform_probs_ptr,
+    inv_q_ptr,
+    max_spec_len,
+    vocab_size: tl.constexpr,
+    relative_prob: tl.constexpr,
+    force_target_relative: tl.constexpr,
+    support_size: tl.constexpr,
+    support_block: tl.constexpr,
+):
+    """Batch-row rejection over compact target support.
+
+    The production drafter is greedy, so its proposal probability is one.
+    Recovery therefore samples from ``max(p - delta_draft, 0)``. The full-
+    vocabulary exponential-noise tensor is retained outside this kernel to
+    preserve the generic sampler's RNG consumption and recovery draw.
+    """
+    req_idx = tl.program_id(0)
+    start_idx = 0 if req_idx == 0 else tl.load(
+        cu_num_draft_tokens_ptr + req_idx - 1
+    )
+    end_idx = tl.load(cu_num_draft_tokens_ptr + req_idx)
+    num_draft_tokens = end_idx - start_idx
+    support_offsets = tl.arange(0, support_block)
+    support_mask = support_offsets < support_size
+
+    rejected = False
+    for pos in range(num_draft_tokens):
+        if not rejected:
+            flat_pos = start_idx + pos
+            support_base = flat_pos * support_size
+            target_ids = tl.load(
+                target_topk_ids_ptr + support_base + support_offsets,
+                mask=support_mask,
+                other=0,
+            )
+            target_probs = tl.load(
+                target_topk_probs_ptr + support_base + support_offsets,
+                mask=support_mask,
+                other=0.0,
+            )
+            draft_token_id = tl.load(draft_token_ids_ptr + flat_pos).to(tl.int64)
+            draft_prob = tl.max(
+                tl.where(target_ids == draft_token_id, target_probs, 0.0)
+            )
+            mode_prob = tl.max(target_probs)
+            uniform_prob = tl.load(uniform_probs_ptr + flat_pos)
+            forced = False
+            if force_target_relative:
+                forced = draft_prob >= relative_prob * mode_prob
+            accepted = forced or (draft_prob > 0.0 and draft_prob >= uniform_prob)
+
+            if accepted:
+                token_id = draft_token_id
+            else:
+                inv_q = tl.load(
+                    inv_q_ptr
+                    + req_idx * vocab_size
+                    + target_ids,
+                    mask=support_mask,
+                    other=0.0,
+                )
+                # The production drafter is greedy, so q is a delta at the
+                # proposed token. Standard rejection recovery samples from
+                # max(p - q, 0), which gives the rejected draft token exactly
+                # zero recovery mass. Leaving it in the compact support changes
+                # the distribution and can immediately resample the token that
+                # was just rejected.
+                recovery_scores = tl.where(
+                    target_ids == draft_token_id,
+                    0.0,
+                    target_probs * inv_q,
+                )
+                recovered_offset = tl.argmax(recovery_scores, axis=0)
+                token_id = tl.load(
+                    target_topk_ids_ptr + support_base + recovered_offset
+                )
+                rejected = True
+
+            tl.store(
+                output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos,
+                token_id,
+            )
+
+    if not rejected:
+        bonus_token_id = tl.load(bonus_token_ids_ptr + req_idx)
+        tl.store(
+            output_token_ids_ptr
+            + req_idx * (max_spec_len + 1)
+            + num_draft_tokens,
+            bonus_token_id,
+        )
 
 
 @triton.jit
@@ -181,6 +328,22 @@ class RejectionSampler(nn.Module):
                 device=device,
             )
         self.synthetic_mode = self.synthetic_conditional_rates is not None
+        self.sm70_compact_topk20_enabled = (
+            os.getenv("VLLM_SM70_MTP_COMPACT_TOPK20_REJECTION", "0") == "1"
+        )
+        self.sm70_fused_rejection_aux_enabled = (
+            os.getenv("VLLM_SM70_FUSED_REJECTION_AUX", "0") == "1"
+        )
+        self.sm70_compact_topk20_relative_prob: float | None = None
+        if self.sm70_compact_topk20_enabled:
+            relative_prob_raw = os.getenv("VLLM_MTP_FORCE_TARGET_RELATIVE_PROB")
+            if relative_prob_raw is not None:
+                relative_prob = float(relative_prob_raw)
+                if not 0.0 < relative_prob <= 1.0:
+                    raise ValueError(
+                        "VLLM_MTP_FORCE_TARGET_RELATIVE_PROB must be in (0, 1]"
+                    )
+                self.sm70_compact_topk20_relative_prob = relative_prob
 
     def forward(
         self,
@@ -252,6 +415,7 @@ class RejectionSampler(nn.Module):
         raw_target_logits = logits[target_logits_indices]
         # Use float32 for the target_logits.
         raw_target_logits = raw_target_logits.to(torch.float32)
+        _maybe_dump_qwen38_target_reference(raw_target_logits, metadata)
         target_logits = raw_target_logits
         if not self.is_processed_logprobs_mode:
             # Clone raw_target_logits before applying processors to preserve
@@ -261,6 +425,25 @@ class RejectionSampler(nn.Module):
         target_logits = self.apply_logits_processors(
             target_logits, sampling_metadata, metadata
         )
+        if _sm70_compact_topk20_rejection_enabled(
+            metadata,
+            draft_probs,
+            target_logits,
+            sampling_metadata,
+            self.synthetic_mode,
+            self.sm70_compact_topk20_enabled,
+        ):
+            output_token_ids = sm70_compact_topk20_rejection_sample(
+                metadata,
+                target_logits,
+                bonus_token_ids,
+                sampling_metadata,
+                self.sm70_compact_topk20_relative_prob,
+            )
+            return SamplerOutput(
+                sampled_token_ids=output_token_ids,
+                logprobs_tensors=None,
+            )
         # [num_tokens, vocab_size]
         # NOTE(woosuk): `target_logits` can be updated in place inside the
         # `apply_sampling_constraints` function.
@@ -269,7 +452,28 @@ class RejectionSampler(nn.Module):
             metadata.cu_num_draft_tokens,
             sampling_metadata,
         )
-        output_token_ids = rejection_sample(
+        fused_rejection_aux = (
+            self.sm70_fused_rejection_aux_enabled
+            and target_logits.is_cuda
+            and sampling_metadata.all_random
+            and sampling_metadata.max_num_logprobs is None
+            and metadata.max_spec_len == 3
+            and bool(metadata.num_draft_tokens)
+            and all(num_draft == 3 for num_draft in metadata.num_draft_tokens)
+        )
+        if self.sm70_fused_rejection_aux_enabled:
+            if fused_rejection_aux:
+                logger.info_once("Using fused rejection auxiliary outputs")
+            else:
+                logger.info_once(
+                    "Fused rejection auxiliary outputs gated off: "
+                    f"cuda={target_logits.is_cuda} "
+                    f"all_random={sampling_metadata.all_random} "
+                    f"max_num_logprobs={sampling_metadata.max_num_logprobs} "
+                    f"num_draft_tokens={metadata.num_draft_tokens} "
+                    f"max_spec_len={metadata.max_spec_len}"
+                )
+        rejection_result = rejection_sample(
             metadata.draft_token_ids,
             metadata.num_draft_tokens,
             metadata.max_spec_len,
@@ -280,7 +484,20 @@ class RejectionSampler(nn.Module):
             sampling_metadata,
             synthetic_mode=self.synthetic_mode,
             synthetic_conditional_rates=self.synthetic_conditional_rates,
+            return_aux=fused_rejection_aux,
         )
+        valid_sampled_token_count = None
+        next_token_ids = None
+        if fused_rejection_aux:
+            assert isinstance(rejection_result, tuple)
+            (
+                output_token_ids,
+                valid_sampled_token_count,
+                next_token_ids,
+            ) = rejection_result
+        else:
+            assert isinstance(rejection_result, torch.Tensor)
+            output_token_ids = rejection_result
         self._maybe_dump_alignment(
             metadata=metadata,
             draft_probs=draft_probs,
@@ -306,6 +523,8 @@ class RejectionSampler(nn.Module):
         return SamplerOutput(
             sampled_token_ids=output_token_ids,
             logprobs_tensors=logprobs_tensors,
+            valid_sampled_token_count=valid_sampled_token_count,
+            next_token_ids=next_token_ids,
         )
 
     def _sample_by_token_matching(
@@ -675,6 +894,134 @@ class RejectionSampler(nn.Module):
         return result
 
 
+def _sm70_compact_topk20_rejection_enabled(
+    metadata: SpecDecodeMetadata,
+    draft_probs: torch.Tensor | None,
+    target_logits: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+    synthetic_mode: bool,
+    compact_enabled: bool,
+) -> bool:
+    """Gate the exact production-shape compact rejection path.
+
+    InputBatch validates top-k, top-p, temperature, and batch shape from its
+    CPU-side mirrors when request metadata changes. Consuming that boolean here
+    avoids a device synchronization on every speculative decode step.
+    """
+    enabled = (
+        compact_enabled
+        and target_logits.is_cuda
+        and draft_probs is None
+        and not synthetic_mode
+        and sampling_metadata.all_random
+        and sampling_metadata.sm70_compact_topk20_eligible
+        and sampling_metadata.top_k is not None
+        and sampling_metadata.top_p is not None
+        and sampling_metadata.max_num_logprobs is None
+        and len(metadata.num_draft_tokens) == 1
+        and metadata.max_spec_len == 3
+        and metadata.num_draft_tokens == [3]
+    )
+    if enabled:
+        logger.info_once(
+            "Using compact top-k-20 rejection/recovery for batch-1 SM70 MTP3"
+        )
+    return enabled
+
+
+def _sm70_compact_topk20_probs(
+    logits: torch.Tensor,
+    temperature: torch.Tensor,
+    top_p: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Return token IDs and normalized probabilities on top-k-20 support."""
+    logits.div_(temperature[0])
+    topk_values, topk_ids = torch.topk(
+        logits,
+        _SM70_COMPACT_TOP_K,
+        dim=-1,
+        sorted=True,
+    )
+    topk_probs = topk_values.softmax(dim=-1, dtype=torch.float32)
+    exclusive_mass = topk_probs.cumsum(dim=-1) - topk_probs
+    topk_values.masked_fill_(exclusive_mass >= top_p[0], -float("inf"))
+    constrained_probs = topk_values.softmax(dim=-1, dtype=torch.float32)
+    return topk_ids, constrained_probs
+
+
+def sm70_compact_topk20_rejection_sample(
+    metadata: SpecDecodeMetadata,
+    target_logits: torch.Tensor,
+    bonus_token_ids: torch.Tensor,
+    sampling_metadata: SamplingMetadata,
+    relative_prob: float | None,
+) -> torch.Tensor:
+    """Production top-k-20 rejection without dense target probabilities.
+
+    ``relative_prob=None`` preserves standard rejection-sampling semantics.
+    A configured value applies the same optional forced-acceptance heuristic
+    as the dense fallback path.
+    """
+    batch_size = len(metadata.num_draft_tokens)
+    num_tokens, vocab_size = target_logits.shape
+    device = target_logits.device
+    assert batch_size == 1
+    assert num_tokens == sum(metadata.num_draft_tokens)
+    assert sampling_metadata.temperature is not None
+    assert sampling_metadata.top_p is not None
+    assert _SM70_COMPACT_TOP_K <= 32
+
+    target_topk_ids, target_topk_probs = _sm70_compact_topk20_probs(
+        target_logits,
+        sampling_metadata.temperature,
+        sampling_metadata.top_p,
+    )
+    uniform_probs = generate_uniform_probs(
+        num_tokens,
+        metadata.num_draft_tokens,
+        sampling_metadata.generators,
+        device,
+    )
+
+    # Match sample_recovered_tokens' one full-vocabulary exponential-noise row
+    # per request. Only the 20 selected entries are read by the fused kernel,
+    # but generating the full row preserves RNG advancement and recovery draws.
+    q = torch.empty(
+        (batch_size, vocab_size),
+        dtype=torch.float32,
+        device=device,
+    )
+    q.exponential_()
+    for req_idx, generator in sampling_metadata.generators.items():
+        if metadata.num_draft_tokens[req_idx] > 0:
+            q[req_idx].exponential_(generator=generator)
+    inv_q = q.reciprocal()
+
+    output_token_ids = torch.full(
+        (batch_size, metadata.max_spec_len + 1),
+        PLACEHOLDER_TOKEN_ID,
+        dtype=torch.int32,
+        device=device,
+    )
+    _sm70_compact_topk20_rejection_kernel[(batch_size,)](
+        output_token_ids,
+        metadata.cu_num_draft_tokens,
+        metadata.draft_token_ids,
+        target_topk_ids,
+        target_topk_probs,
+        bonus_token_ids,
+        uniform_probs,
+        inv_q,
+        metadata.max_spec_len,
+        vocab_size=vocab_size,
+        relative_prob=relative_prob if relative_prob is not None else 1.0,
+        force_target_relative=relative_prob is not None,
+        support_size=_SM70_COMPACT_TOP_K,
+        support_block=32,
+    )
+    return output_token_ids
+
+
 def rejection_sample(
     # [num_tokens]
     draft_token_ids: torch.Tensor,
@@ -692,7 +1039,8 @@ def rejection_sample(
     sampling_metadata: SamplingMetadata,
     synthetic_mode: bool = False,
     synthetic_conditional_rates: torch.Tensor | None = None,
-) -> torch.Tensor:
+    return_aux: bool = False,
+) -> torch.Tensor | tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
     assert draft_token_ids.ndim == 1
     assert draft_probs is None or draft_probs.ndim == 2
     assert cu_num_draft_tokens.ndim == 1
@@ -706,6 +1054,15 @@ def rejection_sample(
     assert draft_probs is None or draft_probs.is_contiguous()
     assert bonus_token_ids.is_contiguous()
     assert target_logits.shape == (num_tokens, vocab_size)
+    if return_aux:
+        # The first specialized consumer is the production random-sampling
+        # q=4 path. Keep every other rejection mode on its established
+        # contract; in particular this excludes zero-draft and mixed-greedy
+        # rows whose auxiliary outputs would otherwise be undefined.
+        assert sampling_metadata.all_random
+        assert num_draft_tokens
+        assert all(num_draft == 3 for num_draft in num_draft_tokens)
+        assert max_spec_len == 3
 
     # Create output buffer.
     output_token_ids = torch.full(
@@ -713,6 +1070,16 @@ def rejection_sample(
         PLACEHOLDER_TOKEN_ID,
         dtype=torch.int32,  # Consistent with SamplerOutput.sampled_token_ids.
         device=device,
+    )
+    valid_sampled_token_count = (
+        torch.empty((batch_size,), dtype=torch.int32, device=device)
+        if return_aux
+        else None
+    )
+    next_token_ids = (
+        torch.empty((batch_size,), dtype=torch.int32, device=device)
+        if return_aux
+        else None
     )
 
     if sampling_metadata.all_greedy:
@@ -789,6 +1156,8 @@ def rejection_sample(
     assert uniform_probs is not None
     rejection_random_sample_kernel[(batch_size,)](
         output_token_ids,
+        valid_sampled_token_count,
+        next_token_ids,
         cu_num_draft_tokens,
         draft_token_ids,
         draft_probs,
@@ -802,7 +1171,12 @@ def rejection_sample(
         synthetic_conditional_rates,
         NO_DRAFT_PROBS=draft_probs is None,
         SYNTHETIC_MODE=synthetic_mode,
+        WRITE_AUX=return_aux,
     )
+    if return_aux:
+        assert valid_sampled_token_count is not None
+        assert next_token_ids is not None
+        return output_token_ids, valid_sampled_token_count, next_token_ids
     return output_token_ids
 
 
@@ -1125,6 +1499,8 @@ def rejection_greedy_sample_kernel(
 @triton.jit(do_not_specialize=["max_spec_len"])
 def rejection_random_sample_kernel(
     output_token_ids_ptr,  # [batch_size, max_spec_len + 1]
+    valid_sampled_token_count_ptr,  # [batch_size] or None
+    next_token_ids_ptr,  # [batch_size] or None
     cu_num_draft_tokens_ptr,  # [batch_size]
     draft_token_ids_ptr,  # [num_tokens]
     draft_probs_ptr,  # [num_tokens, vocab_size] or None
@@ -1138,6 +1514,7 @@ def rejection_random_sample_kernel(
     synthetic_conditional_rates_ptr,  # [num_speculative_tokens] or None
     NO_DRAFT_PROBS: tl.constexpr,
     SYNTHETIC_MODE: tl.constexpr,
+    WRITE_AUX: tl.constexpr,
 ):
     req_idx = tl.program_id(0)
     is_greedy = tl.load(is_greedy_ptr + req_idx)
@@ -1150,6 +1527,8 @@ def rejection_random_sample_kernel(
     num_draft_tokens = end_idx - start_idx
 
     rejected = False
+    valid_count = tl.full((), 0, tl.int32)
+    next_token_id = tl.full((), -1, tl.int32)
     for pos in range(num_draft_tokens):
         if not rejected:
             draft_token_id = tl.load(draft_token_ids_ptr + start_idx + pos)
@@ -1180,6 +1559,8 @@ def rejection_random_sample_kernel(
             tl.store(
                 output_token_ids_ptr + req_idx * (max_spec_len + 1) + pos, token_id
             )
+            valid_count = pos + 1
+            next_token_id = token_id
 
     if not rejected:
         # If all tokens are accepted, append the bonus token.
@@ -1188,6 +1569,12 @@ def rejection_random_sample_kernel(
             output_token_ids_ptr + req_idx * (max_spec_len + 1) + num_draft_tokens,
             bonus_token_id,
         )
+        valid_count = num_draft_tokens + 1
+        next_token_id = bonus_token_id
+
+    if WRITE_AUX:
+        tl.store(valid_sampled_token_count_ptr + req_idx, valid_count)
+        tl.store(next_token_ids_ptr + req_idx, next_token_id)
 
 
 # NOTE(woosuk): Avoid specialization to prevent unnecessary recompilation.

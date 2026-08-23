@@ -39,6 +39,38 @@ def test_qwen3_5_split_gdn_detects_compressed_tensors_config_ignore():
     assert _uses_split_gdn_input_projections(quant_config)
 
 
+def test_qwen3_5_split_gdn_detects_exl3_tensor_storage():
+    from vllm.model_executor.models.qwen3_5 import (
+        _uses_split_gdn_input_projections,
+    )
+
+    prefix = "model.language_model.layers.0.linear_attn"
+    quant_config = _QuantConfig()
+    quant_config.tensor_storage = {
+        f"{prefix}.in_proj_qkv": {"quant_format": "exl3"},
+        f"{prefix}.in_proj_z": {"quant_format": "exl3"},
+        f"{prefix}.in_proj_b": {"quant_format": None},
+        f"{prefix}.in_proj_a": {"quant_format": None},
+    }
+
+    assert _uses_split_gdn_input_projections(quant_config)
+
+
+def test_qwen3_5_split_gdn_requires_both_exl3_ba_records():
+    from vllm.model_executor.models.qwen3_5 import (
+        _uses_split_gdn_input_projections,
+    )
+
+    quant_config = _QuantConfig()
+    quant_config.tensor_storage = {
+        "model.language_model.layers.0.linear_attn.in_proj_a": {
+            "quant_format": None
+        }
+    }
+
+    assert not _uses_split_gdn_input_projections(quant_config)
+
+
 def test_qwen3_5_lm_head_receives_quant_config():
     from vllm.model_executor.models.qwen3_5 import Qwen3_5ForCausalLMBase
 

@@ -5,6 +5,10 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
 
+#if !defined(USE_ROCM)
+#include <cooperative_groups.h>
+#endif
+
 #if defined(USE_ROCM)
 typedef __hip_bfloat16 nv_bfloat16;
 #endif
@@ -375,6 +379,168 @@ __global__ void __launch_bounds__(512, 1)
   }
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
 }
+
+#ifndef USE_ROCM
+namespace cg = cooperative_groups;
+
+DINLINE float sm70_warp_sum(float value) {
+#pragma unroll
+  for (int offset = 16; offset > 0; offset >>= 1) {
+    value += __shfl_down_sync(0xffffffff, value, offset);
+  }
+  return value;
+}
+
+DINLINE float sm70_block_sum(float value) {
+  __shared__ float warp_sums[32];
+  const int lane = threadIdx.x & 31;
+  const int warp = threadIdx.x >> 5;
+  value = sm70_warp_sum(value);
+  if (lane == 0) warp_sums[warp] = value;
+  __syncthreads();
+
+  value = threadIdx.x < (blockDim.x + 31) / 32 ? warp_sums[lane] : 0.0f;
+  if (warp == 0) value = sm70_warp_sum(value);
+  if (threadIdx.x == 0) warp_sums[0] = value;
+  __syncthreads();
+  return warp_sums[0];
+}
+
+// Exact-shape TP4 decode fusion.  The rank accumulation deliberately uses
+// packed_reduce so its FP16 rounding and rank order match the existing custom
+// all-reduce before residual addition and Gemma RMSNorm.
+template <int ngpus>
+__global__ void __launch_bounds__(256, 1)
+    cross_device_reduce_gemma_rms_norm_sm70(
+        RankData* _dp, RankSignals sg, Signal* self_sg,
+        const float* __restrict__ residual,
+        const half* __restrict__ gamma, half* __restrict__ norm_out,
+        float* __restrict__ residual_out, int rank, int hidden_size,
+        float epsilon) {
+  using P = typename packed_t<half>::P;
+  using A = typename packed_t<half>::A;
+  constexpr int pack_size = P::size;
+
+  auto dp = *_dp;
+  const int row = blockIdx.x;
+  const int row_offset = row * hidden_size;
+  const int packs_per_row = hidden_size / pack_size;
+  float square_sum = 0.0f;
+
+  barrier_at_start<ngpus>(sg, self_sg, rank);
+  for (int pack = threadIdx.x; pack < packs_per_row; pack += blockDim.x) {
+    const int packed_index = row * packs_per_row + pack;
+    const P reduced =
+        packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], packed_index);
+#pragma unroll
+    for (int item = 0; item < pack_size; ++item) {
+      const int column = pack * pack_size + item;
+      const int index = row_offset + column;
+      const float value = __half2float(reduced.data[item]) + residual[index];
+      residual_out[index] = value;
+      square_sum = fmaf(value, value, square_sum);
+    }
+  }
+
+  const float inverse_rms =
+      rsqrtf(sm70_block_sum(square_sum) / hidden_size + epsilon);
+  for (int pack = threadIdx.x; pack < packs_per_row; pack += blockDim.x) {
+    P normalized;
+#pragma unroll
+    for (int item = 0; item < pack_size; ++item) {
+      const int column = pack * pack_size + item;
+      const int index = row_offset + column;
+      const float scale = 1.0f + __half2float(gamma[column]);
+      normalized.data[item] =
+          __float2half_rn(residual_out[index] * inverse_rms * scale);
+    }
+    reinterpret_cast<P*>(norm_out)[row * packs_per_row + pack] = normalized;
+  }
+  barrier_at_end<ngpus, true>(sg, self_sg, rank);
+}
+
+// Multiple CTAs cooperate on each 5,120-wide row.  The grid is deliberately
+// small (at most 16 CTAs for the qualified M=4 shape), so a cooperative launch
+// can make every CTA resident before the grid-wide barriers.  Block zero alone
+// performs the cross-rank readiness handshake; a grid barrier then publishes
+// that readiness locally.  Repeating the identical peer handshake in every
+// CTA only adds signal traffic.  Each CTA owns one contiguous pack slice, the
+// FP16 TP4 rank accumulation order remains identical to packed_reduce, and
+// residual_out stays bitwise equal to the established one-stage path.
+template <int ngpus, int ctas_per_row, int threads>
+__global__ void __launch_bounds__(threads, 1)
+    cross_device_reduce_gemma_rms_norm_sm70_cooperative(
+        RankData* _dp, RankSignals sg, Signal* self_sg,
+        const float* __restrict__ residual,
+        const half* __restrict__ gamma, half* __restrict__ norm_out,
+        float* __restrict__ residual_out,
+        float* __restrict__ row_sums, int rank, int hidden_size,
+        float epsilon) {
+  using P = typename packed_t<half>::P;
+  using A = typename packed_t<half>::A;
+  constexpr int pack_size = P::size;
+
+  auto dp = *_dp;
+  const int row = blockIdx.x / ctas_per_row;
+  const int row_cta = blockIdx.x % ctas_per_row;
+  const int row_offset = row * hidden_size;
+  const int packs_per_row = hidden_size / pack_size;
+  const int packs_per_cta =
+      (packs_per_row + ctas_per_row - 1) / ctas_per_row;
+  const int pack_begin = row_cta * packs_per_cta;
+  const int pack_end = min(pack_begin + packs_per_cta, packs_per_row);
+  float square_sum = 0.0f;
+
+  if (blockIdx.x == 0) {
+    barrier_at_start<ngpus>(sg, self_sg, rank);
+  }
+  cg::this_grid().sync();
+  for (int pack = pack_begin + threadIdx.x; pack < pack_end;
+       pack += blockDim.x) {
+    const int packed_index = row * packs_per_row + pack;
+    const P reduced =
+        packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], packed_index);
+#pragma unroll
+    for (int item = 0; item < pack_size; ++item) {
+      const int column = pack * pack_size + item;
+      const int index = row_offset + column;
+      const float value = __half2float(reduced.data[item]) + residual[index];
+      residual_out[index] = value;
+      square_sum = fmaf(value, value, square_sum);
+    }
+  }
+
+  const float cta_sum = sm70_block_sum(square_sum);
+  if (threadIdx.x == 0) {
+    row_sums[row * ctas_per_row + row_cta] = cta_sum;
+  }
+  cg::this_grid().sync();
+
+  float row_sum = 0.0f;
+#pragma unroll
+  for (int cta = 0; cta < ctas_per_row; ++cta) {
+    row_sum += row_sums[row * ctas_per_row + cta];
+  }
+  const float inverse_rms = rsqrtf(row_sum / hidden_size + epsilon);
+  for (int pack = pack_begin + threadIdx.x; pack < pack_end;
+       pack += blockDim.x) {
+    P normalized;
+#pragma unroll
+    for (int item = 0; item < pack_size; ++item) {
+      const int column = pack * pack_size + item;
+      const int index = row_offset + column;
+      const float scale = 1.0f + __half2float(gamma[column]);
+      normalized.data[item] =
+          __float2half_rn(residual_out[index] * inverse_rms * scale);
+    }
+    reinterpret_cast<P*>(norm_out)[row * packs_per_row + pack] = normalized;
+  }
+  cg::this_grid().sync();
+  if (blockIdx.x == 0) {
+    barrier_at_end<ngpus, true>(sg, self_sg, rank);
+  }
+}
+#endif
 
 template <typename T, int ngpus>
 __global__ void __launch_bounds__(256, 1) sm70_tile_runtime_reduce_kernel(
@@ -1048,13 +1214,141 @@ class CustomAllreduce {
 #undef SUM2_KL
   }
 
+#ifndef USE_ROCM
+  void allreduce_gemma_rms_norm_sm70(
+      cudaStream_t stream, half* input, const float* residual,
+      const half* gamma, half* norm_out, float* residual_out, int rows,
+      int hidden_size, float epsilon) {
+    if (world_size_ != 4 || !fully_connected_ ||
+        !custom_allreduce_current_device_is_sm70()) {
+      throw std::runtime_error(
+          "SM70 fused allreduce Gemma RMSNorm requires fully-connected TP4");
+    }
+    if ((rows != 1 && rows != 4) || hidden_size != 5120) {
+      throw std::runtime_error(
+          "SM70 fused allreduce Gemma RMSNorm supports only [1|4, 5120]");
+    }
+    if (hidden_size % packed_t<half>::P::size != 0) {
+      throw std::runtime_error("hidden size must be vector-packable");
+    }
+
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+    } else {
+      auto it = buffers_.find(input);
+      if (it == buffers_.end()) {
+        throw std::runtime_error(
+            "fused allreduce Gemma RMSNorm input address is not registered");
+      }
+      ptrs = it->second;
+    }
+
+    cross_device_reduce_gemma_rms_norm_sm70<4><<<rows, 256, 0, stream>>>(
+        ptrs, sg_, self_sg_, residual, gamma, norm_out, residual_out, rank_,
+        hidden_size, epsilon);
+  }
+
+  void allreduce_gemma_rms_norm_sm70_cooperative(
+      cudaStream_t stream, half* input, const float* residual,
+      const half* gamma, half* norm_out, float* residual_out,
+      float* row_sums, int rows, int hidden_size, float epsilon,
+      int ctas_per_row, int threads) {
+    if (world_size_ != 4 || !fully_connected_ ||
+        !custom_allreduce_current_device_is_sm70()) {
+      throw std::runtime_error(
+          "SM70 cooperative fused allreduce Gemma RMSNorm requires "
+          "fully-connected TP4");
+    }
+    if ((rows != 1 && rows != 2 && rows != 4) || hidden_size != 5120) {
+      throw std::runtime_error(
+          "SM70 cooperative fused allreduce Gemma RMSNorm supports only "
+          "[1|2|4, 5120]");
+    }
+    if (hidden_size % packed_t<half>::P::size != 0) {
+      throw std::runtime_error("hidden size must be vector-packable");
+    }
+    if (ctas_per_row != 2 && ctas_per_row != 4) {
+      throw std::runtime_error(
+          "SM70 cooperative fused allreduce Gemma RMSNorm supports only 2 "
+          "or 4 CTAs per row");
+    }
+    if (threads != 64 && threads != 128 && threads != 160) {
+      throw std::runtime_error(
+          "SM70 cooperative fused allreduce Gemma RMSNorm supports only "
+          "64, 128, or 160 threads per CTA");
+    }
+
+    RankData* ptrs;
+    cudaStreamCaptureStatus status;
+    CUDACHECK(cudaStreamIsCapturing(stream, &status));
+    if (status == cudaStreamCaptureStatusActive) {
+      ptrs = d_rank_data_base_ + graph_unreg_buffers_.size();
+      graph_unreg_buffers_.push_back(input);
+    } else {
+      auto it = buffers_.find(input);
+      if (it == buffers_.end()) {
+        throw std::runtime_error(
+            "cooperative fused allreduce Gemma RMSNorm input address is not "
+            "registered");
+      }
+      ptrs = it->second;
+    }
+
+    const void* kernel = nullptr;
+#define SELECT_COOPERATIVE_KERNEL(ctas, block_threads)                       \
+  if (ctas_per_row == ctas && threads == block_threads) {                    \
+    kernel = reinterpret_cast<const void*>(                                  \
+        cross_device_reduce_gemma_rms_norm_sm70_cooperative<                 \
+            4, ctas, block_threads>);                                         \
+  }
+    SELECT_COOPERATIVE_KERNEL(2, 64)
+    SELECT_COOPERATIVE_KERNEL(2, 128)
+    SELECT_COOPERATIVE_KERNEL(2, 160)
+    SELECT_COOPERATIVE_KERNEL(4, 64)
+    SELECT_COOPERATIVE_KERNEL(4, 128)
+    SELECT_COOPERATIVE_KERNEL(4, 160)
+#undef SELECT_COOPERATIVE_KERNEL
+    if (kernel == nullptr) {
+      throw std::runtime_error(
+          "SM70 cooperative fused allreduce Gemma RMSNorm launch shape was "
+          "not instantiated");
+    }
+
+    int blocks_per_sm = 0;
+    CUDACHECK(cudaOccupancyMaxActiveBlocksPerMultiprocessor(
+        &blocks_per_sm, kernel, threads, 0));
+    int device = 0;
+    int sm_count = 0;
+    CUDACHECK(cudaGetDevice(&device));
+    CUDACHECK(cudaDeviceGetAttribute(&sm_count, cudaDevAttrMultiProcessorCount,
+                                    device));
+    const int grid_blocks = rows * ctas_per_row;
+    if (blocks_per_sm <= 0 || grid_blocks > blocks_per_sm * sm_count) {
+      throw std::runtime_error(
+          "SM70 cooperative fused allreduce Gemma RMSNorm grid cannot be "
+          "made fully resident");
+    }
+
+    void* args[] = {&ptrs,        &sg_,        &self_sg_,   &residual,
+                    &gamma,       &norm_out,   &residual_out, &row_sums,
+                    &rank_,       &hidden_size, &epsilon};
+    CUDACHECK(cudaLaunchCooperativeKernel(const_cast<void*>(kernel),
+                                         dim3(grid_blocks), dim3(threads),
+                                         args, 0, stream));
+  }
+#endif
+
   template <typename T>
   void tile_runtime_allreduce(cudaStream_t stream, const T* input, T* staging,
                               T* output, int size, int tile_numel,
                               int engine_blocks, int compute_iters) {
-    if (world_size_ != 2) {
+    if (world_size_ != 2 && world_size_ != 4) {
       throw std::runtime_error(
-          "SM70 tile runtime prototype currently supports only TP2.");
+          "SM70 tile runtime prototype supports only TP2 or TP4.");
     }
 
     auto pack = packed_t<T>::P::size;
@@ -1104,9 +1398,10 @@ class CustomAllreduce {
 
     switch (world_size_) {
       TILE_RUNTIME_CASE(2)
+      TILE_RUNTIME_CASE(4)
       default:
         throw std::runtime_error(
-            "SM70 tile runtime prototype only supports world_size=2.");
+            "SM70 tile runtime prototype only supports world_size=2 or 4.");
     }
 #undef TILE_RUNTIME_CASE
   }
@@ -1116,9 +1411,9 @@ class CustomAllreduce {
                                      T* staging, T* output, int size,
                                      int tile_numel, int producer_blocks,
                                      int reducer_blocks, int compute_iters) {
-    if (world_size_ != 2) {
+    if (world_size_ != 2 && world_size_ != 4) {
       throw std::runtime_error(
-          "SM70 tile runtime engine currently supports only TP2.");
+          "SM70 tile runtime engine supports only TP2 or TP4.");
     }
 
     auto pack = packed_t<T>::P::size;
@@ -1175,9 +1470,10 @@ class CustomAllreduce {
 
     switch (world_size_) {
       TILE_RUNTIME_ENGINE_CASE(2)
+      TILE_RUNTIME_ENGINE_CASE(4)
       default:
         throw std::runtime_error(
-            "SM70 tile runtime engine only supports world_size=2.");
+            "SM70 tile runtime engine only supports world_size=2 or 4.");
     }
 #undef TILE_RUNTIME_ENGINE_CASE
   }
@@ -1186,9 +1482,9 @@ class CustomAllreduce {
   void tile_runtime_wait_reduce(cudaStream_t stream, T* staging, T* output,
                                 int size, int tile_numel,
                                 int reducer_blocks) {
-    if (world_size_ != 2) {
+    if (world_size_ != 2 && world_size_ != 4) {
       throw std::runtime_error(
-          "SM70 tile runtime wait-reduce currently supports only TP2.");
+          "SM70 tile runtime wait-reduce supports only TP2 or TP4.");
     }
 
     auto pack = packed_t<T>::P::size;
@@ -1247,9 +1543,10 @@ class CustomAllreduce {
 
     switch (world_size_) {
       TILE_RUNTIME_WAIT_REDUCE_CASE(2)
+      TILE_RUNTIME_WAIT_REDUCE_CASE(4)
       default:
         throw std::runtime_error(
-            "SM70 tile runtime wait-reduce only supports world_size=2.");
+            "SM70 tile runtime wait-reduce only supports world_size=2 or 4.");
     }
 #undef TILE_RUNTIME_WAIT_REDUCE_CASE
   }

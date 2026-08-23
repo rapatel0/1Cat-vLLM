@@ -4,6 +4,7 @@
 
 import copy
 import hashlib
+import json
 import math
 import os
 from collections import defaultdict
@@ -1738,6 +1739,79 @@ def _report_kv_cache_config(
     )
 
 
+def _kv_cache_group_capacity_summary(
+    group_index: int,
+    group: KVCacheGroupSpec,
+) -> dict[str, Any]:
+    spec = group.kv_cache_spec
+    summary: dict[str, Any] = {
+        "group_index": group_index,
+        "is_draft_group": group.is_eagle_group,
+        "layer_count": len(group.layer_names),
+        "layer_names": group.layer_names,
+        "spec_type": type(spec).__name__,
+        "block_size": getattr(spec, "block_size", None),
+        "page_size_bytes": getattr(spec, "page_size_bytes", None),
+    }
+    if isinstance(spec, UniformTypeKVCacheSpecs):
+        layer_spec_types: dict[str, int] = defaultdict(int)
+        for layer_spec in spec.kv_cache_specs.values():
+            layer_spec_types[type(layer_spec).__name__] += 1
+        summary["layer_spec_types"] = dict(sorted(layer_spec_types.items()))
+    return summary
+
+
+def _report_worker_kv_capacity_json(
+    vllm_config: VllmConfig,
+    projected_groups_per_worker: list[list[KVCacheGroupSpec]],
+    available_memory: list[int],
+    unclamped_num_blocks: list[int],
+    min_num_blocks: int,
+) -> None:
+    """Emit per-worker PP-aware capacity accounting for deployment bring-up."""
+    if os.getenv("VLLM_KV_CAPACITY_REPORT_JSON", "0") != "1":
+        return
+
+    parallel_config = vllm_config.parallel_config
+    tp_size = parallel_config.tensor_parallel_size
+    pp_size = parallel_config.pipeline_parallel_size
+    max_model_len = vllm_config.model_config.max_model_len
+
+    for worker_index, (groups, memory_bytes, local_num_blocks) in enumerate(
+        zip(
+            projected_groups_per_worker,
+            available_memory,
+            unclamped_num_blocks,
+        )
+    ):
+        full_context_bytes = _max_memory_usage_bytes_from_groups(
+            vllm_config,
+            groups,
+        )
+        report = {
+            "worker_index": worker_index,
+            "tp_rank": worker_index % tp_size,
+            "pp_rank": (worker_index // tp_size) % pp_size,
+            "tp_size": tp_size,
+            "pp_size": pp_size,
+            "configured_max_model_len": max_model_len,
+            "available_cache_bytes": memory_bytes,
+            "available_cache_gib": memory_bytes / (1 << 30),
+            "full_context_bytes": full_context_bytes,
+            "local_fractional_full_slots": (
+                memory_bytes / full_context_bytes if full_context_bytes else None
+            ),
+            "local_num_blocks_before_clamp": local_num_blocks,
+            "global_num_blocks_after_clamp": min_num_blocks,
+            "is_limiting_worker": local_num_blocks == min_num_blocks,
+            "groups": [
+                _kv_cache_group_capacity_summary(group_index, group)
+                for group_index, group in enumerate(groups)
+            ],
+        }
+        logger.info("KV_CAPACITY_REPORT_JSON %s", json.dumps(report, sort_keys=True))
+
+
 def _max_memory_usage_bytes_from_groups(
     vllm_config: VllmConfig,
     kv_cache_groups: list[KVCacheGroupSpec],
@@ -2060,6 +2134,13 @@ def get_kv_cache_configs(
     # allocating unused memory.
     min_num_blocks = min(
         kv_cache_config.num_blocks for kv_cache_config in kv_cache_configs
+    )
+    _report_worker_kv_capacity_json(
+        vllm_config,
+        projected_groups_per_worker,
+        available_memory,
+        [config.num_blocks for config in kv_cache_configs],
+        min_num_blocks,
     )
     for kv_cache_config in kv_cache_configs:
         num_blocks_old = kv_cache_config.num_blocks

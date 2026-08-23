@@ -126,6 +126,44 @@ def _expand_single_request_smallq_metadata_kernel(
     )
 
 
+@triton.jit
+def _prebuild_single_spec_q4_smallq_metadata_kernel(
+    source_block_table,
+    source_seq_lens,
+    output_block_table,
+    output_seq_lens,
+    output_query_start_loc,
+    output_block_table_stride,
+    num_block_cols: tl.constexpr,
+    block_cols_per_program: tl.constexpr,
+):
+    """Prebuild the fixed one-request q=4 Flash paged-decode metadata."""
+    query_idx = tl.program_id(0)
+    block_program = tl.program_id(1)
+    block_col = block_program * block_cols_per_program + tl.arange(
+        0, block_cols_per_program
+    )
+    valid_col = block_col < num_block_cols
+    block = tl.load(source_block_table + block_col, mask=valid_col, other=0)
+    tl.store(
+        output_block_table
+        + query_idx * output_block_table_stride
+        + block_col,
+        tl.maximum(block, 0),
+        mask=valid_col,
+    )
+
+    seq_len = tl.maximum(tl.load(source_seq_lens), 4)
+    tl.store(
+        output_seq_lens + query_idx,
+        seq_len - 4 + query_idx + 1,
+        mask=block_program == 0,
+    )
+    query_head = (query_idx == 0) & (block_program == 0)
+    tl.store(output_query_start_loc, 0, mask=query_head)
+    tl.store(output_query_start_loc + 1, 4, mask=query_head)
+
+
 def _split_paged_kv_cache(
     kv_cache: torch.Tensor | tuple[torch.Tensor, torch.Tensor] | list[torch.Tensor],
 ) -> tuple[torch.Tensor, torch.Tensor]:
@@ -755,6 +793,12 @@ def _get_paged_kv_utils():
 
 def _has_prefix_context(attn_metadata: TritonAttentionMetadata) -> bool:
     """Return True if any sequence has KV context before current query tokens."""
+    if getattr(
+        attn_metadata,
+        "flash_v100_single_spec_has_prefix_context",
+        False,
+    ):
+        return True
     query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
     seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
     if query_start_loc_cpu is not None and seq_lens_cpu is not None:
@@ -1432,9 +1476,52 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         self,
         attn_metadata: TritonAttentionMetadata,
         common_attn_metadata,
+        *,
+        single_spec_real_query_tokens: int | None = None,
     ) -> None:
         attn_metadata.query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
         seq_lens_cpu = getattr(common_attn_metadata, "_seq_lens_cpu", None)
+        attn_metadata.seq_lens_cpu_upper_bound = None
+        attn_metadata.flash_v100_single_spec_has_prefix_context = False
+        if single_spec_real_query_tokens is not None:
+            seq_lens_cpu_upper_bound = getattr(
+                common_attn_metadata,
+                "seq_lens_cpu_upper_bound",
+                None,
+            )
+            query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
+            if (
+                seq_lens_cpu is not None
+                or seq_lens_cpu_upper_bound is None
+                or query_start_loc_cpu.numel() != 2
+                or int(query_start_loc_cpu[-1].item())
+                != single_spec_real_query_tokens
+                or single_spec_real_query_tokens <= 1
+                or int(common_attn_metadata.num_actual_tokens)
+                < single_spec_real_query_tokens
+                or not bool(
+                    torch.all(
+                        seq_lens_cpu_upper_bound
+                        > single_spec_real_query_tokens
+                    ).item()
+                )
+            ):
+                raise AssertionError(
+                    "async single-request verifier received unsupported "
+                    "Flash-V100 CPU metadata"
+                )
+            # Async MTP keeps the exact sequence length authoritative on the
+            # GPU. Keep the optimistic CPU value explicitly typed as an upper
+            # bound so no generic consumer can mistake it for exact data. The
+            # small-q expansion kernel consumes attn_metadata.seq_lens on
+            # device; the upper bound is used only for conservative launch and
+            # workspace hints below.
+            attn_metadata.seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound
+            attn_metadata.flash_v100_single_spec_has_prefix_context = True
+            attn_metadata.seq_lens_cpu = None
+            attn_metadata.causal = common_attn_metadata.causal
+            attn_metadata.max_model_len = self.vllm_config.model_config.max_model_len
+            return
         attn_metadata.seq_lens_cpu = (
             seq_lens_cpu
             if seq_lens_cpu is not None
@@ -1813,6 +1900,167 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         attn_metadata.smallq_decode_max_seq_len_hint = None
         attn_metadata.smallq_decode_workspace_seq_capacity_hint = None
 
+    def prebuild_single_spec_q4(
+        self,
+        source_block_table: torch.Tensor,
+        source_seq_lens: torch.Tensor,
+    ) -> None:
+        """Populate persistent q=4 verifier metadata before builder dispatch."""
+        (
+            source_block_table,
+            source_seq_lens,
+            output_block_table,
+            output_seq_lens,
+            output_query_start_loc,
+        ) = self.graph_prebuild_single_spec_q4_args(
+            source_block_table,
+            source_seq_lens,
+        )
+        block_cols = int(source_block_table.shape[1])
+        block_cols_per_program = 256
+        _prebuild_single_spec_q4_smallq_metadata_kernel[
+            (4, triton.cdiv(block_cols, block_cols_per_program))
+        ](
+            source_block_table,
+            source_seq_lens,
+            output_block_table,
+            output_seq_lens,
+            output_query_start_loc,
+            output_block_table.stride(0),
+            num_block_cols=block_cols,
+            block_cols_per_program=block_cols_per_program,
+        )
+
+    def graph_prebuild_single_spec_q4_args(
+        self,
+        source_block_table: torch.Tensor,
+        source_seq_lens: torch.Tensor,
+    ) -> tuple[
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+        torch.Tensor,
+    ]:
+        """Return the fixed buffers for q=4 metadata built inside the graph."""
+        if (
+            self._smallq_decode_block_table is None
+            or self._smallq_decode_seq_lens is None
+            or self._smallq_query_start_loc is None
+            or self._smallq_buffer_shape is None
+            or source_block_table.ndim != 2
+            or source_block_table.shape[0] != 1
+            or source_seq_lens.ndim != 1
+            or source_seq_lens.numel() != 1
+        ):
+            raise AssertionError("q=4 Flash metadata buffers are not initialized")
+        token_capacity, req_capacity, block_cols = self._smallq_buffer_shape
+        if (
+            token_capacity < 4
+            or req_capacity < 1
+            or int(source_block_table.shape[1]) != block_cols
+            or int(self._smallq_decode_block_table.shape[1]) != block_cols
+        ):
+            raise AssertionError("q=4 Flash metadata buffer shape mismatch")
+        return (
+            source_block_table,
+            source_seq_lens,
+            self._smallq_decode_block_table,
+            self._smallq_decode_seq_lens,
+            self._smallq_query_start_loc,
+        )
+
+    def _attach_prebuilt_single_spec_q4_metadata(
+        self,
+        attn_metadata: TritonAttentionMetadata,
+        common_attn_metadata,
+    ) -> None:
+        self._clear_smallq_decode_metadata(attn_metadata)
+        if (
+            int(attn_metadata.num_actual_tokens) != 4
+            or int(common_attn_metadata.num_reqs) != 1
+            or int(attn_metadata.max_query_len) != 4
+            or self._smallq_decode_block_table is None
+            or self._smallq_decode_seq_lens is None
+            or self._smallq_query_start_loc is None
+            or self._smallq_buffer_shape is None
+        ):
+            raise AssertionError("prebuilt q=4 Flash metadata shape mismatch")
+
+        attn_metadata.smallq_decode_block_table = self._smallq_decode_block_table[:4]
+        attn_metadata.smallq_decode_seq_lens = self._smallq_decode_seq_lens[:4]
+        attn_metadata.smallq_query_start_loc = self._smallq_query_start_loc[:2]
+        _, _, block_cols = self._smallq_buffer_shape
+        raw_seq_capacity = block_cols * int(self.block_size)
+        seq_lens_cpu_upper_bound = getattr(
+            attn_metadata,
+            "seq_lens_cpu_upper_bound",
+            None,
+        )
+        if seq_lens_cpu_upper_bound is None:
+            raise AssertionError("prebuilt q=4 Flash metadata lacks CPU upper bound")
+        max_seq_len_hint = int(seq_lens_cpu_upper_bound.max().item())
+        if max_seq_len_hint > 0 and raw_seq_capacity > 0:
+            attn_metadata.smallq_decode_max_seq_len_hint = max_seq_len_hint
+            attn_metadata.smallq_decode_workspace_seq_capacity_hint = raw_seq_capacity
+
+    def refresh_prebuilt_single_spec_q4_metadata(
+        self,
+        attn_metadata: TritonAttentionMetadata,
+        common_attn_metadata,
+    ) -> None:
+        """Refresh dynamic scalars on a request-scoped q=4 metadata object."""
+        seq_lens_cpu_upper_bound = getattr(
+            common_attn_metadata,
+            "seq_lens_cpu_upper_bound",
+            None,
+        )
+        if (
+            int(common_attn_metadata.num_actual_tokens) != 4
+            or int(common_attn_metadata.num_reqs) != 1
+            or int(common_attn_metadata.max_query_len) != 4
+            or seq_lens_cpu_upper_bound is None
+            or seq_lens_cpu_upper_bound.numel() != 1
+            or attn_metadata.smallq_decode_block_table is None
+            or attn_metadata.smallq_decode_seq_lens is None
+            or attn_metadata.smallq_query_start_loc is None
+            or self._smallq_buffer_shape is None
+        ):
+            raise AssertionError("reused q=4 Flash metadata shape mismatch")
+        max_seq_len_hint = int(seq_lens_cpu_upper_bound[0].item())
+        if max_seq_len_hint <= 4:
+            raise AssertionError("reused q=4 Flash metadata lacks prefix context")
+
+        # Tensor addresses are checked by the runner's reuse key. Rebind the
+        # aliases anyway so the object describes the current common metadata,
+        # while the persistent small-q buffers keep their capture-time address.
+        attn_metadata.num_actual_tokens = 4
+        attn_metadata.max_query_len = 4
+        attn_metadata.query_start_loc = common_attn_metadata.query_start_loc
+        attn_metadata.query_start_loc_cpu = (
+            common_attn_metadata.query_start_loc_cpu
+        )
+        attn_metadata.max_seq_len = int(common_attn_metadata.max_seq_len)
+        attn_metadata.seq_lens = common_attn_metadata.seq_lens
+        attn_metadata.seq_lens_cpu = None
+        attn_metadata.seq_lens_cpu_upper_bound = seq_lens_cpu_upper_bound
+        attn_metadata.block_table = common_attn_metadata.block_table_tensor
+        attn_metadata.slot_mapping = common_attn_metadata.slot_mapping
+        attn_metadata.flash_v100_single_spec_has_prefix_context = True
+        attn_metadata.causal = common_attn_metadata.causal
+        attn_metadata.max_model_len = self.vllm_config.model_config.max_model_len
+        _, _, block_cols = self._smallq_buffer_shape
+        attn_metadata.smallq_decode_max_seq_len_hint = max_seq_len_hint
+        attn_metadata.smallq_decode_workspace_seq_capacity_hint = (
+            block_cols * int(self.block_size)
+        )
+        # Preserve build-path parity even though q=4 deliberately clears the
+        # q=1 decode hints and therefore does not update a partition counter.
+        # Keeping these calls here makes the reuse path safe if their policy is
+        # tightened later without growing the cache key around stale scalars.
+        self._attach_decode_shape_hints(attn_metadata, common_attn_metadata)
+        self._update_decode_active_num_partitions(attn_metadata, stage="reuse")
+
     def _update_smallq_decode_metadata(
         self,
         attn_metadata: TritonAttentionMetadata,
@@ -1837,7 +2085,15 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
             return
 
         query_start_loc_cpu = common_attn_metadata.query_start_loc_cpu
-        seq_lens_cpu = common_attn_metadata.seq_lens_cpu
+        seq_lens_cpu = getattr(
+            attn_metadata,
+            "seq_lens_cpu_upper_bound",
+            None,
+        )
+        if seq_lens_cpu is None:
+            seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+        if seq_lens_cpu is None:
+            seq_lens_cpu = common_attn_metadata.seq_lens_cpu
         query_lens_cpu = query_start_loc_cpu[1:] - query_start_loc_cpu[:-1]
         num_live_reqs = int(torch.count_nonzero(query_lens_cpu).item())
         has_prefix_context = bool(torch.any(query_lens_cpu != seq_lens_cpu).item())
@@ -2078,11 +2334,17 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         fast_build: bool = False,
         ddtree_parent_ids: torch.Tensor | None = None,
         ddtree_num_tree_tokens_cpu: torch.Tensor | None = None,
+        single_spec_real_query_tokens: int | None = None,
+        single_spec_q4_prebuilt: bool = False,
     ):
         attn_metadata = super().build(
             common_prefix_len, common_attn_metadata, fast_build
         )
-        self._attach_common_flash_metadata(attn_metadata, common_attn_metadata)
+        self._attach_common_flash_metadata(
+            attn_metadata,
+            common_attn_metadata,
+            single_spec_real_query_tokens=single_spec_real_query_tokens,
+        )
         self._attach_ddtree_metadata(
             attn_metadata,
             ddtree_parent_ids=ddtree_parent_ids,
@@ -2099,7 +2361,15 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                 attn_metadata,
                 common_attn_metadata,
             )
-        self._update_smallq_decode_metadata(attn_metadata, common_attn_metadata)
+        if single_spec_q4_prebuilt:
+            if single_spec_real_query_tokens != 4:
+                raise AssertionError("prebuilt Flash metadata requires q=4")
+            self._attach_prebuilt_single_spec_q4_metadata(
+                attn_metadata,
+                common_attn_metadata,
+            )
+        else:
+            self._update_smallq_decode_metadata(attn_metadata, common_attn_metadata)
         self._attach_decode_shape_hints(attn_metadata, common_attn_metadata)
         self._update_decode_active_num_partitions(attn_metadata, stage="build")
         self._debug_draft_metadata("build", attn_metadata, common_attn_metadata)
@@ -2974,6 +3244,38 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         is_prefill = attn_metadata.max_query_len > 1
         is_capturing = _is_cuda_graph_capturing(query)
         layer_name = self._layer_debug_info(layer).get("layer_name")
+        if (
+            os.getenv("VLLM_QWEN38_FLASH_Q4_PREP_IN_ATTENTION", "0") == "1"
+            and isinstance(layer_name, str)
+            and layer_name.endswith(".layers.3.self_attn.attn")
+            and ".mtp." not in f".{layer_name}."
+            and int(attn_metadata.num_actual_tokens) == 4
+            and int(attn_metadata.max_query_len) == 4
+            and attn_metadata.block_table is not None
+            and attn_metadata.seq_lens is not None
+            and attn_metadata.smallq_decode_block_table is not None
+            and attn_metadata.smallq_decode_seq_lens is not None
+            and attn_metadata.smallq_query_start_loc is not None
+            and hasattr(
+                torch.ops.qwen38_control,
+                "prebuild_flash_q4_metadata",
+            )
+        ):
+            # Keep the fixed metadata producer in the same opaque attention
+            # partition as its first consumer.  A model-entry producer passed
+            # standalone compile/graph tests but was not ordered across
+            # vLLM's attention graph break during full-engine replay.
+            torch.ops.qwen38_control.prebuild_flash_q4_metadata(
+                attn_metadata.block_table,
+                attn_metadata.seq_lens,
+                attn_metadata.smallq_decode_block_table,
+                attn_metadata.smallq_decode_seq_lens,
+                attn_metadata.smallq_query_start_loc,
+            )
+            logger.info_once(
+                "Building Qwen3.8 q=4 Flash metadata inside first attention "
+                "graph partition"
+            )
         if _draft_graph_debug_enabled():
             _draft_graph_debug_log(
                 "forward:enter",

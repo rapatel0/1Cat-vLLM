@@ -194,6 +194,12 @@ class SamplerOutput:
     logprobs_tensors: LogprobsTensors | None
     # Optional DDTree accepted compact node indices, padded with -1.
     ddtree_accepted_node_indices: torch.Tensor | None = None
+    # Optional device-resident rejection metadata. The count is the contiguous
+    # committed prefix (1 + accepted drafts, including a recovered token), not
+    # just the number of accepted drafts. next_token_ids is the last token in
+    # that prefix; callers must substitute their backup token for discards.
+    valid_sampled_token_count: torch.Tensor | None = None
+    next_token_ids: torch.Tensor | None = None
 
 
 @dataclass

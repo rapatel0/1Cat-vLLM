@@ -576,6 +576,7 @@ def update_num_computed_tokens_for_batch_change(
     valid_sampled_token_count: torch.Tensor,
     prev_num_draft_tokens: torch.Tensor,
     cpu_num_computed_tokens: torch.Tensor,
+    update_num_accepted_tokens: bool = True,
 ) -> None:
     """Correct num_computed_tokens for async spec decode drift.
 
@@ -596,9 +597,10 @@ def update_num_computed_tokens_for_batch_change(
     num_computed_tokens[:n].copy_(
         torch.where(participating, corrected, cpu_num_computed_tokens)
     )
-    num_accepted_tokens.copy_(
-        torch.where(participating, valid_counts, num_accepted_tokens)
-    )
+    if update_num_accepted_tokens:
+        num_accepted_tokens.copy_(
+            torch.where(participating, valid_counts, num_accepted_tokens)
+        )
 
 
 def unconditional_to_conditional_rates(rates: list[float]) -> list[float]:

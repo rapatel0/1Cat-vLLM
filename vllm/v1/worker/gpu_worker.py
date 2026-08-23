@@ -804,6 +804,9 @@ class Worker(WorkerBase):
         all_gather_tensors = {}
         compilation_config = self.vllm_config.compilation_config
         parallel_config = self.vllm_config.parallel_config
+        static_pp_metadata = self.model_runner.get_static_pp_intermediate_metadata(
+            scheduler_output
+        )
 
         if (
             parallel_config.pipeline_parallel_size > 1
@@ -839,6 +842,7 @@ class Worker(WorkerBase):
                 get_pp_group().irecv_tensor_dict(
                     all_gather_group=get_tp_group(),
                     all_gather_tensors=all_gather_tensors,
+                    static_metadata_list=static_pp_metadata,
                 )
             )
             assert tensor_dict is not None
@@ -875,6 +879,7 @@ class Worker(WorkerBase):
             output.tensors,
             all_gather_group=get_tp_group(),
             all_gather_tensors=all_gather_tensors,
+            static_metadata_list=static_pp_metadata,
         )
 
         return None

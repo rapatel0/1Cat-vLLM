@@ -2,6 +2,7 @@
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import contextlib
 from importlib.util import find_spec
+import os
 from types import ModuleType
 from typing import Any
 
@@ -420,6 +421,80 @@ class AllReduceFusedAddRMSNormPattern(BasePattern):
         )
 
 
+class SM70AllReduceFusedAddGemmaRMSNormPattern(BasePattern):
+    """TP4 V100 all-reduce + FP32 residual + Gemma RMSNorm fusion."""
+
+    def __init__(
+        self,
+        epsilon: float,
+        dtype: torch.dtype,
+        device: str | None,
+    ) -> None:
+        super().__init__(dtype, device)
+        self.epsilon = epsilon
+
+    def get_inputs(self) -> list[torch.Tensor]:
+        residual = self.empty_f32(5, 16)
+        input_ = self.empty(5, 16)
+        weight = self.empty(16)
+        return [residual, input_, weight]
+
+    def register(self, pm_pass: PatternMatcherPass) -> None:
+        def native_pattern(
+            residual: torch.Tensor,
+            input_: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            reduced = tensor_model_parallel_all_reduce(input_)
+            residual_out = reduced.float() + residual.float()
+            variance = residual_out.pow(2).mean(dim=-1, keepdim=True)
+            normalized = residual_out * torch.rsqrt(variance + self.epsilon)
+            normalized = normalized * (weight.float() + 1.0)
+            return normalized.to(input_.dtype), residual_out
+
+        def pattern(
+            residual: torch.Tensor,
+            input_: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            allreduce_output = tensor_model_parallel_all_reduce(input_)
+            rms, residual_out = vllm.ir.ops.fused_add_rms_norm(
+                allreduce_output,
+                residual,
+                weight.float() + 1.0,
+                self.epsilon,
+            )
+            return rms, residual_out
+
+        def replacement(
+            residual: torch.Tensor,
+            input_: torch.Tensor,
+            weight: torch.Tensor,
+        ) -> tuple[torch.Tensor, torch.Tensor]:
+            return torch.ops.vllm.all_reduce_gemma_rms_norm_sm70(
+                input_,
+                residual,
+                weight,
+                self.epsilon,
+                group_name=self.tp.unique_name,
+            )
+
+        pm.register_replacement(
+            native_pattern,
+            replacement,
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+        )
+        pm.register_replacement(
+            pattern,
+            replacement,
+            self.get_inputs(),
+            pm.fwd_only,
+            pm_pass,
+        )
+
+
 class AllReduceFusedRMSNormStaticQuantFP8Pattern(BasePattern):
     """
     This pattern replaces the allreduce + rms norm (without residual)
@@ -781,6 +856,18 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         self.hidden_dim = config.model_config.get_hidden_size()
         self.group = get_tp_group().device_group
         rank = get_tensor_model_parallel_rank()
+        self.sm70_enabled = (
+            os.getenv("VLLM_SM70_FUSED_AR_GEMMA_RMS_NORM", "0") == "1"
+            and current_platform.is_device_capability(70)
+            and self.tp_size == 4
+            and self.hidden_dim == 5120
+            and self.model_dtype == torch.float16
+        )
+        if self.sm70_enabled:
+            self.max_token_num = config.scheduler_config.max_num_batched_tokens
+            self.register_sm70_patterns()
+            self.dump_patterns(config, self.patterns)
+            return
         if flashinfer_comm is None:
             logger.warning(
                 "Flashinfer is not installed or comm module not found, "
@@ -845,6 +932,17 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
         self.dump_patterns(config, self.patterns)
 
     @enable_fake_mode
+    def register_sm70_patterns(self) -> None:
+        for epsilon in [1e-5, 1e-6]:
+            SM70AllReduceFusedAddGemmaRMSNormPattern(
+                epsilon,
+                self.model_dtype,
+                self.device,
+            ).register(self.patterns)
+            torch._inductor.pattern_matcher._seen_patterns.clear()
+        self.disabled = False
+
+    @enable_fake_mode
     def register_patterns(self) -> None:
         for epsilon in [1e-5, 1e-6]:
             if self.supports_quant_fusion:
@@ -905,10 +1003,13 @@ class AllReduceFusionPass(VllmPatternMatcherPass):
             return
 
         self.matched_count = self.patterns.apply(graph)
-        logger.debug("Replaced %s patterns", self.matched_count)
+        if self.sm70_enabled:
+            logger.info("SM70 fused allreduce/Gemma replaced %s patterns", self.matched_count)
+        else:
+            logger.debug("Replaced %s patterns", self.matched_count)
 
     def __del__(self) -> None:
-        if getattr(self, "disabled", True):
+        if getattr(self, "disabled", True) or getattr(self, "sm70_enabled", False):
             return
         with contextlib.suppress(Exception):
             destroy_fi_ar_workspace()

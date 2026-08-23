@@ -145,16 +145,21 @@ class Qwen2MoeMLP(nn.Module):
 
     def forward(self, x):
         x = _sm70_dump_qwen_mlp_tensor("mlp_input", self.layer_idx, x)
-        fused_act = getattr(self.gate_up_proj, "forward_fused_silu_and_mul", None)
-        out = fused_act(x) if fused_act is not None else None
+        fused_mlp = getattr(self.down_proj, "forward_fused_mlp", None)
+        out = fused_mlp(x, self.gate_up_proj) if fused_mlp is not None else None
         if out is None:
-            gate_up, _ = self.gate_up_proj(x)
-            gate_up = _sm70_dump_qwen_mlp_tensor(
-                "mlp_gate_up", self.layer_idx, gate_up
+            fused_act = getattr(
+                self.gate_up_proj, "forward_fused_silu_and_mul", None
             )
-            out = self.act_fn(gate_up)
-        out = _sm70_dump_qwen_mlp_tensor("mlp_silu_out", self.layer_idx, out)
-        out, _ = self.down_proj(out)
+            out = fused_act(x) if fused_act is not None else None
+            if out is None:
+                gate_up, _ = self.gate_up_proj(x)
+                gate_up = _sm70_dump_qwen_mlp_tensor(
+                    "mlp_gate_up", self.layer_idx, gate_up
+                )
+                out = self.act_fn(gate_up)
+            out = _sm70_dump_qwen_mlp_tensor("mlp_silu_out", self.layer_idx, out)
+            out, _ = self.down_proj(out)
         out = _sm70_dump_qwen_mlp_tensor("mlp_down_out", self.layer_idx, out)
 
         if self.expert_gate is not None:

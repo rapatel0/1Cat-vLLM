@@ -278,6 +278,51 @@ def test_irecv_tensor_dict_send_allgather_postprocess_binds_keys(
     torch.testing.assert_close(td["b"], torch.ones(4, dtype=torch.int32))
 
 
+def test_tensor_dict_static_metadata_skips_cpu_handshake(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def fail_handshake(*args: Any, **kwargs: Any) -> None:
+        pytest.fail("static metadata path must not use the CPU object channel")
+
+    def fake_irecv(t: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:
+        t.fill_(3)
+        return _DummyWork()
+
+    def fake_isend(t: torch.Tensor, *args: Any, **kwargs: Any) -> _DummyWork:
+        return _DummyWork()
+
+    monkeypatch.setattr(torch.distributed, "is_initialized", lambda: True)
+    monkeypatch.setattr(torch.distributed, "irecv", fake_irecv)
+    monkeypatch.setattr(torch.distributed, "isend", fake_isend)
+
+    metadata = [("hidden", TensorMetadata("cpu", torch.int32, torch.Size([4])))]
+    receiver = _make_group_for_unit_test()
+    receiver.recv_object = fail_handshake  # type: ignore[method-assign]
+    received, recv_handles, postprocess = receiver.irecv_tensor_dict(
+        static_metadata_list=metadata
+    )
+    assert received is not None
+    assert len(recv_handles) == 1
+    assert postprocess == []
+    torch.testing.assert_close(
+        received["hidden"], torch.full((4,), 3, dtype=torch.int32)
+    )
+
+    sender = _make_group_for_unit_test()
+    sender.send_object = fail_handshake  # type: ignore[method-assign]
+    send_handles = sender.isend_tensor_dict(
+        {"hidden": torch.ones(4, dtype=torch.int32)},
+        static_metadata_list=metadata,
+    )
+    assert len(send_handles) == 1
+
+    with pytest.raises(RuntimeError, match="tensor metadata changed"):
+        sender.isend_tensor_dict(
+            {"hidden": torch.ones(5, dtype=torch.int32)},
+            static_metadata_list=metadata,
+        )
+
+
 def test_async_intermediate_tensors_lazy_wait() -> None:
     work = _DummyWork()
     post_calls = {"n": 0}

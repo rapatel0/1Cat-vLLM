@@ -182,6 +182,45 @@ def _run_graph(
     return concrete_outputs
 
 
+def _run_graph_latency(
+    ca: CustomAllreduce,
+    inputs: list[torch.Tensor],
+    warmup_replays: int,
+    timed_replays: int,
+) -> tuple[list[torch.Tensor], float]:
+    """Time a graph containing several production-shaped reductions.
+
+    Putting several reductions in one graph amortizes the Python graph-replay
+    call and CUDA event overhead.  The reported value is milliseconds per
+    custom all-reduce, not milliseconds per graph replay.
+    """
+    torch.cuda.synchronize()
+    dist.barrier()
+    graph = torch.cuda.CUDAGraph()
+    with ca.capture(), torch.cuda.graph(graph):
+        outputs = [ca.custom_all_reduce(inp) for inp in inputs]
+    if any(out is None for out in outputs):
+        raise RuntimeError("custom allreduce rejected graph input")
+    concrete_outputs = [out for out in outputs if out is not None]
+
+    for _ in range(warmup_replays):
+        graph.replay()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    start = torch.cuda.Event(enable_timing=True)
+    end = torch.cuda.Event(enable_timing=True)
+    start.record()
+    for _ in range(timed_replays):
+        graph.replay()
+    end.record()
+    end.synchronize()
+    elapsed_ms = start.elapsed_time(end)
+    latency_ms = elapsed_ms / (timed_replays * len(inputs))
+    dist.barrier()
+    return concrete_outputs, latency_ms
+
+
 def _run_warmup(ca: CustomAllreduce, inp: torch.Tensor) -> torch.Tensor:
     torch.cuda.synchronize()
     dist.barrier()
@@ -266,13 +305,27 @@ def _check_graph_multi(
     seed: int,
     graph_replays: int,
     multi_count: int,
+    latency_warmup_replays: int,
+    latency_replays: int,
+    cooperative_ctas_per_row: int,
+    cooperative_threads: int,
+    measure_latency: bool = False,
 ) -> dict[str, Any]:
     inputs = [
         _make_input(size, dtype, rank, pattern, seed + i * 1009)
         for i in range(multi_count)
     ]
     refs = [_reference_all_reduce(inp) for inp in inputs]
-    outputs = _run_graph(ca, inputs, graph_replays)
+    if measure_latency:
+        outputs, latency_ms = _run_graph_latency(
+            ca,
+            inputs,
+            latency_warmup_replays,
+            latency_replays,
+        )
+    else:
+        outputs = _run_graph(ca, inputs, graph_replays)
+        latency_ms = None
     comparisons = [_compare(out, ref) for out, ref in zip(outputs, refs)]
     max_diff = max(item["max_diff"] for item in comparisons)
     nonzero_count = sum(item["nonzero_count"] for item in comparisons)
@@ -285,7 +338,7 @@ def _check_graph_multi(
         None,
     )
     return {
-        "mode": "graph_multi",
+        "mode": "graph_multi_latency" if measure_latency else "graph_multi",
         "size": size,
         "bytes": size * torch.empty((), dtype=dtype).element_size(),
         "dtype": str(dtype).replace("torch.", ""),
@@ -295,6 +348,245 @@ def _check_graph_multi(
         "max_diff": float(max_diff),
         "nonzero_count": int(nonzero_count),
         "first_bad": first_bad,
+        "latency_ms_per_allreduce": latency_ms,
+        "block_limit": os.environ.get(
+            "VLLM_CUSTOM_ALLREDUCE_BLOCK_LIMIT", "default"
+        ),
+    }
+
+
+def _check_graph_fused_gemma(
+    ca: CustomAllreduce,
+    size: int,
+    rank: int,
+    input_pattern: str,
+    residual_pattern: str,
+    seed: int,
+    multi_count: int,
+    latency_warmup_replays: int,
+    latency_replays: int,
+    cooperative_ctas_per_row: int,
+    cooperative_threads: int,
+) -> dict[str, Any]:
+    if size not in (5120, 10240, 20480):
+        raise ValueError(
+            "fused Gemma mode supports only 5120, 10240, or 20480 elements"
+        )
+    rows = size // 5120
+    inputs = [
+        _make_input(
+            size,
+            torch.float16,
+            rank,
+            input_pattern,
+            seed + i * 1009,
+        )
+        .reshape(rows, 5120)
+        .contiguous()
+        for i in range(multi_count)
+    ]
+    residuals = []
+    gammas = []
+    reference_norms = []
+    reference_residuals = []
+    row_sum_workspaces = []
+    for index, inp in enumerate(inputs):
+        reduced = _reference_custom_order(inp.flatten(), "1stage", ca.world_size)
+        generator = torch.Generator(device="cuda")
+        generator.manual_seed(seed + index * 2017)
+        if residual_pattern == "random_model":
+            residual = torch.randn(
+                inp.shape,
+                device="cuda",
+                dtype=torch.float32,
+                generator=generator,
+            )
+        elif residual_pattern == "zero":
+            residual = torch.zeros_like(inp, dtype=torch.float32)
+        elif residual_pattern == "large":
+            residual = (
+                torch.randn(
+                    inp.shape,
+                    device="cuda",
+                    dtype=torch.float32,
+                    generator=generator,
+                )
+                * 128.0
+            )
+        elif residual_pattern == "cancellation":
+            delta = (
+                (torch.arange(size, device="cuda", dtype=torch.float32) % 17)
+                - 8.0
+            ).reshape_as(inp) * 1e-4
+            residual = -reduced.reshape_as(inp).float() + delta
+        else:
+            raise ValueError(f"unsupported fused residual pattern: {residual_pattern}")
+        generator.manual_seed(seed + index * 3019)
+        gamma = (
+            torch.randn(
+                (5120,), device="cuda", dtype=torch.float32, generator=generator
+            )
+            * 0.05
+        ).half()
+        reference_residual = reduced.reshape_as(inp).float() + residual
+        inverse_rms = torch.rsqrt(
+            reference_residual.square().mean(dim=-1, keepdim=True) + 1e-6
+        )
+        reference_norm = (
+            reference_residual * inverse_rms * (gamma.float() + 1.0)
+        ).half()
+        residuals.append(residual)
+        gammas.append(gamma)
+        reference_norms.append(reference_norm)
+        reference_residuals.append(reference_residual)
+        row_sum_workspaces.append(
+            torch.empty((rows, 4), device="cuda", dtype=torch.float32)
+        )
+
+    torch.cuda.synchronize()
+    dist.barrier()
+    baseline_graph = torch.cuda.CUDAGraph()
+    fused_graph = torch.cuda.CUDAGraph()
+
+    def baseline_call(
+        inp: torch.Tensor, residual: torch.Tensor, gamma: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        reduced = ca.custom_all_reduce(inp)
+        if reduced is None:
+            raise RuntimeError("custom all-reduce rejected baseline input")
+        residual_out = reduced.float() + residual
+        inverse_rms = torch.rsqrt(
+            residual_out.square().mean(dim=-1, keepdim=True) + 1e-6
+        )
+        norm_out = (
+            residual_out * inverse_rms * (gamma.float() + 1.0)
+        ).half()
+        return norm_out, residual_out
+
+    def fused_call(
+        inp: torch.Tensor, residual: torch.Tensor, gamma: torch.Tensor
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        if hasattr(
+            torch.ops.qwen38_c2_ar,
+            "all_reduce_gemma_rms_norm_sm70_cooperative",
+        ):
+            norm_out = torch.empty_like(inp)
+            residual_out = torch.empty_like(inp, dtype=torch.float32)
+            registered = ca._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+            reg_buffer = 0 if registered else ca.buffer_ptrs[ca.rank]
+            reg_buffer_size = 0 if registered else ca.max_size
+            workspace = row_sum_workspaces[len(fused_outputs_pending)]
+            torch.ops.qwen38_c2_ar.all_reduce_gemma_rms_norm_sm70_cooperative(
+                ca._ptr,
+                inp,
+                residual,
+                gamma,
+                norm_out,
+                residual_out,
+                workspace,
+                1e-6,
+                reg_buffer,
+                reg_buffer_size,
+                cooperative_ctas_per_row,
+                cooperative_threads,
+            )
+            fused_outputs_pending.append(None)
+            return norm_out, residual_out
+        if hasattr(ca, "custom_all_reduce_gemma_rms_norm_sm70"):
+            output = ca.custom_all_reduce_gemma_rms_norm_sm70(
+                inp, residual, gamma, 1e-6
+            )
+            if output is None:
+                raise RuntimeError("fused Gemma custom all-reduce rejected input")
+            return output
+        norm_out = torch.empty_like(inp)
+        residual_out = torch.empty_like(inp, dtype=torch.float32)
+        registered = ca._IS_CAPTURING and torch.cuda.is_current_stream_capturing()
+        reg_buffer = 0 if registered else ca.buffer_ptrs[ca.rank]
+        reg_buffer_size = 0 if registered else ca.max_size
+        torch.ops.qwen38_c2_ar.all_reduce_gemma_rms_norm_sm70(
+            ca._ptr,
+            inp,
+            residual,
+            gamma,
+            norm_out,
+            residual_out,
+            1e-6,
+            reg_buffer,
+            reg_buffer_size,
+        )
+        return norm_out, residual_out
+
+    with ca.capture(), torch.cuda.graph(baseline_graph):
+        baseline_outputs = [
+            baseline_call(inp, residual, gamma)
+            for inp, residual, gamma in zip(inputs, residuals, gammas)
+        ]
+    fused_outputs_pending: list[None] = []
+    with ca.capture(), torch.cuda.graph(fused_graph):
+        fused_outputs = [
+            fused_call(inp, residual, gamma)
+            for inp, residual, gamma in zip(inputs, residuals, gammas)
+        ]
+
+    for _ in range(latency_warmup_replays):
+        baseline_graph.replay()
+        fused_graph.replay()
+    torch.cuda.synchronize()
+    dist.barrier()
+
+    def measure(graph: torch.cuda.CUDAGraph) -> float:
+        start = torch.cuda.Event(enable_timing=True)
+        end = torch.cuda.Event(enable_timing=True)
+        start.record()
+        for _ in range(latency_replays):
+            graph.replay()
+        end.record()
+        end.synchronize()
+        return start.elapsed_time(end) / (latency_replays * multi_count)
+
+    baseline_latency_ms = measure(baseline_graph)
+    fused_latency_ms = measure(fused_graph)
+    dist.barrier()
+
+    norm_max_diff = 0.0
+    residual_max_diff = 0.0
+    norm_allclose = True
+    residual_equal = True
+    for (norm, residual), ref_norm, ref_residual in zip(
+        fused_outputs, reference_norms, reference_residuals
+    ):
+        norm_max_diff = max(
+            norm_max_diff, float((norm.float() - ref_norm.float()).abs().max().item())
+        )
+        residual_max_diff = max(
+            residual_max_diff,
+            float((residual - ref_residual).abs().max().item()),
+        )
+        norm_allclose &= bool(torch.allclose(norm, ref_norm, atol=1e-3, rtol=1e-3))
+        residual_equal &= bool(torch.equal(residual, ref_residual))
+
+    passed = norm_allclose and residual_equal
+    return {
+        "mode": "graph_fused_gemma",
+        "size": size,
+        "bytes": size * 2,
+        "dtype": "float16",
+        "pattern": input_pattern,
+        "residual_pattern": residual_pattern,
+        "multi_count": multi_count,
+        "cooperative_ctas_per_row": cooperative_ctas_per_row,
+        "cooperative_threads": cooperative_threads,
+        "baseline_latency_ms_per_fusion": baseline_latency_ms,
+        "fused_latency_ms_per_fusion": fused_latency_ms,
+        "speedup": baseline_latency_ms / fused_latency_ms,
+        "comparison": {
+            "equal": passed,
+            "norm_allclose": norm_allclose,
+            "norm_max_diff": norm_max_diff,
+            "residual_equal": residual_equal,
+            "residual_max_diff": residual_max_diff,
+        },
     }
 
 
@@ -322,6 +614,15 @@ def main() -> None:
     parser.add_argument("--seed", type=int, default=20260602)
     parser.add_argument("--graph-replays", type=int, default=3)
     parser.add_argument("--multi-count", type=int, default=160)
+    parser.add_argument("--latency-warmup-replays", type=int, default=25)
+    parser.add_argument("--latency-replays", type=int, default=500)
+    parser.add_argument("--cooperative-ctas-per-row", type=int, default=4)
+    parser.add_argument("--cooperative-threads", type=int, default=128)
+    parser.add_argument(
+        "--fused-residual-pattern",
+        choices=("random_model", "zero", "large", "cancellation"),
+        default="random_model",
+    )
     parser.add_argument("--max-size-bytes", type=int, default=8 * 1024 * 1024)
     parser.add_argument(
         "--require-exact-patterns",
@@ -329,7 +630,14 @@ def main() -> None:
         help="Patterns that must be bitwise equal in every requested mode.",
     )
     parser.add_argument("--json-out")
+    parser.add_argument(
+        "--standalone-fused-library",
+        help="Temporary extension containing the C2 fused operator.",
+    )
     args = parser.parse_args()
+
+    if args.standalone_fused_library:
+        torch.ops.load_library(args.standalone_fused_library)
 
     local_rank = int(os.environ["LOCAL_RANK"])
     rank = int(os.environ["RANK"])
@@ -383,7 +691,7 @@ def main() -> None:
                                     args.graph_replays,
                                 )
                             )
-                        elif mode == "graph_multi":
+                        elif mode in ("graph_multi", "graph_multi_latency"):
                             results.append(
                                 _check_graph_multi(
                                     ca,
@@ -394,6 +702,27 @@ def main() -> None:
                                     args.seed,
                                     args.graph_replays,
                                     args.multi_count,
+                                    args.latency_warmup_replays,
+                                    args.latency_replays,
+                                    measure_latency=mode == "graph_multi_latency",
+                                )
+                            )
+                        elif mode == "graph_fused_gemma":
+                            if dtype != torch.float16:
+                                continue
+                            results.append(
+                                _check_graph_fused_gemma(
+                                    ca,
+                                    size,
+                                    rank,
+                                    pattern,
+                                    args.fused_residual_pattern,
+                                    args.seed,
+                                    args.multi_count,
+                                    args.latency_warmup_replays,
+                                    args.latency_replays,
+                                    args.cooperative_ctas_per_row,
+                                    args.cooperative_threads,
                                 )
                             )
                         else:
@@ -410,7 +739,7 @@ def main() -> None:
             for item in rank_results:
                 if item["pattern"] not in require_exact_patterns:
                     continue
-                if item["mode"] == "graph_multi":
+                if item["mode"] in ("graph_multi", "graph_multi_latency"):
                     equal = item["all_equal"]
                     comparison = item
                 else:

@@ -771,6 +771,7 @@ class CompilationConfig:
         "vllm::qwen_gdn_input_projection_core",
         "vllm::qwen_gdn_input_projection",
         "vllm::qwen_gdn_output_projection",
+        "vllm::qwen_gdn_post_projection_q1",
         "vllm::gdn_attention_core_xpu",
         "vllm::olmo_hybrid_gdn_full_forward",
         "vllm::kda_attention",

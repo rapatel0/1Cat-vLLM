@@ -53,3 +53,9 @@ class SamplingMetadata:
     # When non-None, use ``holder.has_tracked_requests()`` to see if this batch applies
     # thinking-token-budget logits (holder may exist with an empty tracking set).
     thinking_budget_state_holder: ThinkingBudgetStateHolder | None = None
+
+    # CPU-validated contract for the SM70 batch-1 compact MTP sampler. The
+    # rejection sampler must not inspect device top-k/top-p tensors with
+    # ``.item()`` on the decode path, so InputBatch records exact eligibility
+    # when request metadata changes.
+    sm70_compact_topk20_eligible: bool = False

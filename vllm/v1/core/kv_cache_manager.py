@@ -1,9 +1,15 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import hashlib
 import itertools
+import json
+import os
+
+import numpy as np
 from collections.abc import Sequence
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Literal, overload
 
 from vllm.distributed.kv_events import BlockStored, KVCacheEvent
@@ -20,6 +26,31 @@ from vllm.v1.metrics.stats import PrefixCacheStats
 from vllm.v1.request import Request
 
 logger = init_logger(__name__)
+_SM70_TAIL_PATH = Path("/tmp/vllm-sm70-prompt-tail.json")
+
+
+def _sm70_cached_prompt_tail_tokens(request: Request, hit_tokens: int) -> int:
+    if os.getenv("VLLM_SM70_PROMPT_TAIL_CACHE", "1") != "1":
+        return 0
+    prompt = request.prompt_token_ids
+    if not prompt or hit_tokens <= 0:
+        return 0
+    try:
+        data = json.loads(_SM70_TAIL_PATH.read_text())
+        digest = hashlib.sha256(
+            np.asarray(prompt, dtype=np.int32).tobytes()
+        ).hexdigest()
+        if digest != data.get("sha256"):
+            return 0
+        tail = int(data.get("tail") or 0)
+        prompt_len = int(data.get("prompt_len") or 0)
+    except Exception:
+        return 0
+    if tail <= 1 or prompt_len != len(prompt):
+        return 0
+    if hit_tokens != prompt_len - tail:
+        return 0
+    return tail - 1
 
 
 @dataclass

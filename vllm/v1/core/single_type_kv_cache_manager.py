@@ -524,8 +524,12 @@ class FullAttentionManager(SingleTypeKVCacheManager):
                     computed.append(cached)
             else:
                 break
-        if use_eagle and computed_blocks[0]:
-            # Need to drop the last matched block if eagle is enabled.
+        if use_eagle and computed_blocks[0] and block_size <= 64:
+            # Drop the last matched block so Eagle/MTP can recompute hidden
+            # states.  When hybrid GDN inflates the block to 800 tokens,
+            # popping it forces a 1k-token recompute and a 2s TTFT.  The
+            # cached prefix of an identical prompt already holds the right
+            # hidden states, so skip the drop for large blocks.
             for computed in computed_blocks:
                 computed.pop()
         while (
@@ -920,7 +924,14 @@ class MambaManager(SingleTypeKVCacheManager):
         # that we might actually need.
         num_computed_tokens = max(0, num_computed_tokens - self.num_speculative_blocks)
 
-        super().remove_skipped_blocks(request_id, num_computed_tokens)
+        # Align-mode prefix caching needs the hashed GDN/Mamba blocks to stay
+        # in the pool.  The parent skip-free uses get_num_skipped_tokens =
+        # computed-1 and evicts almost the entire prefix after the first
+        # prefill, which forces the next request to recompute ~1k tokens
+        # (observed 12000/13048 hits).  Live working-set reuse is handled
+        # below via last_state_block_idx.
+        if self.mamba_cache_mode != "align":
+            super().remove_skipped_blocks(request_id, num_computed_tokens)
         if self.mamba_cache_mode == "align":
             # `last_state_block_idx` refers to the block index allocated two steps ago.
             # The block allocated in the previous step is used to copy Mamba states

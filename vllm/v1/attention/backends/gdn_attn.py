@@ -101,6 +101,87 @@ def _build_single_request_gdn_spec_metadata_kernel(
     )
 
 
+@triton.jit
+def _build_grouped_single_request_gdn_spec_metadata_kernel(
+    source_state_ids,
+    source_state_group_stride,
+    source_accepted_tokens,
+    source_state_selectors,
+    output_state_ids,
+    output_state_group_stride,
+    output_state_row_stride,
+    output_sequence_masks,
+    output_sequence_mask_group_stride,
+    output_token_indices,
+    output_token_index_group_stride,
+    output_query_start_loc,
+    output_query_start_group_stride,
+    output_accepted_tokens,
+    output_accepted_group_stride,
+    output_state_selectors,
+    output_selector_group_stride,
+    batch_size: tl.constexpr,
+    real_query_tokens: tl.constexpr,
+    state_width: tl.constexpr,
+    state_block_size: tl.constexpr,
+    capture_only: tl.constexpr,
+    pad_slot_id: tl.constexpr,
+):
+    """Materialize one live q=N request for every GDN cache group."""
+    row = tl.program_id(0)
+    group = tl.program_id(1)
+    state_col = tl.arange(0, state_block_size)
+    state_mask = state_col < state_width
+    live_row = row == 0
+
+    source_state_base = source_state_ids + group * source_state_group_stride
+    output_state_base = output_state_ids + group * output_state_group_stride
+    state_ids = tl.load(
+        source_state_base + state_col,
+        mask=live_row & (not capture_only) & state_mask,
+        other=pad_slot_id,
+    )
+    tl.store(
+        output_state_base + row * output_state_row_stride + state_col,
+        state_ids,
+        mask=state_mask,
+    )
+    tl.store(
+        output_sequence_masks
+        + group * output_sequence_mask_group_stride
+        + row,
+        live_row,
+    )
+
+    accepted = tl.load(source_accepted_tokens, mask=live_row, other=1)
+    selector = tl.load(source_state_selectors, mask=live_row, other=1)
+    tl.store(
+        output_accepted_tokens + group * output_accepted_group_stride + row,
+        accepted,
+    )
+    tl.store(
+        output_state_selectors + group * output_selector_group_stride + row,
+        selector,
+    )
+    tl.store(
+        output_token_indices + group * output_token_index_group_stride + row,
+        row,
+        mask=row < real_query_tokens,
+    )
+    query_start_base = (
+        output_query_start_loc + group * output_query_start_group_stride
+    )
+    tl.store(
+        query_start_base + row,
+        tl.where(live_row, 0, real_query_tokens),
+    )
+    tl.store(
+        query_start_base + batch_size,
+        real_query_tokens,
+        mask=live_row,
+    )
+
+
 def _sm70_flashqla_original_prefill_enabled() -> bool:
     raw = os.getenv("VLLM_SM70_FLASHQLA_ORIGINAL_PREFILL")
     if raw is None:
@@ -595,7 +676,13 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             dtype=torch.int32,
             device=device,
         )
-        if self.use_spec_decode and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
+        register_graph_metadata = (
+            self.use_spec_decode and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
+        ) or (
+            self.use_full_cuda_graph
+            and envs.VLLM_SM70_QWEN_GDN_INPUT_CORE_OP
+        )
+        if register_graph_metadata:
             placeholder_rows = max(
                 1, min(self.num_spec_state_tokens + 1, self.decode_cudagraph_max_bs)
             )
@@ -629,6 +716,36 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 ),
             )
 
+    def _make_single_request_spec_metadata(
+        self,
+        *,
+        batch_size: int,
+        real_query_tokens: int,
+        device: torch.device,
+    ) -> GDNAttentionMetadata:
+        attn_metadata = GDNAttentionMetadata(
+            num_prefills=0,
+            num_prefill_tokens=0,
+            num_decodes=0,
+            num_decode_tokens=0,
+            num_spec_decodes=1,
+            num_spec_decode_tokens=real_query_tokens,
+            num_actual_tokens=batch_size,
+            spec_query_start_loc=self.spec_query_start_loc[: batch_size + 1],
+            spec_state_indices_tensor=self.spec_state_indices_tensor[:batch_size],
+            spec_sequence_masks=self.spec_sequence_masks[:batch_size],
+            spec_token_indx=self.spec_token_indx[:real_query_tokens],
+            non_spec_token_indx=self.non_spec_token_indx[:0],
+            num_accepted_tokens=self.num_accepted_tokens[:batch_size],
+            spec_state_slot_selectors=self.spec_state_slot_selectors[:batch_size],
+        )
+        if envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
+            register_gdn_spec_metadata_tensors(
+                self.layer_names,
+                gdn_spec_metadata_tensors(attn_metadata, device),
+            )
+        return attn_metadata
+
     def build(  # type: ignore[override]
         self,
         common_prefix_len: int,
@@ -642,12 +759,41 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
         ddtree_num_tree_tokens_cpu: torch.Tensor | None = None,
         for_cudagraph_capture: bool = False,
         fast_build: bool = False,
+        single_spec_real_query_tokens: int | None = None,
     ) -> GDNAttentionMetadata:
         m = common_attn_metadata
 
         query_start_loc = m.query_start_loc
         query_start_loc_cpu = m.query_start_loc_cpu
         nums_dict, batch_ptr, token_chunk_offset_ptr = None, None, None
+
+        # The runner's grouped batch-one path has already proved the complete
+        # q=N predicate and materialized every per-cache-group tensor in one
+        # kernel. Avoid repeating the CPU tensor reductions and scalar reads
+        # below once per GDN cache group; they cost roughly 1 ms per builder on
+        # the V100 serving host even though no new metadata is produced.
+        if single_spec_real_query_tokens is not None:
+            batch_size = int(m.num_actual_tokens)
+            if (
+                not self.use_spec_decode
+                or not self.use_full_cuda_graph
+                or self.num_spec != 3
+                or self.num_spec_state_tokens + 1 != 4
+                or query_start_loc_cpu.numel() != 2
+                or envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
+                or os.getenv("VLLM_SM70_DUMP_GDN_STATE_TABLE_DIR")
+                or batch_size > self.decode_cudagraph_max_bs
+                or single_spec_real_query_tokens != 4
+                or single_spec_real_query_tokens > batch_size
+            ):
+                raise AssertionError(
+                    "prebuilt GDN metadata received an unsupported runtime shape"
+                )
+            return self._make_single_request_spec_metadata(
+                batch_size=batch_size,
+                real_query_tokens=single_spec_real_query_tokens,
+                device=query_start_loc.device,
+            )
 
         num_reqs = query_start_loc_cpu.numel() - 1
         if spec_sequence_masks_cpu is not None:
@@ -684,7 +830,7 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             )
 
         if (
-            os.getenv("VLLM_SM70_GDN_SINGLE_SPEC_METADATA", "0") == "1"
+            envs.VLLM_SM70_GDN_SINGLE_SPEC_METADATA
             and self.use_spec_decode
             and self.use_full_cuda_graph
             and current_state_block_ids is not None
@@ -731,36 +877,11 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                         capture_only=for_cudagraph_capture,
                         pad_slot_id=PAD_SLOT_ID,
                     )
-                    attn_metadata = GDNAttentionMetadata(
-                        num_prefills=0,
-                        num_prefill_tokens=0,
-                        num_decodes=0,
-                        num_decode_tokens=0,
-                        num_spec_decodes=1,
-                        num_spec_decode_tokens=real_query_tokens,
-                        num_actual_tokens=batch_size,
-                        spec_query_start_loc=self.spec_query_start_loc[
-                            : batch_size + 1
-                        ],
-                        spec_state_indices_tensor=self.spec_state_indices_tensor[
-                            :batch_size
-                        ],
-                        spec_sequence_masks=self.spec_sequence_masks[:batch_size],
-                        spec_token_indx=self.spec_token_indx[:real_query_tokens],
-                        non_spec_token_indx=self.non_spec_token_indx[:0],
-                        num_accepted_tokens=self.num_accepted_tokens[:batch_size],
-                        spec_state_slot_selectors=self.spec_state_slot_selectors[
-                            :batch_size
-                        ],
+                    return self._make_single_request_spec_metadata(
+                        batch_size=batch_size,
+                        real_query_tokens=real_query_tokens,
+                        device=query_start_loc.device,
                     )
-                    if envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
-                        register_gdn_spec_metadata_tensors(
-                            self.layer_names,
-                            gdn_spec_metadata_tensors(
-                                attn_metadata, query_start_loc.device
-                            ),
-                        )
-                    return attn_metadata
 
         # The single-request speculative fast path above only consumes the
         # already-selected recurrent-state IDs.  Keep the generic block-table
@@ -1180,7 +1301,9 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
             batch_ptr=batch_ptr,
             token_chunk_offset_ptr=token_chunk_offset_ptr,
         )
-        if self.use_spec_decode and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP:
+        if (
+            self.use_spec_decode and envs.VLLM_SM70_QWEN_GDN_SPEC_CORE_OP
+        ) or envs.VLLM_SM70_QWEN_GDN_INPUT_CORE_OP:
             register_gdn_spec_metadata_tensors(
                 self.layer_names,
                 gdn_spec_metadata_tensors(attn_metadata, query_start_loc.device),
