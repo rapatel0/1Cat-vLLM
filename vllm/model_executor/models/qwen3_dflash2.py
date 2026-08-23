@@ -25,7 +25,9 @@ from vllm.model_executor.layers.vocab_parallel_embedding import (
     UnquantizedEmbeddingMethod,
 )
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.utils.flashinfer import has_flashinfer
+from vllm.utils.torch_utils import direct_register_custom_op
 
 from .dflash_sm70 import (
     DFLASH_SM70_WIDE_OUTPUT_SCALE,
@@ -40,6 +42,50 @@ from .qwen3_dflash import (
 from .utils import maybe_prefix
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _sanitize_dflash2_candidate_ids_kernel(
+    candidate_ids_ptr,
+    numel,
+    vocab_size,
+    BLOCK: tl.constexpr,
+):
+    offsets = tl.program_id(0) * BLOCK + tl.arange(0, BLOCK)
+    mask = offsets < numel
+    token_ids = tl.load(candidate_ids_ptr + offsets, mask=mask, other=0)
+    token_ids = tl.maximum(0, tl.minimum(token_ids, vocab_size - 1))
+    tl.store(candidate_ids_ptr + offsets, token_ids, mask=mask)
+
+
+def _sanitize_dflash2_candidate_ids(
+    candidate_ids: torch.Tensor, vocab_size: int
+) -> None:
+    if candidate_ids.is_cuda:
+        numel = candidate_ids.numel()
+        _sanitize_dflash2_candidate_ids_kernel[(triton.cdiv(numel, 256),)](
+            candidate_ids,
+            numel,
+            vocab_size,
+            BLOCK=256,
+        )
+    else:
+        candidate_ids.clamp_(min=0, max=vocab_size - 1)
+
+
+def _sanitize_dflash2_candidate_ids_fake(
+    candidate_ids: torch.Tensor, vocab_size: int
+) -> None:
+    return
+
+
+direct_register_custom_op(
+    op_name="sanitize_dflash2_candidate_ids",
+    op_func=_sanitize_dflash2_candidate_ids,
+    mutates_args=["candidate_ids"],
+    fake_impl=_sanitize_dflash2_candidate_ids_fake,
+)
+sanitize_dflash2_candidate_ids = torch.ops.vllm.sanitize_dflash2_candidate_ids
 
 
 def _use_sm70_bf16_emulation(config) -> bool:
@@ -426,6 +472,11 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             values, selected = _topk(values, selector.top_k)
             ids = ids.gather(-1, selected)
 
+        # The selector embeds these IDs inside a replayed CUDA graph. Keep an
+        # opaque device guard in the graph so a stale candidate row cannot
+        # terminate every TP rank with an out-of-range embedding access. Valid
+        # TopK IDs are unchanged. Invalid drafts fail safe to target verification.
+        sanitize_dflash2_candidate_ids(ids, self.config.vocab_size)
         values = values.float() * self.output_multiplier
         if self.final_logit_softcapping is not None:
             cap = self.final_logit_softcapping

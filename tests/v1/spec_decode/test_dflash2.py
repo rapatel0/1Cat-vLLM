@@ -12,6 +12,7 @@ import vllm.model_executor.models.qwen3_dflash2 as dflash2_model
 import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 import vllm.v1.worker.gpu.attn_utils as attn_utils
 import vllm.v1.worker.gpu.spec_decode.dflash.speculator as dflash_speculator
+from vllm.config.compilation import CUDAGraphMode
 from vllm.config.speculative import SpeculativeConfig
 from vllm.model_executor.layers.mamba.gdn.qwen_gdn_linear_attn import (
     _is_dflash2_spec_config,
@@ -49,6 +50,30 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
     _requires_sm70_tail,
     _selector_walk_kernel,
 )
+
+
+def test_dflash_draft_enforce_eager_disables_cuda_graph(monkeypatch):
+    speculator = object.__new__(DFlashSpeculator)
+    speculator.vllm_config = SimpleNamespace(
+        speculative_config=SimpleNamespace(enforce_eager=True)
+    )
+    speculator.device = torch.device("cpu")
+    speculator.num_query_per_req = 8
+    speculator.attn_cg_support = SimpleNamespace(
+        min_cg_support=SimpleNamespace(value=999),
+        min_cg_attn_backend="test",
+    )
+    captured = {}
+
+    def fake_manager(config, device, mode, decode_query_len):
+        captured.update(mode=mode, decode_query_len=decode_query_len)
+        return SimpleNamespace()
+
+    monkeypatch.setattr(dflash_speculator, "DFlashCudaGraphManager", fake_manager)
+
+    speculator.init_cudagraph_manager(CUDAGraphMode.FULL)
+
+    assert captured == {"mode": CUDAGraphMode.NONE, "decode_query_len": 8}
 
 
 @pytest.mark.parametrize("block_size", [4, 6, 8])
@@ -541,6 +566,7 @@ def test_compute_candidates_trims_fused_local_top20_to_checkpoint_top16(monkeypa
     model = SimpleNamespace(
         lm_head=lm_head,
         model=SimpleNamespace(candidate_selector=SimpleNamespace(top_k=16)),
+        config=SimpleNamespace(vocab_size=248320),
         output_multiplier=1.0,
         final_logit_softcapping=None,
     )
@@ -556,6 +582,35 @@ def test_compute_candidates_trims_fused_local_top20_to_checkpoint_top16(monkeypa
     assert torch.equal(actual_ids, ids.gather(-1, positions))
     assert torch.equal(actual_values, expected_values)
     dense_apply.assert_not_called()
+
+
+def test_compute_candidates_sanitizes_invalid_ids_before_selector(monkeypatch):
+    quant_method = UnquantizedEmbeddingMethod()
+    values = torch.arange(20, dtype=torch.float32).reshape(1, 20)
+    ids = torch.arange(100, 120, dtype=torch.int64).reshape(1, 20)
+    ids[0, -1] = 999999
+    ids[0, -2] = -999999
+    lm_head = SimpleNamespace(
+        quant_method=quant_method,
+        maybe_get_sm70_dflash2_top20=lambda hidden, selector_k: (values, ids),
+    )
+    model = SimpleNamespace(
+        lm_head=lm_head,
+        model=SimpleNamespace(candidate_selector=SimpleNamespace(top_k=16)),
+        config=SimpleNamespace(vocab_size=248320),
+        output_multiplier=1.0,
+        final_logit_softcapping=None,
+    )
+    monkeypatch.setattr(
+        dflash2_model, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+
+    actual_ids, _ = DFlash2Qwen3ForCausalLM.compute_candidates(
+        model, torch.empty((1, 8))
+    )
+
+    assert actual_ids.min().item() == 0
+    assert actual_ids.max().item() == 248319
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="requires CUDA")

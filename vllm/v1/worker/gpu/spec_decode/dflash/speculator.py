@@ -114,6 +114,13 @@ class DFlashSpeculator(DraftModelSpeculator):
 
     def init_cudagraph_manager(self, cudagraph_mode: CUDAGraphMode) -> None:
         wants_full = cudagraph_mode.decode_mode() == CUDAGraphMode.FULL
+        speculative_config = self.vllm_config.speculative_config
+        if speculative_config is not None and speculative_config.enforce_eager:
+            wants_full = False
+            logger.info(
+                "%s draft enforce_eager is enabled; running the draft eagerly.",
+                self._speculator_name,
+            )
         supports_full = (
             self.attn_cg_support.min_cg_support.value
             >= AttentionCGSupport.UNIFORM_BATCH.value

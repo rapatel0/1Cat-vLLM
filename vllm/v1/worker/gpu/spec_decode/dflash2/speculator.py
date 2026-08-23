@@ -7,6 +7,9 @@ import torch
 
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.model_executor.models.qwen3_dflash2 import (
+    sanitize_dflash2_candidate_ids,
+)
 from vllm.triton_utils import tl, triton
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
@@ -346,6 +349,9 @@ class DFlash2Speculator(DFlashSpeculator):
         )
         unary_logits = unary_logits.view_as(candidate_ids)
         anchor_token_ids = self.input_buffers.input_ids[self._anchor_indices[:num_reqs]]
+        sanitize_dflash2_candidate_ids(
+            anchor_token_ids, self.draft_model_config.get_vocab_size()
+        )
         scores = self.model.model.candidate_selector(
             candidate_ids,
             unary_logits,
