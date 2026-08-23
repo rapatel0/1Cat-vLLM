@@ -176,6 +176,10 @@ if TYPE_CHECKING:
     VLLM_SM70_LM_HEAD_TOP1: bool = True
     VLLM_SM70_LM_HEAD_TOP1_TC: bool = False
     VLLM_SM70_DFLASH2_FUSED_SELECTOR: bool = False
+    VLLM_SM70_DFLASH2_VERIFY_FASTPATH: bool = False
+    VLLM_SM70_DFLASH2_FUSED_GDN_METADATA: bool = False
+    VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW: bool = False
+    VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY: bool = False
     VLLM_SM70_TOP1_CUSTOM_AR: bool = False
     VLLM_SM70_GREEDY_TOKEN_FASTPATH: bool = True
     VLLM_SM70_GREEDY_TOKEN_FASTPATH_TRACE: bool = False
@@ -1748,6 +1752,29 @@ environment_variables: dict[str, Callable[[], Any]] = {
     # microbenchmark and paired end-to-end V100 gates show a stable win.
     "VLLM_SM70_DFLASH2_FUSED_SELECTOR": lambda: bool(
         int(os.getenv("VLLM_SM70_DFLASH2_FUSED_SELECTOR", "0"))
+    ),
+    # Umbrella gate for DFlash2 target-verification optimizations. Keep this
+    # default-off while each stage is checked against the unchanged MRV2 path
+    # with identical weights, prompts, and sampling configuration.
+    "VLLM_SM70_DFLASH2_VERIFY_FASTPATH": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_VERIFY_FASTPATH", "0"))
+    ),
+    # Build all DFlash2 target GDN state-index metadata with one pointer-table
+    # Triton launch. Keep separate from the shared-classification gate until
+    # the fixed-trajectory and mixed-batch Graph checks pass.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_METADATA": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "0"))
+    ),
+    # Debug-only oracle: materialize the legacy advanced-indexing contract and
+    # compare it with the fused persistent buffers before graph replay.
+    "VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "0"))
+    ),
+    # DFlash2-only packed GDN target-verification kernel. This is deliberately
+    # independent from the shared-metadata umbrella gate so each optimization
+    # can be paired against the unchanged verifier in isolation.
+    "VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY": lambda: bool(
+        int(os.getenv("VLLM_SM70_DFLASH2_FUSED_GDN_VERIFY", "0"))
     ),
     # Safe greedy-only shortcut: avoid full vocab all-gather/sampler work when
     # the request batch is pure greedy and has no penalties, logprobs, grammar,

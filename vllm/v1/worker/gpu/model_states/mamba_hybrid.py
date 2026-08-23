@@ -7,20 +7,32 @@ import numpy as np
 import torch
 import torch.nn as nn
 
+from vllm import envs
 from vllm.config import VllmConfig
 from vllm.config.compilation import CUDAGraphMode
+from vllm.logger import init_logger
 from vllm.model_executor.layers.mamba.mamba_utils import (
     get_conv_copy_spec,
     is_conv_state_dim_first,
 )
+from vllm.platforms import current_platform
 from vllm.triton_utils import triton
 from vllm.utils.platform_utils import is_pin_memory_available
-from vllm.v1.attention.backends.gdn_attn import GDNAttentionMetadataBuilder
+from vllm.v1.attention.backends.gdn_attn import (
+    DFlash2GDNGroupDescriptor,
+    GDNAttentionMetadata,
+    GDNAttentionMetadataBuilder,
+    prepare_dflash2_gdn_group_metadata,
+)
 from vllm.v1.attention.backends.mamba2_attn import Mamba2AttentionMetadataBuilder
 from vllm.v1.core.sched.output import NewRequestData
 from vllm.v1.kv_cache_interface import KVCacheConfig, MambaSpec
 from vllm.v1.utils import CpuGpuBuffer
-from vllm.v1.worker.gpu.attn_utils import build_attn_metadata
+from vllm.v1.worker.gpu.attn_utils import (
+    CommonGDNSpecMetadata,
+    build_attn_metadata,
+    compute_common_gdn_attn_metadata,
+)
 from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.mamba_align import (
     preprocess_mamba_align_fused_kernel,
@@ -33,12 +45,16 @@ from vllm.v1.worker.gpu.model_states.interface import ModelSpecificAttnMetadata
 from vllm.v1.worker.mamba_utils import MambaSpecDecodeGPUContext
 from vllm.v1.worker.utils import AttentionGroup
 
+logger = init_logger(__name__)
+
 
 @dataclass
 class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
     is_prefilling: torch.Tensor
     num_accepted_tokens: torch.Tensor | None = None
     num_decode_draft_tokens_cpu: torch.Tensor | None = None
+    common_gdn_metadata: CommonGDNSpecMetadata | None = None
+    prepared_dflash2_gdn_metadata: dict[int, GDNAttentionMetadata] | None = None
 
     def get_extra_common_attn_kwargs(
         self,
@@ -57,7 +73,7 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             (Mamba2AttentionMetadataBuilder, GDNAttentionMetadataBuilder),
         ):
             return {}
-        return {
+        kwargs = {
             "num_accepted_tokens": None
             if self.num_accepted_tokens is None
             else self.num_accepted_tokens[:num_reqs],
@@ -65,6 +81,13 @@ class MambaHybridAttnMetadata(ModelSpecificAttnMetadata):
             if self.num_decode_draft_tokens_cpu is None
             else self.num_decode_draft_tokens_cpu[:num_reqs],
         }
+        if isinstance(attn_metadata_builder, GDNAttentionMetadataBuilder):
+            kwargs["common_gdn_metadata"] = self.common_gdn_metadata
+            if self.prepared_dflash2_gdn_metadata is not None:
+                kwargs["prepared_dflash2_metadata"] = (
+                    self.prepared_dflash2_gdn_metadata.get(id(attn_metadata_builder))
+                )
+        return kwargs
 
 
 class MambaHybridModelState(DefaultModelState):
@@ -82,6 +105,35 @@ class MambaHybridModelState(DefaultModelState):
         self.num_accepted_tokens_gpu = torch.ones(
             self.max_num_reqs, dtype=torch.int32, device=self.device
         )
+        speculative_config = vllm_config.speculative_config
+        draft_model_config = (
+            speculative_config.draft_model_config
+            if speculative_config is not None
+            else None
+        )
+        draft_architectures: list[str] = []
+        if draft_model_config is not None:
+            draft_architectures = draft_model_config.architectures or []
+        self._use_dflash2_common_gdn_metadata = bool(
+            envs.VLLM_SM70_DFLASH2_VERIFY_FASTPATH
+            and speculative_config is not None
+            and speculative_config.use_dflash()
+            and "DFlash2DraftModel" in draft_architectures
+        )
+        if self._use_dflash2_common_gdn_metadata:
+            logger.info_once("DFlash2 shared GDN batch metadata fast path enabled.")
+        self._use_dflash2_fused_gdn_metadata = bool(
+            self._use_dflash2_common_gdn_metadata
+            and envs.VLLM_SM70_DFLASH2_FUSED_GDN_METADATA
+            and self.cache_config.mamba_cache_mode == "none"
+            and device.type == "cuda"
+            and current_platform.is_device_capability(70)
+        )
+        self._dflash2_gdn_builders: (
+            list[tuple[int, GDNAttentionMetadataBuilder]] | None
+        ) = None
+        self._dflash2_gdn_group_descriptor: DFlash2GDNGroupDescriptor | None = None
+        self._dflash2_fused_gdn_metadata_logged = False
         self._align_mode = self.cache_config.mamba_cache_mode == "align"
         if self._align_mode:
             self._mamba_state_idx_gpu = torch.full(
@@ -200,6 +252,20 @@ class MambaHybridModelState(DefaultModelState):
             input_batch.idx_mapping,
         )
 
+    def _get_dflash2_gdn_builders(
+        self,
+        attn_groups: list[list[AttentionGroup]],
+    ) -> list[tuple[int, GDNAttentionMetadataBuilder]]:
+        if self._dflash2_gdn_builders is None:
+            builders: list[tuple[int, GDNAttentionMetadataBuilder]] = []
+            for kv_cache_group_id, groups in enumerate(attn_groups):
+                for group in groups:
+                    builder = group.get_metadata_builder(0)
+                    if isinstance(builder, GDNAttentionMetadataBuilder):
+                        builders.append((kv_cache_group_id, builder))
+            self._dflash2_gdn_builders = builders
+        return self._dflash2_gdn_builders
+
     def prepare_attn(
         self,
         input_batch: InputBatch,
@@ -228,6 +294,8 @@ class MambaHybridModelState(DefaultModelState):
         # compute them during actual (non-capture) forward execution.
         num_accepted_tokens = None
         num_decode_draft_tokens_cpu = None
+        common_gdn_metadata = None
+        prepared_dflash2_gdn_metadata = None
         if not for_capture:
             num_accepted_tokens = self.num_accepted_tokens_gpu.new_ones(num_reqs)
             num_accepted_tokens[: input_batch.num_reqs] = self.num_accepted_tokens_gpu[
@@ -247,13 +315,54 @@ class MambaHybridModelState(DefaultModelState):
                     -1,
                 )
             num_decode_draft_tokens_cpu = torch.from_numpy(num_decode_draft_tokens_np)
+            if self._use_dflash2_common_gdn_metadata:
+                speculative_config = self.vllm_config.speculative_config
+                assert speculative_config is not None
+                common_gdn_metadata = compute_common_gdn_attn_metadata(
+                    num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+                    query_start_loc=input_batch.query_start_loc,
+                    query_start_loc_cpu=query_start_loc_cpu,
+                    num_spec_state_tokens=(
+                        speculative_config.num_speculative_state_tokens()
+                    ),
+                    legacy_mixed_decode_routing=(
+                        envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING
+                    ),
+                )
+
+            if (
+                self._use_dflash2_fused_gdn_metadata
+                and cudagraph_mode == CUDAGraphMode.FULL
+                and common_gdn_metadata is not None
+            ):
+                prepared_result = prepare_dflash2_gdn_group_metadata(
+                    builders_by_group=self._get_dflash2_gdn_builders(attn_groups),
+                    block_tables=block_tables,
+                    common_gdn_metadata=common_gdn_metadata,
+                    num_accepted_tokens=num_accepted_tokens,
+                    num_actual_tokens=num_tokens,
+                    descriptor=self._dflash2_gdn_group_descriptor,
+                )
+                if prepared_result is not None:
+                    (
+                        prepared_dflash2_gdn_metadata,
+                        self._dflash2_gdn_group_descriptor,
+                    ) = prepared_result
+                    if not self._dflash2_fused_gdn_metadata_logged:
+                        logger.info(
+                            "DFlash2 fused GDN metadata active for %d cache groups.",
+                            len(prepared_dflash2_gdn_metadata),
+                        )
+                        self._dflash2_fused_gdn_metadata_logged = True
 
         mamba_attn_metadata = MambaHybridAttnMetadata(
             is_prefilling=is_prefilling,
             num_accepted_tokens=num_accepted_tokens,
             num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            common_gdn_metadata=common_gdn_metadata,
+            prepared_dflash2_gdn_metadata=prepared_dflash2_gdn_metadata,
         )
-        return build_attn_metadata(
+        attn_metadata = build_attn_metadata(
             attn_groups=attn_groups,
             num_reqs=num_reqs,
             num_tokens=num_tokens,
@@ -269,6 +378,16 @@ class MambaHybridModelState(DefaultModelState):
             model_specific_attn_metadata=mamba_attn_metadata,
             for_cudagraph_capture=for_capture,
         )
+        if common_gdn_metadata is not None:
+            # The legacy per-group builder fenced here through a GPU ``.item()``
+            # assertion. Keep one batch-level fence after every group's state
+            # contract and graph-buffer copy instead of removing the ordering
+            # edge or paying it once per GDN cache group.
+            assert (
+                common_gdn_metadata.spec_query_start_loc[-1].item()
+                == common_gdn_metadata.num_spec_decode_tokens
+            )
+        return attn_metadata
 
     def postprocess_state(
         self,

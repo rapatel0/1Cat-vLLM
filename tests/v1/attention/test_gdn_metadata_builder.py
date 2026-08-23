@@ -36,9 +36,11 @@ from vllm.v1.attention.backends.gdn_attn import (
     build_gdn_spec_decode_state_contract,
     gdn_spec_metadata_tensors,
     get_registered_gdn_spec_metadata_tensors,
+    prepare_dflash2_gdn_group_metadata,
 )
 from vllm.v1.attention.backends.utils import PAD_SLOT_ID
 from vllm.v1.kv_cache_interface import MambaSpec
+from vllm.v1.worker.gpu.attn_utils import compute_common_gdn_attn_metadata
 
 BLOCK_SIZE = 16
 DEVICE = torch.device("cpu")
@@ -172,6 +174,7 @@ def _create_gdn_builder(
     use_full_cuda_graph: bool = False,
     mamba_cache_mode: str = "none",
     max_cudagraph_capture_size: int = 4,
+    device: torch.device = DEVICE,
 ) -> GDNAttentionMetadataBuilder:
     """Create a GDNAttentionMetadataBuilder with minimal config."""
     vllm_config = create_vllm_config(model_name=model_name, block_size=BLOCK_SIZE)
@@ -181,6 +184,11 @@ def _create_gdn_builder(
         vllm_config.compilation_config.max_cudagraph_capture_size = (
             max_cudagraph_capture_size
         )
+    else:
+        # Keep the helper's default contract explicit. The repository-wide
+        # compilation default may select FULL graphs on CUDA platforms, which
+        # would pad otherwise eager metadata and make these tests route-dependent.
+        vllm_config.compilation_config.cudagraph_mode = CUDAGraphMode.NONE
     if num_speculative_tokens > 0:
         vllm_config.speculative_config = SpeculativeConfig(
             method="ngram",
@@ -196,7 +204,7 @@ def _create_gdn_builder(
         kv_cache_spec=mamba_spec,
         layer_names=["layer.0"],
         vllm_config=vllm_config,
-        device=DEVICE,
+        device=device,
     )
 
 
@@ -212,18 +220,71 @@ def _build(
     builder: GDNAttentionMetadataBuilder,
     batch_spec: BatchSpec,
     num_decode_draft_tokens: list[int] | None = None,
+    use_common_metadata: bool = False,
 ) -> GDNAttentionMetadata:
     """Build GDN attention metadata, optionally with spec-decode kwargs."""
     common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
     kwargs: dict = {}
     if num_decode_draft_tokens is not None:
-        kwargs["num_decode_draft_tokens_cpu"] = torch.tensor(
+        num_decode_draft_tokens_cpu = torch.tensor(
             num_decode_draft_tokens, dtype=torch.int32, device="cpu"
         )
-        kwargs["num_accepted_tokens"] = torch.ones(
+        num_accepted_tokens = torch.ones(
             batch_spec.batch_size, dtype=torch.int32, device=DEVICE
         )
+        kwargs["num_decode_draft_tokens_cpu"] = num_decode_draft_tokens_cpu
+        kwargs["num_accepted_tokens"] = num_accepted_tokens
+        if use_common_metadata:
+            kwargs["common_gdn_metadata"] = compute_common_gdn_attn_metadata(
+                num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+                query_start_loc=common.query_start_loc,
+                query_start_loc_cpu=common.query_start_loc_cpu,
+                num_spec_state_tokens=builder.num_spec_state_tokens,
+                legacy_mixed_decode_routing=(
+                    qwen_gdn.envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING
+                ),
+            )
     return builder.build(common_prefix_len=0, common_attn_metadata=common, **kwargs)
+
+
+def _assert_gdn_metadata_equal(
+    actual: GDNAttentionMetadata,
+    expected: GDNAttentionMetadata,
+) -> None:
+    scalar_fields = (
+        "num_prefills",
+        "num_prefill_tokens",
+        "num_decodes",
+        "num_decode_tokens",
+        "num_spec_decodes",
+        "num_spec_decode_tokens",
+        "num_actual_tokens",
+    )
+    for field in scalar_fields:
+        assert getattr(actual, field) == getattr(expected, field), field
+
+    tensor_fields = (
+        "has_initial_state",
+        "spec_query_start_loc",
+        "non_spec_query_start_loc",
+        "spec_state_indices_tensor",
+        "non_spec_state_indices_tensor",
+        "spec_sequence_masks",
+        "spec_token_indx",
+        "non_spec_token_indx",
+        "num_accepted_tokens",
+        "spec_state_slot_selectors",
+        "chunk_indices",
+        "chunk_offsets",
+        "batch_ptr",
+        "token_chunk_offset_ptr",
+    )
+    for field in tensor_fields:
+        actual_tensor = getattr(actual, field)
+        expected_tensor = getattr(expected, field)
+        assert (actual_tensor is None) == (expected_tensor is None), field
+        if actual_tensor is not None:
+            assert torch.equal(actual_tensor, expected_tensor), field
 
 
 def _effective_spec_initial_state_slots(
@@ -258,6 +319,51 @@ def test_gdn_build_classification(
     assert meta.num_prefills == test_case.expected_num_prefills
     assert meta.num_prefill_tokens == test_case.expected_num_prefill_tokens
     assert meta.num_spec_decodes == test_case.expected_num_spec_decodes
+
+
+@pytest.mark.parametrize(
+    "test_case",
+    [
+        case
+        for case in GDN_BUILD_TEST_CASES.values()
+        if case.num_decode_draft_tokens is not None
+    ],
+    ids=[
+        name
+        for name, case in GDN_BUILD_TEST_CASES.items()
+        if case.num_decode_draft_tokens is not None
+    ],
+)
+def test_common_gdn_metadata_matches_per_group_builder(
+    test_case: GDNBuildTestCase,
+    local_gdn_model: str,
+):
+    generic_builder = _create_gdn_builder(
+        local_gdn_model, test_case.num_speculative_tokens
+    )
+    common_builder = _create_gdn_builder(
+        local_gdn_model, test_case.num_speculative_tokens
+    )
+    batch = BatchSpec(
+        seq_lens=test_case.seq_lens,
+        query_lens=test_case.query_lens,
+    )
+
+    torch.manual_seed(0)
+    expected = _build(
+        generic_builder,
+        batch,
+        test_case.num_decode_draft_tokens,
+    )
+    torch.manual_seed(0)
+    actual = _build(
+        common_builder,
+        batch,
+        test_case.num_decode_draft_tokens,
+        use_common_metadata=True,
+    )
+
+    _assert_gdn_metadata_equal(actual, expected)
 
 
 def test_mixed_decode_stays_decode_fastpath(local_gdn_model):
@@ -335,6 +441,264 @@ def test_full_cuda_graph_spec_replay_tail_uses_pad_slot(local_gdn_model):
         [PAD_SLOT_ID] * 3,
         [PAD_SLOT_ID] * 3,
     ]
+
+
+def test_common_gdn_metadata_matches_full_graph_padding(local_gdn_model):
+    generic_builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=2,
+        use_full_cuda_graph=True,
+    )
+    common_builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=2,
+        use_full_cuda_graph=True,
+    )
+    batch = BatchSpec(seq_lens=[4097], query_lens=[3])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        block_table_tensor=torch.tensor(
+            [[10, 11, 12, 13, 14]],
+            dtype=torch.int32,
+            device=DEVICE,
+        ),
+        num_actual_tokens=4,
+    )
+    num_accepted_tokens = torch.tensor([3], dtype=torch.int32, device=DEVICE)
+    num_decode_draft_tokens_cpu = torch.tensor([2], dtype=torch.int32, device="cpu")
+
+    expected = generic_builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=num_accepted_tokens,
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+    )
+    common_metadata = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+        query_start_loc=common.query_start_loc,
+        query_start_loc_cpu=common.query_start_loc_cpu,
+        num_spec_state_tokens=common_builder.num_spec_state_tokens,
+        legacy_mixed_decode_routing=(
+            qwen_gdn.envs.VLLM_SM70_MTP_LEGACY_GDN_MIXED_DECODE_ROUTING
+        ),
+    )
+    assert common_metadata is not None
+    actual = common_builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=num_accepted_tokens,
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+        common_gdn_metadata=common_metadata,
+    )
+
+    _assert_gdn_metadata_equal(actual, expected)
+
+
+def test_prepared_dflash2_metadata_belongs_to_exact_builder(local_gdn_model):
+    builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=2,
+        use_full_cuda_graph=True,
+    )
+    batch = BatchSpec(seq_lens=[4097], query_lens=[3])
+    common = create_common_attn_metadata(batch, BLOCK_SIZE, DEVICE).replace(
+        block_table_tensor=torch.tensor(
+            [[10, 11, 12, 13]], dtype=torch.int32, device=DEVICE
+        ),
+        num_actual_tokens=4,
+    )
+    num_accepted_tokens = torch.tensor([2], dtype=torch.int32, device=DEVICE)
+    num_decode_draft_tokens_cpu = torch.tensor([2], dtype=torch.int32, device="cpu")
+    common_metadata = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+        query_start_loc=common.query_start_loc,
+        query_start_loc_cpu=common.query_start_loc_cpu,
+        num_spec_state_tokens=builder.num_spec_state_tokens,
+        legacy_mixed_decode_routing=False,
+    )
+    assert common_metadata is not None
+    prepared = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=num_accepted_tokens,
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+        common_gdn_metadata=common_metadata,
+    )
+
+    actual = builder.build(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=num_accepted_tokens,
+        num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+        common_gdn_metadata=common_metadata,
+        prepared_dflash2_metadata=prepared,
+    )
+    assert actual is prepared
+
+    other_builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=2,
+        use_full_cuda_graph=True,
+    )
+    with pytest.raises(ValueError, match="does not belong"):
+        other_builder.build(
+            common_prefix_len=0,
+            common_attn_metadata=common,
+            num_accepted_tokens=num_accepted_tokens,
+            num_decode_draft_tokens_cpu=num_decode_draft_tokens_cpu,
+            common_gdn_metadata=common_metadata,
+            prepared_dflash2_metadata=prepared,
+        )
+
+
+def test_dflash2_fused_gdn_group_metadata_replay(
+    monkeypatch,
+    local_gdn_model,
+):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the fused GDN metadata kernel")
+    device = torch.device("cuda")
+    if torch.cuda.get_device_capability(device) != (7, 0):
+        pytest.skip("the fused GDN metadata kernel is SM70-only")
+
+    # The accepted DFlash2 verifier keeps the legacy spec-core operator off.
+    # Fused metadata must therefore own its graph-stable buffers independently.
+    monkeypatch.setenv("VLLM_SM70_QWEN_GDN_SPEC_CORE_OP", "0")
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_FUSED_GDN_METADATA", "1")
+    monkeypatch.setenv("VLLM_SM70_DFLASH2_GDN_METADATA_SHADOW", "1")
+    qwen_gdn.envs.disable_envs_cache()
+
+    builders = [
+        _create_gdn_builder(
+            local_gdn_model,
+            num_speculative_tokens=7,
+            use_full_cuda_graph=True,
+            max_cudagraph_capture_size=16,
+            device=device,
+        )
+        for _ in range(2)
+    ]
+    width = builders[0].num_spec_state_tokens + 1
+    assert width == 8
+    query_start_loc = torch.tensor([0, 8, 16], dtype=torch.int32, device=device)
+    query_start_loc_cpu = query_start_loc.cpu()
+    common_metadata = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=torch.tensor([7, 7], dtype=torch.int32),
+        query_start_loc=query_start_loc,
+        query_start_loc_cpu=query_start_loc_cpu,
+        num_spec_state_tokens=7,
+        legacy_mixed_decode_routing=False,
+    )
+    assert common_metadata is not None
+
+    block_tables = (
+        torch.arange(10, 10 + 2 * width, dtype=torch.int32, device=device).view(
+            2, width
+        ),
+        torch.arange(100, 100 + 2 * width, dtype=torch.int32, device=device).view(
+            2, width
+        ),
+    )
+    accepted = torch.tensor([3, 5], dtype=torch.int32, device=device)
+    for builder in builders:
+        builder.spec_state_indices_tensor.fill_(777)
+
+    first_result = prepare_dflash2_gdn_group_metadata(
+        builders_by_group=[(0, builders[0]), (1, builders[1])],
+        block_tables=block_tables,
+        common_gdn_metadata=common_metadata,
+        num_accepted_tokens=accepted,
+        num_actual_tokens=16,
+        descriptor=None,
+    )
+    assert first_result is not None
+    prepared, descriptor = first_result
+    torch.cuda.synchronize(device)
+
+    for group_id, builder in enumerate(builders):
+        state = prepared[id(builder)].spec_state_indices_tensor
+        assert state is not None
+        torch.testing.assert_close(state[:2], block_tables[group_id], rtol=0, atol=0)
+        torch.testing.assert_close(
+            state[2:], torch.full_like(state[2:], PAD_SLOT_ID), rtol=0, atol=0
+        )
+    first = prepared[id(builders[0])]
+    assert first.spec_query_start_loc is not None
+    assert first.spec_query_start_loc.tolist() == [0, 8, 16] + [16] * 14
+    assert first.num_accepted_tokens is not None
+    assert first.num_accepted_tokens.tolist() == [3, 5] + [1] * 14
+    assert first.spec_state_slot_selectors is not None
+    assert first.spec_state_slot_selectors.tolist() == [3, 5] + [1] * 14
+    assert first.spec_sequence_masks is not None
+    assert first.spec_sequence_masks.tolist() == [True, True] + [False] * 14
+
+    # Poison every persistent output and replay with new source values. This
+    # catches stale graph-tail data and accidental reuse of one group's table.
+    for builder in builders:
+        builder.spec_state_indices_tensor.fill_(888)
+    common_buffers = builders[0]._ddtree_fast_common_buffers
+    assert common_buffers is not None
+    common_buffers.spec_sequence_masks.fill_(True)
+    common_buffers.spec_query_start_loc.fill_(-1)
+    common_buffers.num_accepted_tokens.fill_(-1)
+    common_buffers.spec_state_slot_selectors.fill_(-1)
+    block_tables[0].add_(1000)
+    block_tables[1].add_(2000)
+    accepted.copy_(torch.tensor([7, 2], dtype=torch.int32, device=device))
+
+    second_result = prepare_dflash2_gdn_group_metadata(
+        builders_by_group=[(0, builders[0]), (1, builders[1])],
+        block_tables=block_tables,
+        common_gdn_metadata=common_metadata,
+        num_accepted_tokens=accepted,
+        num_actual_tokens=16,
+        descriptor=descriptor,
+    )
+    assert second_result is not None
+    replayed, replay_descriptor = second_result
+    assert replay_descriptor is descriptor
+    assert replayed is prepared
+    torch.cuda.synchronize(device)
+    for group_id, builder in enumerate(builders):
+        state = replayed[id(builder)].spec_state_indices_tensor
+        assert state is not None
+        torch.testing.assert_close(state[:2], block_tables[group_id], rtol=0, atol=0)
+        torch.testing.assert_close(
+            state[2:], torch.full_like(state[2:], PAD_SLOT_ID), rtol=0, atol=0
+        )
+    assert replayed[id(builders[0])].num_accepted_tokens is not None
+    assert replayed[id(builders[0])].num_accepted_tokens.tolist() == [7, 2] + [1] * 14
+
+    # The pointer tables remain valid when the graph batch shape changes, but
+    # the graph-buffer views do not. Ensure the cache key rebuilds their
+    # lengths instead of returning the steady-state B2 metadata.
+    single_common = compute_common_gdn_attn_metadata(
+        num_decode_draft_tokens_cpu=torch.tensor([7], dtype=torch.int32),
+        query_start_loc=torch.tensor([0, 8], dtype=torch.int32, device=device),
+        query_start_loc_cpu=torch.tensor([0, 8], dtype=torch.int32),
+        num_spec_state_tokens=7,
+        legacy_mixed_decode_routing=False,
+    )
+    assert single_common is not None
+    single_result = prepare_dflash2_gdn_group_metadata(
+        builders_by_group=[(0, builders[0]), (1, builders[1])],
+        block_tables=(block_tables[0][:1], block_tables[1][:1]),
+        common_gdn_metadata=single_common,
+        num_accepted_tokens=accepted[:1],
+        num_actual_tokens=8,
+        descriptor=descriptor,
+    )
+    assert single_result is not None
+    single_prepared, single_descriptor = single_result
+    assert single_descriptor is descriptor
+    assert single_prepared is not replayed
+    torch.cuda.synchronize(device)
+    single = single_prepared[id(builders[0])]
+    assert single.spec_state_indices_tensor is not None
+    assert single.spec_state_indices_tensor.shape == (8, 8)
+    assert single.spec_query_start_loc is not None
+    assert single.spec_query_start_loc.tolist() == [0, 8] + [8] * 7
+    assert single.num_accepted_tokens is not None
+    assert single.num_accepted_tokens.tolist() == [7] + [1] * 7
 
 
 def test_full_cuda_graph_capture_single_token_decode_is_not_spec(local_gdn_model):
