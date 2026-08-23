@@ -174,6 +174,40 @@ void fp8_gemm_sm70_out(torch::Tensor out,
                        int64_t q_ld,
                        bool gated_silu);
 
+std::vector<torch::Tensor> fp8_qpn8_prepare_sm70(torch::Tensor qweight,
+                                                 torch::Tensor scales);
+
+void fp8_qpn8_dequantize_sm70_out(torch::Tensor out, torch::Tensor codes,
+                                  torch::Tensor group_scales);
+
+void fp8_qpn8_prefill_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
+                               torch::Tensor input, torch::Tensor codes,
+                               torch::Tensor group_scales, bool gated_silu);
+
+void fp8_qpn8_dispatch_sm70_out(torch::Tensor out, int64_t dense_weight_ptr,
+                                torch::Tensor input, torch::Tensor codes,
+                                torch::Tensor group_scales, int64_t split_k,
+                                int64_t accumulator_chains, bool prefetch_codes,
+                                bool gated_silu);
+
+void fp8_qpn8_gemm_sm70_out(torch::Tensor out,
+                            torch::Tensor input,
+                            torch::Tensor codes,
+                            torch::Tensor group_scales,
+                            int64_t split_k,
+                            int64_t accumulator_chains,
+                            bool fast_decoder,
+                            bool prefetch_codes);
+
+void fp8_qpn8_gated_pair_sm70_out(torch::Tensor out,
+                                  torch::Tensor input,
+                                  torch::Tensor codes,
+                                  torch::Tensor group_scales,
+                                  int64_t split_k,
+                                  int64_t accumulator_chains,
+                                  bool fast_decoder,
+                                  bool prefetch_codes);
+
 void fp8_gemm_sm70_prefill_dispatch_out(
     torch::Tensor out, int64_t dense_weight_ptr, torch::Tensor _in_feats,
     torch::Tensor _kernel, torch::Tensor _scaling_factors, int64_t group_size,
@@ -698,7 +732,10 @@ void tile_runtime_wait_reduce(fptr_t _fa, torch::Tensor& staging,
                               int64_t reducer_blocks);
 void dispose(fptr_t _fa);
 int64_t meta_size();
+int64_t sm70_tp4_push_allreduce_buffer_size();
 void register_buffer(fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
+void register_sm70_tp4_push_allreduce_buffer(
+    fptr_t _fa, const std::vector<int64_t>& fake_ipc_ptrs);
 std::tuple<std::vector<int64_t>, std::vector<int64_t>>
 get_graph_buffer_ipc_meta(fptr_t _fa);
 void register_graph_buffers(fptr_t _fa,

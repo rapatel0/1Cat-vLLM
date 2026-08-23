@@ -499,6 +499,10 @@ void dispose(fptr_t _fa) {
 
 int64_t meta_size() { return sizeof(vllm::Signal); }
 
+int64_t sm70_tp4_push_allreduce_buffer_size() {
+  return vllm::kSm70Tp4PushAllreduceBufferBytes;
+}
+
 void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
   auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
   TORCH_CHECK(fake_ipc_ptrs.size() == fa->world_size_);
@@ -507,6 +511,19 @@ void register_buffer(fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
     ipc_ptrs[i] = reinterpret_cast<void*>(fake_ipc_ptrs[i]);
   }
   fa->register_buffer(ipc_ptrs);
+}
+
+void register_sm70_tp4_push_allreduce_buffer(
+    fptr_t _fa, const std::vector<fptr_t>& fake_ipc_ptrs) {
+  auto fa = reinterpret_cast<vllm::CustomAllreduce*>(_fa);
+  TORCH_CHECK_EQ(fake_ipc_ptrs.size(),
+                 static_cast<size_t>(vllm::kSm70Tp4PushAllreduceWorldSize));
+  TORCH_CHECK_EQ(fake_ipc_ptrs.size(), static_cast<size_t>(fa->world_size_));
+  void* ipc_ptrs[vllm::kSm70Tp4PushAllreduceWorldSize];
+  for (size_t peer = 0; peer < fake_ipc_ptrs.size(); ++peer) {
+    ipc_ptrs[peer] = reinterpret_cast<void*>(fake_ipc_ptrs[peer]);
+  }
+  fa->register_sm70_tp4_push_buffer(ipc_ptrs);
 }
 
 // Use vector<int64_t> to represent byte data for python binding compatibility.

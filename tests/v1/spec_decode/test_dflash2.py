@@ -4,6 +4,7 @@
 from types import SimpleNamespace
 from unittest.mock import Mock
 
+import numpy as np
 import pytest
 import torch
 
@@ -40,6 +41,9 @@ from vllm.v1.core.kv_cache_utils import unify_kv_cache_spec_page_size
 from vllm.v1.kv_cache_interface import FullAttentionSpec, MambaSpec
 from vllm.v1.worker.gpu.spec_decode import init_speculator
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
+from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
+    _supports_sparse_sampling_contract,
+)
 from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
     DFlash2Speculator,
     _requires_sm70_tail,
@@ -134,6 +138,12 @@ def test_selector_initializes_probabilistic_cache_to_negative_infinity(monkeypat
     speculator = DFlash2Speculator(None, torch.device("cpu"))
     assert speculator.draft_logits is allocated
     assert torch.isneginf(speculator.draft_logits).all()
+    sparse_logits = speculator.get_sparse_draft_logits()
+    assert sparse_logits is not None
+    candidate_ids, candidate_scores = sparse_logits
+    assert candidate_ids.shape == (2, 7, 16)
+    assert candidate_scores.shape == (2, 7, 16)
+    assert candidate_scores.dtype is torch.float32
 
 
 @pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA required")
@@ -185,6 +195,81 @@ def test_selector_uses_checkpoint_top16_and_fp32_proposal_cache(monkeypatch):
     assert speculator.selector_top_k == 16
     assert dtype is torch.float32
     assert fill == float("-inf")
+
+
+def _sparse_sampling_contract_fixture():
+    idx = np.array([0], dtype=np.int32)
+    sampling_states = SimpleNamespace(
+        temperature=SimpleNamespace(np=np.array([1.0], dtype=np.float32)),
+        top_k=SimpleNamespace(np=np.array([20], dtype=np.int32)),
+        top_p=SimpleNamespace(np=np.array([0.95], dtype=np.float32)),
+        min_p=SimpleNamespace(np=np.array([0.0], dtype=np.float32)),
+        max_num_logprobs=Mock(return_value=-1),
+    )
+    sampler = SimpleNamespace(
+        sampling_states=sampling_states,
+        penalties_state=SimpleNamespace(use_penalty=np.array([False])),
+        logit_bias_state=SimpleNamespace(use_logit_bias=np.array([False])),
+        bad_words_state=SimpleNamespace(
+            num_bad_words=SimpleNamespace(np=np.array([0], dtype=np.int32))
+        ),
+        logprob_token_ids_state=SimpleNamespace(max_num_token_ids=Mock(return_value=0)),
+        compute_nans=False,
+    )
+    rejection_sampler = SimpleNamespace(
+        rejection_sample_method="standard",
+        sampler=sampler,
+    )
+    input_batch = SimpleNamespace(
+        num_reqs=1,
+        is_prefilling_np=np.array([False]),
+        idx_mapping_np=idx,
+    )
+    return rejection_sampler, input_batch
+
+
+def test_sparse_target_rejection_accepts_official_sampling_contract():
+    rejection_sampler, input_batch = _sparse_sampling_contract_fixture()
+    assert _supports_sparse_sampling_contract(rejection_sampler, input_batch)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [
+        ("temperature", 0.0),
+        ("top_k", 16),
+        ("top_p", 0.0),
+        ("min_p", 0.05),
+        ("penalty", True),
+        ("logit_bias", True),
+        ("bad_words", 1),
+        ("logprobs", 1),
+        ("custom_logprobs", 1),
+        ("compute_nans", True),
+    ],
+)
+def test_sparse_target_rejection_falls_back_for_unsupported_sampling(
+    field: str,
+    value: float | int | bool,
+):
+    rejection_sampler, input_batch = _sparse_sampling_contract_fixture()
+    sampler = rejection_sampler.sampler
+    if field in {"temperature", "top_k", "top_p", "min_p"}:
+        getattr(sampler.sampling_states, field).np[0] = value
+    elif field == "penalty":
+        sampler.penalties_state.use_penalty[0] = value
+    elif field == "logit_bias":
+        sampler.logit_bias_state.use_logit_bias[0] = value
+    elif field == "bad_words":
+        sampler.bad_words_state.num_bad_words.np[0] = value
+    elif field == "logprobs":
+        sampler.sampling_states.max_num_logprobs.return_value = value
+    elif field == "custom_logprobs":
+        sampler.logprob_token_ids_state.max_num_token_ids.return_value = value
+    else:
+        sampler.compute_nans = value
+
+    assert not _supports_sparse_sampling_contract(rejection_sampler, input_batch)
 
 
 def test_probabilistic_selector_caches_temperature_applied_scores():
@@ -253,6 +338,45 @@ def test_probabilistic_selector_caches_temperature_applied_scores():
     torch.testing.assert_close(
         realized[0, 1], scores[0, 1, first_index] / temperature[0]
     )
+
+
+def test_probabilistic_cache_keeps_ids_and_scores_in_request_slot_order(monkeypatch):
+    if not torch.cuda.is_available():
+        pytest.skip("CUDA is required for the DFlash2 cache kernel")
+
+    device = torch.device("cuda")
+    dense_cache = torch.zeros((2, 7, 31), dtype=torch.float32, device=device)
+    _stub_base(monkeypatch, dense_cache)
+    speculator = DFlash2Speculator(None, device)
+    speculator.sample_idx_mapping = torch.tensor(
+        [1] * 7 + [0] * 7,
+        dtype=torch.int32,
+        device=device,
+    )
+    candidate_ids = torch.stack(
+        (
+            torch.arange(16, dtype=torch.int64, device=device).repeat(7, 1),
+            torch.arange(15, 31, dtype=torch.int64, device=device).repeat(7, 1),
+        )
+    )
+    selector_scores = torch.arange(
+        2 * 7 * 16,
+        dtype=torch.float32,
+        device=device,
+    ).view(2, 7, 16)
+    speculator._selector_scores.copy_(selector_scores)
+
+    speculator._cache_draft_logits(candidate_ids, num_sample=14)
+    sparse_logits = speculator.get_sparse_draft_logits()
+    assert sparse_logits is not None
+    cached_ids, cached_scores = sparse_logits
+
+    assert torch.equal(cached_ids[1], candidate_ids[0])
+    assert torch.equal(cached_ids[0], candidate_ids[1])
+    assert torch.equal(cached_scores[1], selector_scores[0])
+    assert torch.equal(cached_scores[0], selector_scores[1])
+    assert torch.equal(dense_cache[1].gather(1, candidate_ids[0]), selector_scores[0])
+    assert torch.equal(dense_cache[0].gather(1, candidate_ids[1]), selector_scores[1])
 
 
 def test_dflash2_architecture_dispatches_to_mrv2(monkeypatch):

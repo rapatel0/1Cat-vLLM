@@ -237,6 +237,43 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "bool gated_silu) -> ()");
   ops.impl("fp8_gemm_sm70_out", torch::kCUDA, &fp8_gemm_sm70_out);
 
+  ops.def("fp8_qpn8_prepare_sm70(Tensor qweight, Tensor scales) -> Tensor[]");
+  ops.impl("fp8_qpn8_prepare_sm70", torch::kCUDA, &fp8_qpn8_prepare_sm70);
+
+  ops.def(
+      "fp8_qpn8_dequantize_sm70_out(Tensor(a!) out, Tensor codes, "
+      "Tensor group_scales) -> ()");
+  ops.impl("fp8_qpn8_dequantize_sm70_out", torch::kCUDA,
+           &fp8_qpn8_dequantize_sm70_out);
+
+  ops.def(
+      "fp8_qpn8_prefill_sm70_out(Tensor(a!) out, int dense_weight_ptr, "
+      "Tensor input, Tensor codes, Tensor group_scales, bool gated_silu) -> "
+      "()");
+  ops.impl("fp8_qpn8_prefill_sm70_out", torch::kCUDA,
+           &fp8_qpn8_prefill_sm70_out);
+
+  ops.def(
+      "fp8_qpn8_dispatch_sm70_out(Tensor(a!) out, int dense_weight_ptr, "
+      "Tensor input, Tensor codes, Tensor group_scales, int split_k, "
+      "int accumulator_chains, bool prefetch_codes, bool gated_silu) -> ()");
+  ops.impl("fp8_qpn8_dispatch_sm70_out", torch::kCUDA,
+           &fp8_qpn8_dispatch_sm70_out);
+
+  ops.def(
+      "fp8_qpn8_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
+      "Tensor group_scales, int split_k, int accumulator_chains, "
+      "bool fast_decoder, bool prefetch_codes) -> ()");
+  ops.impl("fp8_qpn8_gemm_sm70_out", torch::kCUDA,
+           &fp8_qpn8_gemm_sm70_out);
+
+  ops.def(
+      "fp8_qpn8_gated_pair_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor codes, Tensor group_scales, int split_k, "
+      "int accumulator_chains, bool fast_decoder, bool prefetch_codes) -> ()");
+  ops.impl("fp8_qpn8_gated_pair_sm70_out", torch::kCUDA,
+           &fp8_qpn8_gated_pair_sm70_out);
+
   ops.def(
       "fp8_gemm_sm70_prefill_dispatch_out(Tensor(a!) out, "
       "int dense_weight_ptr, Tensor _in_feats, Tensor _kernel, "
@@ -697,8 +734,12 @@ TORCH_LIBRARY_EXPAND(CONCAT(TORCH_EXTENSION_NAME, _custom_ar), custom_ar) {
 
   custom_ar.def("dispose", &dispose);
   custom_ar.def("meta_size", &meta_size);
+  custom_ar.def("sm70_tp4_push_allreduce_buffer_size",
+                &sm70_tp4_push_allreduce_buffer_size);
 
   custom_ar.def("register_buffer", &register_buffer);
+  custom_ar.def("register_sm70_tp4_push_allreduce_buffer",
+                &register_sm70_tp4_push_allreduce_buffer);
   custom_ar.def("get_graph_buffer_ipc_meta", &get_graph_buffer_ipc_meta);
   custom_ar.def("register_graph_buffers", &register_graph_buffers);
 

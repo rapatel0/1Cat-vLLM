@@ -54,6 +54,23 @@ constexpr size_t kSm70Tp8HierarchicalAllreduceBytes = 4096 * sizeof(half);
 constexpr int kSm70Tp8CompletionSignalSlotBase = 2;
 constexpr int kSm70GemmaRmsNormHiddenSize = 5120;
 constexpr int kSm70GemmaRmsNormThreads = 1024;
+// DFlash2 verifies eight positions at once. These constants mirror SGLang's
+// two-epoch one-shot push collective while keeping its storage separate from
+// vLLM's pull-collective metadata and intermediate buffers.
+constexpr int kSm70Tp4PushAllreduceWorldSize = 4;
+constexpr int kSm70Tp4PushAllreduceBlocks = 80;
+constexpr int kSm70Tp4PushAllreduceThreads = 128;
+constexpr int kSm70Tp4PushAllreduceEpochs = 2;
+constexpr uint16_t kSm70Tp4PushAllreduceSentinel = 0x7f7f;
+constexpr int kSm70Tp4PushAllreduceSentinelByte = 0x7f;
+constexpr size_t kSm70Tp4PushAllreduceBytes =
+    8 * kSm70GemmaRmsNormHiddenSize * sizeof(half);
+constexpr size_t kSm70Tp4PushAllreduceSignalBytes =
+    ((kSm70Tp4PushAllreduceBlocks * sizeof(uint32_t) + 127) / 128) * 128;
+constexpr size_t kSm70Tp4PushAllreduceBufferBytes =
+    kSm70Tp4PushAllreduceSignalBytes +
+    kSm70Tp4PushAllreduceEpochs * kSm70Tp4PushAllreduceWorldSize *
+        kSm70Tp4PushAllreduceBytes;
 
 inline int sm70_gemma_rms_norm_threads() {
   const char* raw = std::getenv("VLLM_SM70_TP2_AR_GEMMA_RMS_THREADS");
@@ -396,6 +413,54 @@ DINLINE P packed_reduce(const P* ptrs[], int idx) {
   return downcast<P>(tmp);
 }
 
+// Adapted from SGLang-V100's SM70-capable one-shot push collective at
+// haohervchb/sglang-V100@845b9fdf7a7e. SGLang uses positive zero as its empty
+// slot sentinel. This variant preinitializes slots with a reserved FP16 NaN
+// payload instead, preserving every finite payload bit, including signed zero.
+DINLINE void sm70_push_escape_sentinel(half& value) {
+  auto* bits = reinterpret_cast<uint16_t*>(&value);
+  if (*bits == kSm70Tp4PushAllreduceSentinel) *bits = 0x7e00u;
+}
+
+DINLINE bool sm70_push_is_sentinel(const half& value) {
+  const auto* bits = reinterpret_cast<const uint16_t*>(&value);
+  return *bits == kSm70Tp4PushAllreduceSentinel;
+}
+
+template <typename P>
+DINLINE void sm70_push_load_volatile_16b(P& value, const void* address,
+                                        int offset) {
+  static_assert(alignof(P) == 16 && sizeof(P) == 16);
+  const auto* source = reinterpret_cast<const P*>(address) + offset;
+  uint4 bits;
+  asm volatile("ld.volatile.global.v4.b32 {%0, %1, %2, %3}, [%4];"
+               : "=r"(bits.x), "=r"(bits.y), "=r"(bits.z), "=r"(bits.w)
+               : "l"(source));
+  value = *reinterpret_cast<const P*>(&bits);
+}
+
+template <typename P>
+DINLINE void sm70_push_store_volatile_16b(const P& value, void* address,
+                                         int offset) {
+  static_assert(alignof(P) == 16 && sizeof(P) == 16);
+  const uint4 bits = *reinterpret_cast<const uint4*>(&value);
+  auto* destination = reinterpret_cast<P*>(address) + offset;
+  asm volatile("st.volatile.global.v4.b32 [%4], {%0, %1, %2, %3};"
+               :
+               : "r"(bits.x), "r"(bits.y), "r"(bits.z), "r"(bits.w),
+                 "l"(destination));
+}
+
+template <typename P, int ngpus, typename A>
+DINLINE P sm70_push_reduce(P (&values)[ngpus]) {
+  A accumulator = upcast(values[0]);
+#pragma unroll
+  for (int rank = 1; rank < ngpus; ++rank) {
+    packed_assign_add(accumulator, upcast(values[rank]));
+  }
+  return downcast<P>(accumulator);
+}
+
 template <typename P, int ngpus, typename A>
 DINLINE P packed_reduce_sum2(const P* ptrs_a[], const P* ptrs_b[], int idx) {
   P local = ptrs_a[0][idx];
@@ -426,6 +491,85 @@ __global__ void __launch_bounds__(512, 1)
     ((P*)result)[idx] = packed_reduce<P, ngpus, A>((const P**)&dp.ptrs[0], idx);
   }
   barrier_at_end<ngpus, true>(sg, self_sg, rank);
+}
+
+template <int ngpus>
+__global__ void __launch_bounds__(1024, 1)
+    sm70_cross_device_reduce_1stage_push(
+        RankData push_buffers, const half* __restrict__ input,
+        half* __restrict__ output, int rank, int packed_size) {
+  static_assert(ngpus == kSm70Tp4PushAllreduceWorldSize);
+  using P = typename packed_t<half>::P;
+  using A = typename packed_t<half>::A;
+
+  auto* local_storage =
+      const_cast<char*>(reinterpret_cast<const char*>(push_buffers.ptrs[rank]));
+  auto* local_epochs = reinterpret_cast<uint32_t*>(local_storage);
+  const uint32_t epoch = local_epochs[blockIdx.x];
+  constexpr int packed_stride =
+      kSm70Tp4PushAllreduceBytes / sizeof(P);
+  const int epoch_offset = epoch * ngpus * packed_stride;
+  const int offset = blockIdx.x * blockDim.x + threadIdx.x;
+
+  if (offset < packed_size) {
+    P value = reinterpret_cast<const P*>(input)[offset];
+#pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      sm70_push_escape_sentinel(value.data[element]);
+    }
+
+#pragma unroll
+    for (int destination_rank = 0; destination_rank < ngpus;
+         ++destination_rank) {
+      auto* destination_base = const_cast<char*>(reinterpret_cast<const char*>(
+          push_buffers.ptrs[destination_rank]));
+      void* destination = destination_base +
+                          kSm70Tp4PushAllreduceSignalBytes +
+                          (epoch_offset + rank * packed_stride) * sizeof(P);
+      sm70_push_store_volatile_16b(value, destination, offset);
+    }
+
+    P peer_values[ngpus];
+    while (true) {
+      bool has_empty_slot = false;
+#pragma unroll
+      for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+        const void* source = local_storage +
+                             kSm70Tp4PushAllreduceSignalBytes +
+                             (epoch_offset + source_rank * packed_stride) *
+                                 sizeof(P);
+        sm70_push_load_volatile_16b(peer_values[source_rank], source, offset);
+#pragma unroll
+        for (int element = 0; element < P::size; ++element) {
+          has_empty_slot |=
+              sm70_push_is_sentinel(peer_values[source_rank].data[element]);
+        }
+      }
+      if (!has_empty_slot) break;
+    }
+
+    reinterpret_cast<P*>(output)[offset] =
+        sm70_push_reduce<P, ngpus, A>(peer_values);
+
+    P empty;
+#pragma unroll
+    for (int element = 0; element < P::size; ++element) {
+      *reinterpret_cast<uint16_t*>(&empty.data[element]) =
+          kSm70Tp4PushAllreduceSentinel;
+    }
+#pragma unroll
+    for (int source_rank = 0; source_rank < ngpus; ++source_rank) {
+      void* source = local_storage + kSm70Tp4PushAllreduceSignalBytes +
+                     (epoch_offset + source_rank * packed_stride) * sizeof(P);
+      sm70_push_store_volatile_16b(empty, source, offset);
+    }
+  }
+
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    local_epochs[blockIdx.x] =
+        (epoch + 1) % kSm70Tp4PushAllreduceEpochs;
+  }
 }
 
 // This prototype deliberately stays narrow: it mirrors the FP32 Gemma RMSNorm
@@ -922,6 +1066,8 @@ class CustomAllreduce {
   std::vector<void*> graph_unreg_buffers_;
   // a map from IPC handles to opened IPC pointers
   std::map<IPC_KEY, char*> ipc_handles_;
+  RankData sm70_tp4_push_buffers_{};
+  bool sm70_tp4_push_buffers_registered_ = false;
 
   /**
    * Signals are an array of ipc-enabled buffers from all ranks.
@@ -1000,6 +1146,27 @@ class CustomAllreduce {
     CUDACHECK(
         cudaMemcpy(d_data, &data, sizeof(RankData), cudaMemcpyHostToDevice));
     buffers_[ptrs[rank_]] = d_data;
+  }
+
+  void register_sm70_tp4_push_buffer(void** ptrs) {
+    if (world_size_ != kSm70Tp4PushAllreduceWorldSize || !fully_connected_ ||
+        !custom_allreduce_current_device_is_sm70()) {
+      throw std::runtime_error(
+          "SM70 push all-reduce requires fully-connected TP4 on SM70.");
+    }
+    for (int peer = 0; peer < world_size_; ++peer) {
+      if (ptrs[peer] == nullptr) {
+        throw std::runtime_error(
+            "SM70 push all-reduce received a null peer buffer.");
+      }
+      sm70_tp4_push_buffers_.ptrs[peer] = ptrs[peer];
+    }
+    auto* local_data = static_cast<char*>(ptrs[rank_]) +
+                       kSm70Tp4PushAllreduceSignalBytes;
+    CUDACHECK(cudaMemset(local_data, kSm70Tp4PushAllreduceSentinelByte,
+                         kSm70Tp4PushAllreduceBufferBytes -
+                             kSm70Tp4PushAllreduceSignalBytes));
+    sm70_tp4_push_buffers_registered_ = true;
   }
 
   RankData* rank_data_for_buffer(cudaStream_t stream, void* buffer,
@@ -1108,6 +1275,16 @@ class CustomAllreduce {
     size /= d;
     auto bytes = size * sizeof(typename packed_t<T>::P);
     if constexpr (std::is_same_v<T, half>) {
+      if (sm70_tp4_push_buffers_registered_ &&
+          world_size_ == kSm70Tp4PushAllreduceWorldSize && fully_connected_ &&
+          bytes == kSm70Tp4PushAllreduceBytes &&
+          custom_allreduce_current_device_is_sm70()) {
+        sm70_cross_device_reduce_1stage_push<
+            kSm70Tp4PushAllreduceWorldSize>
+            <<<kSm70Tp4PushAllreduceBlocks, kSm70Tp4PushAllreduceThreads, 0,
+               stream>>>(sm70_tp4_push_buffers_, input, output, rank_, size);
+        return;
+      }
       if (sm70_tp8_hierarchical_custom_ar_enabled(world_size_,
                                                   fully_connected_) &&
           bytes == kSm70Tp8HierarchicalAllreduceBytes) {

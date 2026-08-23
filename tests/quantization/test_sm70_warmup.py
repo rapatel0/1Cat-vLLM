@@ -35,6 +35,14 @@ def test_fp8_warmup_discovers_grouped_bmm_by_per_group_shape():
     assert discovered == [(layer, False)]
 
 
+def test_fp8_warmup_skips_static_qpn8_dispatch():
+    layer = _grouped_fp8_layer()
+    layer.sm70_fp8_qpn8 = True
+    model = nn.Sequential(layer)
+
+    assert list(warmup._iter_unique_fp8_dense_layers(model)) == []
+
+
 def test_fp8_warmup_matches_grouped_bmm_runtime_slice(monkeypatch):
     layer = _grouped_fp8_layer()
     calls = []

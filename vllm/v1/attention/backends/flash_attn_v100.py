@@ -25,6 +25,7 @@ import vllm.envs as envs
 from vllm.forward_context import CUDAGRAPH_VARIANT_LONG_CONTEXT
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
+from vllm.triton_utils import tl, triton
 from vllm.v1.attention.backend import AttentionCGSupport, AttentionType
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionBackend,
@@ -34,6 +35,125 @@ from vllm.v1.attention.backends.triton_attn import (
 )
 
 logger = init_logger(__name__)
+
+
+@triton.jit
+def _sm70_prepare_smallq_decode_metadata_kernel(
+    out_block_table_ptr,
+    out_seq_lens_ptr,
+    out_query_start_loc_ptr,
+    block_table_ptr,
+    seq_lens_ptr,
+    query_start_loc_ptr,
+    block_table_stride,
+    out_block_table_stride,
+    num_reqs,
+    num_query_tokens,
+    real_num_query_tokens,
+    block_cols,
+    REQ_BLOCK: tl.constexpr,
+    BLOCK_COLS: tl.constexpr,
+):
+    token_idx = tl.program_id(0)
+
+    # Find the request that owns this flattened query token. Equal trailing
+    # boundaries are CUDA-graph padding; clamping maps them to the final padded
+    # request, matching repeat_query_lens[-1] += padding_tokens.
+    req_offsets = tl.arange(0, REQ_BLOCK)
+    req_mask = req_offsets < num_reqs
+    query_ends = tl.load(
+        query_start_loc_ptr + req_offsets + 1,
+        mask=req_mask,
+        other=0x7FFFFFFF,
+    )
+    req_idx = tl.sum((token_idx >= query_ends).to(tl.int32), axis=0)
+    req_idx = tl.minimum(req_idx, num_reqs - 1)
+
+    query_start = tl.load(query_start_loc_ptr + req_idx)
+    query_end = tl.load(query_start_loc_ptr + req_idx + 1)
+    query_len = query_end - query_start
+    seq_len = tl.load(seq_lens_ptr + req_idx)
+    effective_seq_len = tl.maximum(seq_len, query_len)
+    decode_seq_len = effective_seq_len - query_len + token_idx - query_start + 1
+    is_padding = token_idx >= real_num_query_tokens
+    tl.store(
+        out_seq_lens_ptr + token_idx,
+        tl.where(is_padding, 0, decode_seq_len),
+    )
+
+    cols = tl.arange(0, BLOCK_COLS)
+    col_mask = cols < block_cols
+    block_ids = tl.load(
+        block_table_ptr + req_idx * block_table_stride + cols,
+        mask=col_mask,
+        other=0,
+    )
+    block_ids = tl.maximum(block_ids, 0)
+    block_ids = tl.where(is_padding, 0, block_ids)
+    tl.store(
+        out_block_table_ptr + token_idx * out_block_table_stride + cols,
+        block_ids,
+        mask=col_mask,
+    )
+
+    # The same launch also refreshes the graph-stable query boundaries.
+    if token_idx == 0:
+        boundary_offsets = tl.arange(0, REQ_BLOCK)
+        boundary_mask = boundary_offsets < num_reqs + 1
+        boundaries = tl.load(
+            query_start_loc_ptr + boundary_offsets,
+            mask=boundary_mask,
+            other=0,
+        )
+        tl.store(
+            out_query_start_loc_ptr + boundary_offsets,
+            boundaries,
+            mask=boundary_mask,
+        )
+
+
+def _sm70_prepare_smallq_decode_metadata(
+    out_block_table: torch.Tensor,
+    out_seq_lens: torch.Tensor,
+    out_query_start_loc: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    query_start_loc: torch.Tensor,
+    *,
+    num_reqs: int,
+    num_query_tokens: int,
+    real_num_query_tokens: int,
+) -> None:
+    """Materialize persistent Flash-V100 verifier metadata in one launch."""
+    if num_reqs <= 0 or num_query_tokens <= 0:
+        raise ValueError("small-query metadata requires positive request/token counts")
+    block_cols = int(block_table.shape[1])
+    if block_cols <= 0:
+        raise ValueError("small-query block table must have at least one column")
+    if out_block_table.shape[0] < num_query_tokens:
+        raise ValueError("small-query output block table is too small")
+    if out_seq_lens.numel() < num_query_tokens:
+        raise ValueError("small-query output sequence buffer is too small")
+    if out_query_start_loc.numel() < num_reqs + 1:
+        raise ValueError("small-query output boundary buffer is too small")
+
+    _sm70_prepare_smallq_decode_metadata_kernel[(num_query_tokens,)](
+        out_block_table,
+        out_seq_lens,
+        out_query_start_loc,
+        block_table,
+        seq_lens,
+        query_start_loc,
+        block_table.stride(0),
+        out_block_table.stride(0),
+        num_reqs,
+        num_query_tokens,
+        real_num_query_tokens,
+        block_cols,
+        REQ_BLOCK=triton.next_power_of_2(num_reqs + 1),
+        BLOCK_COLS=triton.next_power_of_2(block_cols),
+        num_warps=1,
+    )
 
 
 class FlashAttnV100Metadata(TritonAttentionMetadata):
@@ -2508,6 +2628,29 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         self._is_dflash_draft_model = self._is_speculative_draft_model and (
             getattr(spec_config, "method", None) == "dflash"
         )
+        draft_model_config = (
+            getattr(spec_config, "draft_model_config", None)
+            if spec_config is not None
+            else None
+        )
+        draft_architectures = getattr(draft_model_config, "architectures", None) or []
+        use_dflash = bool(
+            spec_config is not None
+            and callable(getattr(spec_config, "use_dflash", None))
+            and spec_config.use_dflash()
+        )
+        self._use_sm70_dflash2_fused_smallq_metadata = bool(
+            envs.VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA
+            and self.device.type == "cuda"
+            and current_platform.is_device_capability(70)
+            and not self._is_speculative_draft_model
+            and use_dflash
+            and "DFlash2DraftModel" in draft_architectures
+        )
+        if self._use_sm70_dflash2_fused_smallq_metadata:
+            logger.info_once(
+                "SM70 DFlash2 fused Flash-V100 small-query metadata active."
+            )
         self._draft_block_table: torch.Tensor | None = None
         self._draft_seq_lens: torch.Tensor | None = None
         self._draft_query_start_loc: torch.Tensor | None = None
@@ -3038,92 +3181,110 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
 
         profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
         query_start_loc = attn_metadata.query_start_loc[: num_reqs + 1]
-        query_lens = query_start_loc[1:] - query_start_loc[:-1]
-        real_query_lens = query_lens
         real_num_query_tokens = int(query_start_loc_cpu[-1].item())
         if real_num_query_tokens > num_query_tokens:
             return
-
-        repeat_query_lens = query_lens
         padding_tokens = num_query_tokens - real_num_query_tokens
-        if padding_tokens > 0:
-            repeat_query_lens = query_lens.clone()
-            repeat_query_lens[-1] += padding_tokens
-
         seq_lens = attn_metadata.seq_lens[:num_reqs]
-        effective_seq_lens = torch.maximum(
-            seq_lens,
-            real_query_lens.to(dtype=seq_lens.dtype),
-        )
-        block_table = block_table.clamp_min(0)
         prep_ms = (
             (time.perf_counter() - profile_stage_t0) * 1000.0
             if profile_enabled
             else 0.0
         )
         profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-        decode_block_table = torch.repeat_interleave(
-            block_table,
-            repeat_query_lens,
-            dim=0,
-            output_size=num_query_tokens,
-        ).contiguous()
-        seq_lens_rep = torch.repeat_interleave(
-            effective_seq_lens,
-            repeat_query_lens,
-            output_size=num_query_tokens,
-        )
-        query_lens_rep = torch.repeat_interleave(
-            real_query_lens.to(dtype=seq_lens.dtype),
-            repeat_query_lens,
-            output_size=num_query_tokens,
-        )
-        start_locs_rep = torch.repeat_interleave(
-            query_start_loc[:-1].to(dtype=seq_lens.dtype),
-            repeat_query_lens,
-            output_size=num_query_tokens,
-        )
-        token_indices = self._smallq_token_indices[:num_query_tokens].to(
-            dtype=seq_lens.dtype
-        )
-        offsets = token_indices - start_locs_rep + 1
-        decode_seq_lens = (seq_lens_rep - query_lens_rep + offsets).contiguous()
-        if padding_tokens > 0:
-            padding_mask = token_indices >= real_num_query_tokens
-            decode_seq_lens = torch.where(
-                padding_mask,
-                torch.zeros_like(decode_seq_lens),
-                decode_seq_lens,
-            ).contiguous()
-            decode_block_table = torch.where(
-                padding_mask[:, None],
-                torch.zeros_like(decode_block_table),
-                decode_block_table,
-            ).contiguous()
-        expand_ms = (
-            (time.perf_counter() - profile_stage_t0) * 1000.0
-            if profile_enabled
-            else 0.0
-        )
+        if self._use_sm70_dflash2_fused_smallq_metadata:
+            _sm70_prepare_smallq_decode_metadata(
+                self._smallq_decode_block_table,
+                self._smallq_decode_seq_lens,
+                self._smallq_query_start_loc,
+                block_table,
+                seq_lens,
+                query_start_loc,
+                num_reqs=num_reqs,
+                num_query_tokens=num_query_tokens,
+                real_num_query_tokens=real_num_query_tokens,
+            )
+            expand_ms = (
+                (time.perf_counter() - profile_stage_t0) * 1000.0
+                if profile_enabled
+                else 0.0
+            )
+            copy_ms = 0.0
+        else:
+            query_lens = query_start_loc[1:] - query_start_loc[:-1]
+            real_query_lens = query_lens
+            repeat_query_lens = query_lens
+            if padding_tokens > 0:
+                repeat_query_lens = query_lens.clone()
+                repeat_query_lens[-1] += padding_tokens
 
-        profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
-        self._smallq_decode_block_table[:num_query_tokens].copy_(
-            decode_block_table,
-            non_blocking=True,
-        )
-        self._smallq_decode_seq_lens[:num_query_tokens].copy_(
-            decode_seq_lens,
-            non_blocking=True,
-        )
-        self._smallq_query_start_loc[: num_reqs + 1].copy_(
-            query_start_loc,
-            non_blocking=True,
-        )
-        copy_ms = (
-            (time.perf_counter() - profile_stage_t0) * 1000.0
-            if profile_enabled
-            else 0.0
-        )
+            effective_seq_lens = torch.maximum(
+                seq_lens,
+                real_query_lens.to(dtype=seq_lens.dtype),
+            )
+            clamped_block_table = block_table.clamp_min(0)
+            decode_block_table = torch.repeat_interleave(
+                clamped_block_table,
+                repeat_query_lens,
+                dim=0,
+                output_size=num_query_tokens,
+            ).contiguous()
+            seq_lens_rep = torch.repeat_interleave(
+                effective_seq_lens,
+                repeat_query_lens,
+                output_size=num_query_tokens,
+            )
+            query_lens_rep = torch.repeat_interleave(
+                real_query_lens.to(dtype=seq_lens.dtype),
+                repeat_query_lens,
+                output_size=num_query_tokens,
+            )
+            start_locs_rep = torch.repeat_interleave(
+                query_start_loc[:-1].to(dtype=seq_lens.dtype),
+                repeat_query_lens,
+                output_size=num_query_tokens,
+            )
+            token_indices = self._smallq_token_indices[:num_query_tokens].to(
+                dtype=seq_lens.dtype
+            )
+            offsets = token_indices - start_locs_rep + 1
+            decode_seq_lens = (seq_lens_rep - query_lens_rep + offsets).contiguous()
+            if padding_tokens > 0:
+                padding_mask = token_indices >= real_num_query_tokens
+                decode_seq_lens = torch.where(
+                    padding_mask,
+                    torch.zeros_like(decode_seq_lens),
+                    decode_seq_lens,
+                ).contiguous()
+                decode_block_table = torch.where(
+                    padding_mask[:, None],
+                    torch.zeros_like(decode_block_table),
+                    decode_block_table,
+                ).contiguous()
+            expand_ms = (
+                (time.perf_counter() - profile_stage_t0) * 1000.0
+                if profile_enabled
+                else 0.0
+            )
+
+            profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
+            self._smallq_decode_block_table[:num_query_tokens].copy_(
+                decode_block_table,
+                non_blocking=True,
+            )
+            self._smallq_decode_seq_lens[:num_query_tokens].copy_(
+                decode_seq_lens,
+                non_blocking=True,
+            )
+            self._smallq_query_start_loc[: num_reqs + 1].copy_(
+                query_start_loc,
+                non_blocking=True,
+            )
+            copy_ms = (
+                (time.perf_counter() - profile_stage_t0) * 1000.0
+                if profile_enabled
+                else 0.0
+            )
 
         profile_stage_t0 = time.perf_counter() if profile_enabled else 0.0
         flash_metadata.smallq_decode_block_table = self._smallq_decode_block_table[
@@ -3166,7 +3327,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                 "total_ms=%.3f clear_ms=%.3f guard_ms=%.3f ensure_ms=%.3f "
                 "prep_ms=%.3f expand_ms=%.3f copy_ms=%.3f hint_ms=%.3f "
                 "num_reqs=%d num_query_tokens=%d real_query_tokens=%d "
-                "padding_tokens=%d block_cols=%d",
+                "padding_tokens=%d block_cols=%d fused=%s",
                 (time.perf_counter() - profile_t0) * 1000.0,
                 clear_ms,
                 guard_ms,
@@ -3180,6 +3341,7 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
                 real_num_query_tokens,
                 padding_tokens,
                 int(block_table.shape[1]),
+                self._use_sm70_dflash2_fused_smallq_metadata,
             )
         if _draft_graph_debug_enabled():
             _graph_metadata_debug_log(

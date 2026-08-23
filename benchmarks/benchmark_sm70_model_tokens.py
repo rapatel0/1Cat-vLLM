@@ -500,7 +500,10 @@ def _sm70_tune_policy() -> dict[str, Any]:
     }
 
 
-def _sm70_turbomind_policy() -> dict[str, Any]:
+def _sm70_turbomind_policy(
+    max_num_seqs: int | None = None,
+    speculative_enabled: bool = False,
+) -> dict[str, Any]:
     awq_turbomind = _env_bool("VLLM_SM70_AWQ_TURBOMIND", True)
     awq_tune_raw = os.environ.get("VLLM_SM70_AWQ_TUNE_SMALL_SHAPES")
     awq_tune0_pinned = awq_tune_raw == "0"
@@ -521,6 +524,7 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         "VLLM_SM70_FP8_PREFILL_EXACT_DENSE",
         True,
     )
+    fp8_qpn8 = _env_bool("VLLM_SM70_FP8_QPN8", True)
     nvfp4_turbomind = _env_bool("VLLM_SM70_NVFP4_TURBOMIND", False)
     mxfp4_turbomind = _env_bool("VLLM_SM70_MXFP4_TURBOMIND", False)
     fp8_dequant_fallback = _env_bool("VLLM_SM70_FP8_DEQUANT_FALLBACK", True)
@@ -577,6 +581,15 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
             "VLLM_SM70_FP8_PREFILL_EXACT_DENSE"
         ),
         "fp8_prefill_exact_dense_effective": fp8_prefill_exact_dense,
+        "VLLM_SM70_FP8_QPN8": os.environ.get("VLLM_SM70_FP8_QPN8"),
+        "fp8_qpn8_effective": fp8_qpn8,
+        "fp8_qpn8_native_decode_max_m": 8,
+        "fp8_qpn8_configured_max_num_seqs": max_num_seqs,
+        "fp8_qpn8_concurrency_contract": (max_num_seqs is None or max_num_seqs <= 8),
+        "fp8_qpn8_no_mtp_contract": not speculative_enabled,
+        "fp8_qpn8_large_m_fallback": "bounded_fp16_weight_workspace",
+        "fp8_qpn8_large_m_gated_temporary": "M_x_8704_fp16",
+        "VLLM_SM70_FP8_QPN8_LIBRARY": os.environ.get("VLLM_SM70_FP8_QPN8_LIBRARY"),
         "VLLM_SM70_NVFP4_TURBOMIND": os.environ.get("VLLM_SM70_NVFP4_TURBOMIND"),
         "nvfp4_turbomind_effective": nvfp4_turbomind,
         "VLLM_SM70_MXFP4_TURBOMIND": os.environ.get("VLLM_SM70_MXFP4_TURBOMIND"),
@@ -765,6 +778,15 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
             and not fp8_moe_batched_w2_dispatch
             and not f16_dense
         ),
+        "accepted_qwen38_fp8_qpn8_default_policy": (
+            fp8_turbomind
+            and fp8_dequant_fallback
+            and fp8_dense_gated_silu
+            and fp8_prefill_exact_dense
+            and fp8_qpn8
+            and (max_num_seqs is None or max_num_seqs <= 8)
+            and not speculative_enabled
+        ),
         "accepted_awq_moe_default_policy": (
             awq_turbomind
             and awq_moe_safe_default_selector
@@ -810,7 +832,9 @@ def _sm70_turbomind_policy() -> dict[str, Any]:
         "route_hit_oracle": (
             "Accepted dense route-hit requires logs such as "
             "`SM70 AWQ TurboMind dense path enabled`, "
-            "`SM70 FP8 TurboMind W8A16 dense path enabled`, and when warmup "
+            "`SM70 FP8 TurboMind W8A16 dense path enabled`, and for the "
+            "Qwen3.8-27B TP4 QPN8 default "
+            "`Memory-neutral SM70 FP8 QPN8 path enabled`; when warmup "
             "is relevant `SM70 AWQ warmup finished`. AWQ MoE production "
             "throughput evidence must keep the default fast route: batched "
             "GEMM enabled, legacy single-token compact enabled, and no "
@@ -1755,7 +1779,10 @@ def _dump(args: argparse.Namespace) -> int:
         ],
         "env": _tracked_env(),
         "sm70_tune_policy": _sm70_tune_policy(),
-        "sm70_turbomind_policy": _sm70_turbomind_policy(),
+        "sm70_turbomind_policy": _sm70_turbomind_policy(
+            int(llm_kwargs["max_num_seqs"]),
+            speculative_enabled=llm_kwargs.get("speculative_config") is not None,
+        ),
         "sm70_attention_policy": _sm70_attention_policy(
             llm_kwargs.get("kv_cache_dtype")
         ),

@@ -1,6 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from typing import TYPE_CHECKING
 
 import torch
@@ -8,6 +9,23 @@ import torch
 from vllm.platforms import current_platform
 
 current_platform.import_kernels()
+
+
+def _maybe_load_fp8_qpn8_library() -> None:
+    """Load an explicitly selected source-built QPN8 extension.
+
+    Production builds register these operators in ``vllm._C``. This opt-in
+    path lets source experiments add only the QPN8 operators to an otherwise
+    compatible installed build, including in spawned TP workers.
+    """
+    if os.getenv("VLLM_SM70_FP8_QPN8", "0") != "1":
+        return
+    library_path = os.getenv("VLLM_SM70_FP8_QPN8_LIBRARY")
+    if library_path:
+        torch.ops.load_library(library_path)
+
+
+_maybe_load_fp8_qpn8_library()
 
 if TYPE_CHECKING:
 
@@ -417,6 +435,207 @@ if hasattr(torch.ops._C, "fp8_gemm_sm70_out"):
         k_ld: int,
         q_ld: int,
         gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def fp8_qpn8_prepare_sm70(
+    qweight: torch.Tensor,
+    scales: torch.Tensor,
+) -> list[torch.Tensor]:
+    """Pack checkpoint-native block FP8 weights into the QPN8 layout."""
+    return _op("fp8_qpn8_prepare_sm70")(qweight, scales)
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_prepare_sm70"):
+
+    @register_fake("_C::fp8_qpn8_prepare_sm70")
+    def _fp8_qpn8_prepare_sm70_fake(
+        qweight: torch.Tensor,
+        scales: torch.Tensor,
+    ) -> list[torch.Tensor]:
+        n = qweight.size(0)
+        k = qweight.size(1)
+        codes = torch.empty((k, n), dtype=torch.uint8, device=qweight.device)
+        group_scales = torch.empty(
+            (k // 128, n // 32), dtype=torch.float16, device=scales.device
+        )
+        return [codes, group_scales]
+
+
+def fp8_qpn8_dequantize_sm70_out(
+    out: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+) -> None:
+    """Materialize one QPN8 weight into a caller-owned FP16 workspace."""
+    _op("fp8_qpn8_dequantize_sm70_out")(out, codes, group_scales)
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_dequantize_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_dequantize_sm70_out")
+    def _fp8_qpn8_dequantize_sm70_out_fake(
+        out: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+    ) -> None:
+        return None
+
+
+def fp8_qpn8_prefill_sm70_out(
+    out: torch.Tensor,
+    dense_weight_ptr: int,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    gated_silu: bool,
+) -> None:
+    """Dequantize QPN8 into bounded workspace and run a large-M FP16 GEMM."""
+    _op("fp8_qpn8_prefill_sm70_out")(
+        out,
+        dense_weight_ptr,
+        input,
+        codes,
+        group_scales,
+        gated_silu,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_prefill_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_prefill_sm70_out")
+    def _fp8_qpn8_prefill_sm70_out_fake(
+        out: torch.Tensor,
+        dense_weight_ptr: int,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def fp8_qpn8_dispatch_sm70_out(
+    out: torch.Tensor,
+    dense_weight_ptr: int,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    prefetch_codes: bool,
+    gated_silu: bool,
+) -> None:
+    """Runtime-dispatch dynamic M without specializing a Python branch."""
+    _op("fp8_qpn8_dispatch_sm70_out")(
+        out,
+        dense_weight_ptr,
+        input,
+        codes,
+        group_scales,
+        split_k,
+        accumulator_chains,
+        prefetch_codes,
+        gated_silu,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_dispatch_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_dispatch_sm70_out")
+    def _fp8_qpn8_dispatch_sm70_out_fake(
+        out: torch.Tensor,
+        dense_weight_ptr: int,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        split_k: int,
+        accumulator_chains: int,
+        prefetch_codes: bool,
+        gated_silu: bool,
+    ) -> None:
+        return None
+
+
+def fp8_qpn8_gemm_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    fast_decoder: bool,
+    prefetch_codes: bool = False,
+) -> None:
+    """Run the SM70 QPN8 FP8 GEMM into ``out``.
+
+    The model- and shape-gated automatic route and operator benchmark share
+    this entry point. ``codes`` and ``group_scales`` use the QPN8 layout.
+    """
+    _op("fp8_qpn8_gemm_sm70_out")(
+        out,
+        input,
+        codes,
+        group_scales,
+        split_k,
+        accumulator_chains,
+        fast_decoder,
+        prefetch_codes,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_gemm_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_gemm_sm70_out")
+    def _fp8_qpn8_gemm_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        split_k: int,
+        accumulator_chains: int,
+        fast_decoder: bool,
+        prefetch_codes: bool,
+    ) -> None:
+        return None
+
+
+def fp8_qpn8_gated_pair_sm70_out(
+    out: torch.Tensor,
+    input: torch.Tensor,
+    codes: torch.Tensor,
+    group_scales: torch.Tensor,
+    split_k: int,
+    accumulator_chains: int,
+    fast_decoder: bool,
+    prefetch_codes: bool = False,
+) -> None:
+    """Run the single-kernel paired-tile QPN8 gated SiLU experiment."""
+    _op("fp8_qpn8_gated_pair_sm70_out")(
+        out,
+        input,
+        codes,
+        group_scales,
+        split_k,
+        accumulator_chains,
+        fast_decoder,
+        prefetch_codes,
+    )
+
+
+if hasattr(torch.ops._C, "fp8_qpn8_gated_pair_sm70_out"):
+
+    @register_fake("_C::fp8_qpn8_gated_pair_sm70_out")
+    def _fp8_qpn8_gated_pair_sm70_out_fake(
+        out: torch.Tensor,
+        input: torch.Tensor,
+        codes: torch.Tensor,
+        group_scales: torch.Tensor,
+        split_k: int,
+        accumulator_chains: int,
+        fast_decoder: bool,
+        prefetch_codes: bool,
     ) -> None:
         return None
 

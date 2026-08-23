@@ -95,6 +95,9 @@ from vllm.v1.worker.gpu.sample.prompt_logprob import PromptLogprobsWorker
 from vllm.v1.worker.gpu.sample.sampler import Sampler
 from vllm.v1.worker.gpu.shutdown import free_before_shutdown
 from vllm.v1.worker.gpu.spec_decode import init_speculator
+from vllm.v1.worker.gpu.spec_decode.dflash2.sparse_rejection import (
+    try_dflash2_sparse_target_rejection,
+)
 from vllm.v1.worker.gpu.spec_decode.eagle.eagle3_utils import (
     set_eagle3_aux_hidden_state_layers,
 )
@@ -956,31 +959,44 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         grammar_output: GrammarOutput | None,
     ) -> tuple[SamplerOutput, torch.Tensor, torch.Tensor]:
         sample_hidden_states = hidden_states[input_batch.logits_indices]
-        logits = self.model.compute_logits(sample_hidden_states)
-        if grammar_output is not None:
-            # Apply grammar bitmask to the logits in-place.
-            assert self.structured_outputs_worker is not None
-            self.structured_outputs_worker.apply_grammar_bitmask(
-                logits,
-                input_batch,
-                grammar_output.structured_output_request_ids,
-                grammar_output.grammar_bitmask,
-            )
-
-        if input_batch.num_draft_tokens == 0:
-            # No draft tokens (common case).
-            assert self.sampler is not None
-            sampler_output = self.sampler(logits, input_batch)
-        else:
-            # Rejection sampling for spec decoding.
+        sampler_output = None
+        if input_batch.num_draft_tokens > 0:
             assert self.rejection_sampler is not None
             assert self.speculator is not None
-            sampler_output = self.rejection_sampler(
-                logits,
+            sampler_output = try_dflash2_sparse_target_rejection(
+                self.model,
+                self.speculator,
+                self.rejection_sampler,
+                sample_hidden_states,
                 input_batch,
-                # Draft logits are needed for probabilistic rejection sampling.
-                self.speculator.draft_logits,
+                grammar_output,
             )
+        if sampler_output is None:
+            logits = self.model.compute_logits(sample_hidden_states)
+            if grammar_output is not None:
+                # Apply grammar bitmask to the logits in-place.
+                assert self.structured_outputs_worker is not None
+                self.structured_outputs_worker.apply_grammar_bitmask(
+                    logits,
+                    input_batch,
+                    grammar_output.structured_output_request_ids,
+                    grammar_output.grammar_bitmask,
+                )
+
+            if input_batch.num_draft_tokens == 0:
+                # No draft tokens (common case).
+                assert self.sampler is not None
+                sampler_output = self.sampler(logits, input_batch)
+            else:
+                # Rejection sampling for spec decoding.
+                assert self.rejection_sampler is not None
+                assert self.speculator is not None
+                sampler_output = self.rejection_sampler(
+                    logits,
+                    input_batch,
+                    # Draft logits are needed for probabilistic rejection sampling.
+                    self.speculator.draft_logits,
+                )
 
         # Get the number of sampled and rejected tokens.
         # For chunked prefills, num_sampled and num_rejected are both 0.

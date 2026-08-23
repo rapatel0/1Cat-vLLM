@@ -261,6 +261,11 @@ def _iter_unique_fp8_dense_layers(
     for layer in model.modules():
         if not getattr(layer, "sm70_fp8_turbomind", False):
             continue
+        # QPN8 has a static source-selected dispatch and does not populate the
+        # TurboMind LUT warmed below. CUDA graph capture exercises its admitted
+        # M<=8 kernels separately.
+        if getattr(layer, "sm70_fp8_qpn8", False):
+            continue
 
         if getattr(layer, "sm70_fp8_bmm", False):
             k_dim = int(layer.weight.shape[1])

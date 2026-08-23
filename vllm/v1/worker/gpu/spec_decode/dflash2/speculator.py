@@ -164,6 +164,7 @@ def _selector_walk_tail_kernel(
 def _cache_draft_logits_kernel(
     draft_logits_ptr,
     cached_candidate_ptr,
+    cached_score_ptr,
     candidate_ptr,
     scores_ptr,
     req_state_ptr,
@@ -191,6 +192,7 @@ def _cache_draft_logits_kernel(
     scores = tl.load(scores_ptr + candidate_base + offsets, mask=mask)
     tl.store(logits_base + token_ids, scores, mask=mask)
     tl.store(cached_candidate_ptr + cache_base + offsets, token_ids, mask=mask)
+    tl.store(cached_score_ptr + cache_base + offsets, scores, mask=mask)
 
 
 class DFlash2Speculator(DFlashSpeculator):
@@ -213,6 +215,11 @@ class DFlash2Speculator(DFlashSpeculator):
         )
         self._cached_candidate_ids = torch.zeros(
             self._selector_scores.shape, dtype=torch.int64, device=device
+        )
+        self._cached_candidate_scores = (
+            torch.empty_like(self._selector_scores)
+            if self.draft_logits is not None
+            else None
         )
         self._selector_path_state = torch.empty(
             self.max_num_reqs, dtype=torch.int32, device=device
@@ -285,10 +292,13 @@ class DFlash2Speculator(DFlashSpeculator):
     def _cache_draft_logits(self, candidate_ids: torch.Tensor, num_sample: int) -> None:
         draft_logits = self.draft_logits
         assert draft_logits is not None
+        cached_scores = self._cached_candidate_scores
+        assert cached_scores is not None
         block_k = triton.next_power_of_2(self.selector_top_k)
         _cache_draft_logits_kernel[(num_sample,)](
             draft_logits,
             self._cached_candidate_ids,
+            cached_scores,
             candidate_ids,
             self._selector_scores,
             self.sample_idx_mapping,
@@ -299,6 +309,14 @@ class DFlash2Speculator(DFlashSpeculator):
             BLOCK_K=block_k,
             num_warps=1,
         )
+
+    def get_sparse_draft_logits(
+        self,
+    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+        """Return request-slot proposal candidates for sparse rejection."""
+        if self.draft_logits is None or self._cached_candidate_scores is None:
+            return None
+        return self._cached_candidate_ids, self._cached_candidate_scores
 
     def _generate_draft(
         self,

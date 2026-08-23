@@ -81,6 +81,7 @@ class CustomAllreduce:
         """
         self._IS_CAPTURING = False
         self.disabled = True
+        self.sm70_tp4_push_buffer_ptrs: list[int] | None = None
 
         if not custom_ar:
             # disable because of missing custom allreduce library
@@ -259,6 +260,27 @@ class CustomAllreduce:
             self.meta_ptrs, self.rank_data, rank, self.fully_connected
         )
         ops.register_buffer(self._ptr, self.buffer_ptrs)
+        if (
+            envs.VLLM_SM70_TP4_PUSH_ALLREDUCE
+            and world_size == 4
+            and fully_connected
+            and current_platform.is_cuda()
+            and device_capability is not None
+            and device_capability.major == 7
+            and device_capability.minor == 0
+        ):
+            push_buffer_size = ops.sm70_tp4_push_allreduce_buffer_size()
+            self.sm70_tp4_push_buffer_ptrs = self.create_shared_buffer(
+                push_buffer_size,
+                group=group,
+            )
+            ops.register_sm70_tp4_push_allreduce_buffer(
+                self._ptr, self.sm70_tp4_push_buffer_ptrs
+            )
+            logger.info(
+                "SM70 TP4 SGLang-style push all-reduce enabled for the "
+                "FP16 [8, 5120] verifier shape."
+            )
 
     @contextmanager
     def capture(self):
@@ -718,6 +740,9 @@ class CustomAllreduce:
             self._ptr = 0
             self.free_shared_buffer(self.meta_ptrs, rank=self.rank)
             self.free_shared_buffer(self.buffer_ptrs, rank=self.rank)
+            if self.sm70_tp4_push_buffer_ptrs is not None:
+                self.free_shared_buffer(self.sm70_tp4_push_buffer_ptrs, rank=self.rank)
+                self.sm70_tp4_push_buffer_ptrs = None
 
     def __del__(self):
         self.close()

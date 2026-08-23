@@ -42241,3 +42241,42 @@ Interpretation:
   formatter changes from current main and keep large C/CUDA formatter work
   separate from accepted kernel repairs. Small policy substitutions still need
   their own current-source static/argument-equivalence checks before merge.
+
+## 2026-08-23 Qwen3.8-27B-FP8 TP4 no-MTP QPN8 decode acceptance
+
+- Integration base is `7aede2cf01`; the owned source worktree and Draft PR are
+  `codex/v100-qwen38-fp8-qpn8-operator-race-20260822-114943` and PR 258.
+- Added a memory-neutral SM70 QPN8 weight layout and direct decode operators for
+  the accepted TP-local gate/up `(K,N)=(5120,8704)`, down `(4352,5120)`, and
+  output `(1536,5120)` projections. GDN input and full-attention QKV remain on
+  TurboMind. The old layout is replaced at load time rather than retained.
+- Default admission is exact-model and exact-shape gated to Qwen3.8-27B-FP8,
+  TP4, no MTP, and configured `max_num_seqs <= 8`. Native QPN8 handles M=1-8.
+  Wider-concurrency and MTP configurations retain TurboMind until their own
+  performance and quality gates pass; this is not a batch-one-only dispatch.
+- The opaque C++ M dispatch prevents an AOTInductor M=1 trace from being reused
+  for prefill. M>8 remains functionally correct through one bounded 85 MiB FP16
+  weight workspace, but fused gate/up additionally creates an `M x 8704` FP16
+  temporary and is not accepted as a high-concurrency performance route.
+- Complete-source no-MTP E5M2 TP4 A/B at input 1024 and output cap 256 measured
+  TurboMind at `16.961295 ms/token`, `58.958 tok/s`, and default-on QPN8 at
+  `16.347973 ms/token`, `61.170 tok/s` (`+3.752%`). The candidate stopped
+  normally at token 233; the control finished all 256 tokens. An earlier
+  matched operator-integration run measured `15.808000 ms/token`,
+  `63.259 tok/s` (`+7.448%`) and remains headroom evidence, not the conservative
+  complete-source claim.
+- Nsight Systems attributes about `0.944 ms/token` of the trace improvement to
+  dense service (`10.335 -> 9.391 ms`), while launch count and GPU idle time are
+  unchanged. The QPN8 dense service spends 6.172 ms in the 75-90% DRAM band and
+  7.059 ms in the 25-50% SM band; no dense kernel sustains at least 90% DRAM or
+  50% SM. Useful dense arithmetic rises from 1.177 to 1.295 TFLOP/s per GPU.
+- The quality gate passed without a measured regression: WikiText PPL/byte PPL
+  and bits/byte improved slightly, GSM8K flexible accuracy was equal and strict
+  accuracy improved by one item, all measured MMLU subjects were equal or
+  better, and all measured C-Eval subjects were equal. Sampled token identity
+  is therefore not used as the sole acceptance criterion.
+- Full evidence and artifact paths are recorded in
+  `docs/design/sm70_qwen38_qpn8_decode.md`. Next work is a measured single-launch
+  M=9/11/16 row-tile route, followed by larger concurrency crossovers; do not
+  compose an eight-row launch with a separate tail or promote the current
+  large-M temporary as an accepted throughput implementation.
