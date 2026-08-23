@@ -584,6 +584,52 @@ def test_compute_candidates_trims_fused_local_top20_to_checkpoint_top16(monkeypa
     dense_apply.assert_not_called()
 
 
+def test_compute_candidates_retains_tp_collective_inputs_and_outputs(monkeypatch):
+    quant_method = UnquantizedEmbeddingMethod()
+    local_values = torch.arange(40, dtype=torch.float32).reshape(2, 20)
+    local_ids = torch.arange(100, 140, dtype=torch.int64).reshape(2, 20)
+    lm_head = SimpleNamespace(
+        quant_method=quant_method,
+        maybe_get_sm70_dflash2_top20=lambda hidden, selector_k: (
+            local_values,
+            local_ids,
+        ),
+    )
+    model = SimpleNamespace(
+        lm_head=lm_head,
+        model=SimpleNamespace(candidate_selector=SimpleNamespace(top_k=16)),
+        config=SimpleNamespace(vocab_size=248320),
+        output_multiplier=1.0,
+        final_logit_softcapping=None,
+        _captured_candidate_collective_tensors=[],
+    )
+
+    def fake_all_gather(tensor, dim):
+        assert dim == -1
+        return torch.cat((tensor, tensor), dim=dim)
+
+    monkeypatch.setattr(
+        dflash2_model, "get_tensor_model_parallel_world_size", lambda: 4
+    )
+    monkeypatch.setattr(
+        dflash2_model, "tensor_model_parallel_all_gather", fake_all_gather
+    )
+    monkeypatch.setattr(
+        dflash2_model, "_is_dflash2_cuda_graph_capture", lambda tensor: True
+    )
+
+    DFlash2Qwen3ForCausalLM.compute_candidates(model, torch.empty((2, 8)))
+
+    assert len(model._captured_candidate_collective_tensors) == 1
+    retained_values, retained_ids, gathered_values, gathered_ids = (
+        model._captured_candidate_collective_tensors[0]
+    )
+    assert retained_values is local_values
+    assert retained_ids is local_ids
+    assert gathered_values.shape == (2, 40)
+    assert gathered_ids.shape == (2, 40)
+
+
 def test_compute_candidates_sanitizes_invalid_ids_before_selector(monkeypatch):
     quant_method = UnquantizedEmbeddingMethod()
     values = torch.arange(20, dtype=torch.float32).reshape(1, 20)

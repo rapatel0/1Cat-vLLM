@@ -88,6 +88,10 @@ direct_register_custom_op(
 sanitize_dflash2_candidate_ids = torch.ops.vllm.sanitize_dflash2_candidate_ids
 
 
+def _is_dflash2_cuda_graph_capture(tensor: torch.Tensor) -> bool:
+    return tensor.is_cuda and torch.cuda.is_current_stream_capturing()
+
+
 def _use_sm70_bf16_emulation(config) -> bool:
     declared_dtype = getattr(config, "dtype", None)
     if declared_dtype is None:
@@ -435,6 +439,12 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
         self.output_multiplier = float(draft_config.get("output_multiplier", 1.0))
         softcap = float(draft_config.get("final_logit_softcapping") or 0.0)
         self.final_logit_softcapping = softcap if softcap > 0 else None
+        # PyNCCL CUDA graphs keep raw pointers to collective inputs and outputs.
+        # Own every captured candidate tensor for the model lifetime so graph-pool
+        # reuse cannot alias a later allocation during sustained replay.
+        self._captured_candidate_collective_tensors: list[
+            tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]
+        ] = []
 
     def compute_candidates(
         self, hidden_states: torch.Tensor
@@ -465,8 +475,13 @@ class DFlash2Qwen3ForCausalLM(DFlashQwen3ForCausalLM):
             values, ids = local_candidates
 
         if get_tensor_model_parallel_world_size() > 1:
-            values = tensor_model_parallel_all_gather(values, dim=-1)
-            ids = tensor_model_parallel_all_gather(ids, dim=-1)
+            local_values, local_ids = values, ids
+            values = tensor_model_parallel_all_gather(local_values, dim=-1)
+            ids = tensor_model_parallel_all_gather(local_ids, dim=-1)
+            if _is_dflash2_cuda_graph_capture(values):
+                self._captured_candidate_collective_tensors.append(
+                    (local_values, local_ids, values, ids)
+                )
 
         if values.shape[-1] > selector.top_k:
             values, selected = _topk(values, selector.top_k)
