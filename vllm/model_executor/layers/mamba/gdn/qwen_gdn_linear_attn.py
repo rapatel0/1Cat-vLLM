@@ -428,7 +428,7 @@ def _sm70_dump_gdn_core_tensor(
     source: str = "core",
 ) -> None:
     _sm70_gdn_graph_buffer_copy(label, layer_name, tensor, source)
-    if torch.cuda.is_current_stream_capturing():
+    if tensor.is_cuda and torch.cuda.is_current_stream_capturing():
         return
     dump_dir = os.getenv("VLLM_SM70_DUMP_GDN_CORE_DIR")
     if not dump_dir:
@@ -442,7 +442,9 @@ def _sm70_dump_gdn_core_tensor(
     enable_file = os.getenv("VLLM_SM70_DUMP_GDN_CORE_ENABLE_FILE")
     if enable_file and not os.path.exists(enable_file):
         return
-    if torch.compiler.is_compiling() or torch.cuda.is_current_stream_capturing():
+    if torch.compiler.is_compiling() or (
+        tensor.is_cuda and torch.cuda.is_current_stream_capturing()
+    ):
         return
 
     try:
