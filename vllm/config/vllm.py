@@ -521,10 +521,37 @@ class VllmConfig:
         return 0
 
     @property
+    def num_lookahead_tokens(self) -> int:
+        """KV positions reserved beyond the target model's scheduled query."""
+        speculative_config = self.speculative_config
+        if speculative_config is None:
+            return 0
+        if speculative_config.use_dflash_family():
+            # DFlash has one anchor query plus the checkpoint-owned draft state.
+            return speculative_config.num_speculative_state_tokens() + 1
+        if speculative_config.use_eagle() or speculative_config.uses_draft_model():
+            return self.num_speculative_tokens
+        return 0
+
+    @property
     def use_v2_model_runner(self) -> bool:
         use_v2_model_runner = envs.VLLM_USE_V2_MODEL_RUNNER
+        is_mrv2_dflash = (
+            self.speculative_config is not None and self.speculative_config.use_dflash()
+        )
         if use_v2_model_runner is not None:
+            if is_mrv2_dflash and not use_v2_model_runner:
+                raise ValueError(
+                    "method='dflash' is implemented only by Model Runner V2. "
+                    "Use method='dflash_ddtree' for the retained V1 DDTree route."
+                )
             return use_v2_model_runner
+
+        # The old V1 flat-DFlash route is intentionally removed. Force every
+        # method='dflash' checkpoint through the MRV2 speculator and fail in
+        # _validate_v2_model_runner if another configured feature is unsupported.
+        if is_mrv2_dflash:
+            return True
 
         if not self._is_default_v2_model_runner_model():
             return False
@@ -2482,13 +2509,6 @@ class VllmConfig:
         model_config = self.model_config
         speculative_config = self.speculative_config
 
-        if (
-            model_config is not None
-            and model_config.has_inner_state
-            and self.cache_config.mamba_cache_mode == "align"
-        ):
-            unsupported.append("hybrid/mamba models with align cache mode")
-
         if self.parallel_config.prefill_context_parallel_size > 1:
             unsupported.append("prefill context parallelism")
 
@@ -2505,11 +2525,19 @@ class VllmConfig:
             # TODO: ngram / ngram_gpu are not supported by the v2 model runner yet
             if speculative_config.method in ("ngram", "ngram_gpu"):
                 unsupported.append("ngram/ngram_gpu speculative decoding")
-            elif speculative_config.method not in ("eagle", "eagle3", "mtp"):
+            elif speculative_config.method not in (
+                "eagle",
+                "eagle3",
+                "mtp",
+                "dflash",
+            ):
                 unsupported.append(f"speculative method '{speculative_config.method}'")
 
             # V2 EagleSpeculator does not support parallel_drafting (required by PEagle)
-            if speculative_config.parallel_drafting:
+            if (
+                speculative_config.parallel_drafting
+                and speculative_config.method != "dflash"
+            ):
                 unsupported.append("parallel drafting for speculative decoding")
 
             if (
@@ -2517,6 +2545,11 @@ class VllmConfig:
                 and self.parallel_config.pipeline_parallel_size > 1
             ):
                 unsupported.append("EAGLE3 with pipeline parallelism")
+            if (
+                speculative_config.method == "dflash"
+                and self.parallel_config.pipeline_parallel_size > 1
+            ):
+                unsupported.append("DFlash with pipeline parallelism")
 
         if self.parallel_config.enable_dbo:
             unsupported.append("dual batch overlap")
@@ -2618,10 +2651,6 @@ class VllmConfig:
                 "Chunked MM input is required because we need the flexibility "
                 "to schedule a multiple of block_size tokens even if they are "
                 "in the middle of a mm input"
-            )
-            # TODO: support align mamba cache mode for model runner v2
-            assert not envs.VLLM_USE_V2_MODEL_RUNNER, (
-                "Model Runner V2 has not yet supported mamba_cache_mode='align'. "
             )
 
     @model_validator(mode="after")
