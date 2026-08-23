@@ -1,0 +1,2456 @@
+commit 73b067c747fdf167e0ac868d220cb549371e0f94
+Author:     Ravi Patel <rapatel0@gmail.com>
+AuthorDate: Sat Jul 18 20:37:49 2026 -0500
+Commit:     Ravi Patel <rapatel0@gmail.com>
+CommitDate: Sat Jul 18 20:37:49 2026 -0500
+
+    FORGE-001: add SM70 MTP segmented attention candidate
+    
+    Co-authored-by: OpenAI Codex <codex@openai.com>
+
+diff --git a/benchmarks/benchmark_hy3_64k_segmented_attention.py b/benchmarks/benchmark_hy3_64k_segmented_attention.py
+new file mode 100644
+index 0000000000..2309592e97
+--- /dev/null
++++ b/benchmarks/benchmark_hy3_64k_segmented_attention.py
+@@ -0,0 +1,854 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++"""Benchmark truthful q>1 segmented attention at Hy3's TP8-local shape.
++
++The default workload is one independently resident 64K request with MTP2
++verification (q=3, Hq/Hkv=8/1, D=128). Unlike earlier exploratory harnesses,
++this benchmark passes the real query length to production dispatch and sizes
++all segmented scratch by flattened query-token rows.
++"""
++
++from __future__ import annotations
++
++import argparse
++import hashlib
++import json
++import math
++import os
++import statistics
++import subprocess
++import sys
++from contextlib import contextmanager
++from dataclasses import asdict, dataclass, field
++from pathlib import Path
++
++import torch
++
++from vllm.v1.attention.ops import (
++    triton_unified_attention as triton_unified_attention_module,
++)
++from vllm.v1.kv_cache_interface import KVQuantMode
++
++_can_use_3d_attention = triton_unified_attention_module._can_use_3d_attention
++unified_attention = triton_unified_attention_module.unified_attention
++
++
++@dataclass(frozen=True)
++class Candidate:
++    name: str
++    segments: int
++    warps: int
++    block_m: int
++
++    @property
++    def segmented(self) -> bool:
++        return self.segments > 0
++
++
++@dataclass(frozen=True)
++class ErrorStats:
++    maximum: float
++    p99: float
++    mean: float
++
++
++@dataclass(frozen=True)
++class Result:
++    candidate: str
++    planned_segmented: bool
++    scratch_touched: bool
++    scratch_validation_complete: bool
++    backend_selectable: bool
++    segments: int
++    warps: int
++    block_m: int
++    median_ms: float
++    mad_ms: float
++    minimum_ms: float
++    maximum_ms: float
++    samples_ms: list[float]
++    speedup_vs_2d: float | None
++    error_vs_fp32: ErrorStats
++    error_vs_2d: ErrorStats
++    within_2d_fp32_envelope: bool
++    valid: bool
++    invalid_reasons: list[str]
++
++
++@dataclass
++class CandidateState:
++    candidate: Candidate
++    output: torch.Tensor
++    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor]
++    samples: list[float] = field(default_factory=list)
++
++
++@contextmanager
++def _sm70_schedule(candidate: Candidate):
++    keys = (
++        "VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS",
++        "VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS",
++    )
++    previous = {key: os.environ.get(key) for key in keys}
++    try:
++        if candidate.segmented:
++            os.environ[keys[0]] = str(candidate.warps)
++        else:
++            os.environ.pop(keys[0], None)
++            os.environ.pop(keys[1], None)
++        yield
++    finally:
++        for key, value in previous.items():
++            if value is None:
++                os.environ.pop(key, None)
++            else:
++                os.environ[key] = value
++
++
++def _parse_positive_csv(raw: str, name: str) -> list[int]:
++    values = [int(value) for value in raw.split(",")]
++    if not values or any(value <= 0 for value in values):
++        raise ValueError(f"{name} must contain positive comma-separated integers")
++    return values
++
++
++def _parse_candidates(raw: str) -> list[Candidate]:
++    candidates: list[Candidate] = []
++    for value in raw.split(","):
++        if value == "2d":
++            candidates.append(Candidate(name="2d", segments=0, warps=0, block_m=16))
++            continue
++        pieces = value.split("x")
++        if len(pieces) not in (2, 3):
++            raise ValueError(
++                f"Invalid candidate {value!r}; expected "
++                "2d, SEGMENTSxWARPS, or SEGMENTSxWARPSxBLOCK_M"
++            )
++        segments_raw, warps_raw = pieces[:2]
++        segments = int(segments_raw)
++        warps = int(warps_raw)
++        block_m = int(pieces[2]) if len(pieces) == 3 else 16
++        if (
++            segments not in (16, 32, 64)
++            or warps not in (1, 2, 4, 8)
++            or block_m not in (16, 32)
++        ):
++            raise ValueError(
++                f"Invalid candidate {value!r}; expected "
++                "segments in 16/32/64, "
++                "warps in 1/2/4/8, "
++                "block_m in 16/32"
++            )
++        candidates.append(
++            Candidate(
++                name=f"segmented_s{segments}_w{warps}_m{block_m}",
++                segments=segments,
++                warps=warps,
++                block_m=block_m,
++            )
++        )
++    if not any(not candidate.segmented for candidate in candidates):
++        candidates.insert(
++            0,
++            Candidate(name="2d", segments=0, warps=0, block_m=16),
++        )
++    names = [candidate.name for candidate in candidates]
++    if len(names) != len(set(names)):
++        raise ValueError("Candidate list contains duplicate routes")
++    if len(candidates) > 5:
++        raise ValueError("Use at most one baseline and four progressive candidates")
++    return candidates
++
++
++def _make_inputs(
++    *,
++    seq_lens: list[int],
++    query_lens: list[int],
++    query_heads: int,
++    kv_heads: int,
++    head_size: int,
++    block_size: int,
++    seed: int,
++) -> tuple[
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor,
++]:
++    if len(seq_lens) != len(query_lens):
++        raise ValueError("seq_lens and query_lens must have equal lengths")
++    generator = torch.Generator(device="cuda")
++    generator.manual_seed(seed)
++
++    blocks_per_seq = [(seq_len + block_size - 1) // block_size for seq_len in seq_lens]
++    used_blocks = sum(blocks_per_seq)
++    physical_block_count = used_blocks + 2
++    query = torch.randn(
++        (sum(query_lens), query_heads, head_size),
++        dtype=torch.float16,
++        device="cuda",
++        generator=generator,
++    )
++    key_cache = torch.full(
++        (physical_block_count, block_size, kv_heads, head_size),
++        float("nan"),
++        dtype=torch.float16,
++        device="cuda",
++    )
++    value_cache = torch.full(
++        (physical_block_count, block_size, kv_heads, head_size),
++        float("nan"),
++        dtype=torch.float16,
++        device="cuda",
++    )
++
++    shuffled_blocks = torch.randperm(
++        physical_block_count,
++        dtype=torch.int64,
++        device="cuda",
++        generator=generator,
++    ).to(torch.int32)
++    active_pages = shuffled_blocks[:used_blocks].long()
++    key_cache[active_pages] = torch.randn(
++        (used_blocks, block_size, kv_heads, head_size),
++        dtype=torch.float16,
++        device="cuda",
++        generator=generator,
++    )
++    value_cache[active_pages] = torch.randn(
++        (used_blocks, block_size, kv_heads, head_size),
++        dtype=torch.float16,
++        device="cuda",
++        generator=generator,
++    )
++    max_blocks = max(blocks_per_seq)
++    block_table = shuffled_blocks[-1].expand(len(seq_lens), max_blocks + 1).clone()
++    offset = 0
++    for seq_idx, (seq_len, block_count) in enumerate(zip(seq_lens, blocks_per_seq)):
++        block_table[seq_idx, :block_count] = shuffled_blocks[
++            offset : offset + block_count
++        ]
++        valid_tail = seq_len % block_size
++        if valid_tail:
++            final_page = shuffled_blocks[offset + block_count - 1].long()
++            key_cache[final_page, valid_tail:] = float("nan")
++            value_cache[final_page, valid_tail:] = float("nan")
++        offset += block_count
++
++    seq_lens_tensor = torch.tensor(seq_lens, dtype=torch.int32, device="cuda")
++    cu_seqlens_q = torch.tensor(
++        [0, *query_lens],
++        dtype=torch.int32,
++        device="cuda",
++    ).cumsum(dim=0)
++    return (
++        query,
++        key_cache,
++        value_cache,
++        block_table,
++        seq_lens_tensor,
++        cu_seqlens_q,
++    )
++
++
++def _make_scratch(
++    query: torch.Tensor,
++    segments: int,
++) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
++    effective_segments = max(segments, 1)
++    return (
++        torch.full(
++            (
++                query.shape[0],
++                query.shape[1],
++                effective_segments,
++                query.shape[2],
++            ),
++            float("nan"),
++            dtype=torch.float32,
++            device=query.device,
++        ),
++        torch.full(
++            (query.shape[0], query.shape[1], effective_segments),
++            float("nan"),
++            dtype=torch.float32,
++            device=query.device,
++        ),
++        torch.full(
++            (query.shape[0], query.shape[1], effective_segments),
++            float("nan"),
++            dtype=torch.float32,
++            device=query.device,
++        ),
++    )
++
++
++def _run(
++    *,
++    candidate: Candidate,
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    output: torch.Tensor,
++    block_table: torch.Tensor,
++    seq_lens: torch.Tensor,
++    cu_seqlens_q: torch.Tensor,
++    query_lens: list[int],
++    max_seq_len: int,
++    scratch: tuple[torch.Tensor, torch.Tensor, torch.Tensor],
++) -> torch.Tensor:
++    unified_attention(
++        q=query,
++        k=key_cache,
++        v=value_cache,
++        out=output,
++        cu_seqlens_q=cu_seqlens_q,
++        max_seqlen_q=max(query_lens),
++        seqused_k=seq_lens,
++        max_seqlen_k=max_seq_len,
++        softmax_scale=query.shape[-1] ** -0.5,
++        causal=True,
++        window_size=(-1, -1),
++        block_table=block_table,
++        softcap=0.0,
++        q_descale=None,
++        k_descale=None,
++        v_descale=None,
++        seq_threshold_3D=query.shape[0] if candidate.segmented else 0,
++        num_par_softmax_segments=(candidate.segments if candidate.segmented else 1),
++        softmax_segm_output=scratch[0],
++        softmax_segm_max=scratch[1],
++        softmax_segm_expsum=scratch[2],
++        kv_quant_mode=KVQuantMode.NONE,
++        sm70_mtp_block_m=(
++            candidate.block_m if candidate.segmented and candidate.block_m != 16 else 0
++        ),
++    )
++    return output
++
++
++def _benchmark_candidates(
++    *,
++    candidates: list[Candidate],
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    seq_lens: torch.Tensor,
++    cu_seqlens_q: torch.Tensor,
++    query_lens: list[int],
++    max_seq_len: int,
++    warmups: int,
++    repeats: int,
++) -> list[tuple[Candidate, torch.Tensor, list[float], bool, bool]]:
++    states = [
++        CandidateState(
++            candidate=candidate,
++            output=torch.empty_like(query),
++            scratch=_make_scratch(query, candidate.segments),
++        )
++        for candidate in candidates
++    ]
++    for state in states:
++        with _sm70_schedule(state.candidate):
++            for _ in range(warmups):
++                _run(
++                    candidate=state.candidate,
++                    query=query,
++                    key_cache=key_cache,
++                    value_cache=value_cache,
++                    output=state.output,
++                    block_table=block_table,
++                    seq_lens=seq_lens,
++                    cu_seqlens_q=cu_seqlens_q,
++                    query_lens=query_lens,
++                    max_seq_len=max_seq_len,
++                    scratch=state.scratch,
++                )
++    torch.accelerator.synchronize()
++
++    for repeat_idx in range(repeats):
++        ordered_states = states if repeat_idx % 2 == 0 else list(reversed(states))
++        round_events: list[
++            tuple[CandidateState, torch.cuda.Event, torch.cuda.Event]
++        ] = []
++        for state in ordered_states:
++            start = torch.cuda.Event(enable_timing=True)
++            end = torch.cuda.Event(enable_timing=True)
++            with _sm70_schedule(state.candidate):
++                start.record()
++                _run(
++                    candidate=state.candidate,
++                    query=query,
++                    key_cache=key_cache,
++                    value_cache=value_cache,
++                    output=state.output,
++                    block_table=block_table,
++                    seq_lens=seq_lens,
++                    cu_seqlens_q=cu_seqlens_q,
++                    query_lens=query_lens,
++                    max_seq_len=max_seq_len,
++                    scratch=state.scratch,
++                )
++                end.record()
++            round_events.append((state, start, end))
++        torch.accelerator.synchronize()
++        for state, start, end in round_events:
++            state.samples.append(float(start.elapsed_time(end)))
++
++    # Timed state is never correctness evidence. Poison every destination and
++    # run one dedicated validation launch so stale or partial writes fail.
++    for state in states:
++        state.output.fill_(float("nan"))
++        for scratch_tensor in state.scratch:
++            scratch_tensor.fill_(float("nan"))
++        with _sm70_schedule(state.candidate):
++            _run(
++                candidate=state.candidate,
++                query=query,
++                key_cache=key_cache,
++                value_cache=value_cache,
++                output=state.output,
++                block_table=block_table,
++                seq_lens=seq_lens,
++                cu_seqlens_q=cu_seqlens_q,
++                query_lens=query_lens,
++                max_seq_len=max_seq_len,
++                scratch=state.scratch,
++            )
++    torch.accelerator.synchronize()
++
++    return [
++        (
++            state.candidate,
++            state.output.clone(),
++            state.samples,
++            bool(torch.isfinite(state.scratch[1]).any().item()),
++            (
++                all(
++                    bool(torch.isfinite(tensor).all().item())
++                    for tensor in state.scratch
++                )
++                and bool((state.scratch[2] > 0).all().item())
++                if state.candidate.segmented
++                else all(
++                    bool(torch.isnan(tensor).all().item()) for tensor in state.scratch
++                )
++            ),
++        )
++        for state in states
++    ]
++
++
++def _fp32_reference(
++    *,
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    seq_lens: list[int],
++    query_lens: list[int],
++) -> torch.Tensor:
++    block_size = key_cache.shape[1]
++    kv_heads = key_cache.shape[2]
++    head_size = key_cache.shape[3]
++    repeats = query.shape[1] // kv_heads
++    outputs: list[torch.Tensor] = []
++    query_offset = 0
++    for seq_idx, (seq_len, query_len) in enumerate(zip(seq_lens, query_lens)):
++        block_count = (seq_len + block_size - 1) // block_size
++        physical_blocks = block_table[seq_idx, :block_count].long()
++        key = key_cache[physical_blocks].flatten(0, 1)[:seq_len].float()
++        value = value_cache[physical_blocks].flatten(0, 1)[:seq_len].float()
++        query_slice = query[query_offset : query_offset + query_len].float()
++        query_grouped = query_slice.view(
++            query_len,
++            kv_heads,
++            repeats,
++            head_size,
++        ).permute(1, 2, 0, 3)
++        scores = torch.einsum(
++            "grqd,kgd->grqk",
++            query_grouped,
++            key,
++        )
++        scores *= head_size**-0.5
++        key_positions = torch.arange(seq_len, device=query.device)
++        query_positions = (
++            seq_len
++            - query_len
++            + torch.arange(
++                query_len,
++                device=query.device,
++            )
++        )
++        causal_mask = key_positions[None, :] > query_positions[:, None]
++        scores.masked_fill_(causal_mask[None, None, :, :], float("-inf"))
++        probabilities = torch.softmax(scores, dim=-1)
++        output = torch.einsum(
++            "grqk,kgd->qgrd",
++            probabilities,
++            value,
++        ).reshape(query_len, query.shape[1], head_size)
++        outputs.append(output)
++        query_offset += query_len
++    return torch.cat(outputs)
++
++
++def _error_stats(actual: torch.Tensor, expected: torch.Tensor) -> ErrorStats:
++    error = (actual.float() - expected.float()).abs().flatten()
++    return ErrorStats(
++        maximum=float(error.max().item()),
++        p99=float(torch.quantile(error, 0.99).item()),
++        mean=float(error.mean().item()),
++    )
++
++
++def _median_abs_deviation(samples: list[float]) -> float:
++    median = statistics.median(samples)
++    return float(statistics.median(abs(sample - median) for sample in samples))
++
++
++def _repo_root() -> Path:
++    return Path(__file__).resolve().parents[1]
++
++
++def _loaded_source_path() -> Path:
++    module_path = triton_unified_attention_module.__file__
++    if module_path is None:
++        raise RuntimeError("Loaded unified-attention module has no source path")
++    return Path(module_path).resolve()
++
++
++def _validate_loaded_source() -> None:
++    expected = (
++        _repo_root() / "vllm/v1/attention/ops/triton_unified_attention.py"
++    ).resolve()
++    loaded = _loaded_source_path()
++    if loaded != expected:
++        raise RuntimeError(
++            "Benchmark source/import mismatch: "
++            f"expected {expected}, loaded {loaded}. "
++            "Run with this checkout first on PYTHONPATH."
++        )
++
++
++def _source_sha() -> str:
++    result = subprocess.run(
++        ["git", "rev-parse", "HEAD"],
++        check=True,
++        capture_output=True,
++        text=True,
++        cwd=_repo_root(),
++    )
++    return result.stdout.strip()
++
++
++def _source_dirty() -> bool:
++    result = subprocess.run(
++        ["git", "status", "--porcelain"],
++        check=True,
++        capture_output=True,
++        text=True,
++        cwd=_repo_root(),
++    )
++    return bool(result.stdout.strip())
++
++
++def _source_hashes() -> dict[str, str]:
++    root = _repo_root()
++    relative_paths = (
++        "benchmarks/benchmark_hy3_64k_segmented_attention.py",
++        "vllm/v1/attention/backends/triton_attn.py",
++        "vllm/v1/attention/ops/triton_unified_attention.py",
++    )
++    return {
++        path: hashlib.sha256((root / path).read_bytes()).hexdigest()
++        for path in relative_paths
++    }
++
++
++def _parse_args() -> argparse.Namespace:
++    parser = argparse.ArgumentParser()
++    parser.add_argument("--json-out", type=Path, required=True)
++    parser.add_argument("--seq-lens", default="65536")
++    parser.add_argument("--query-lens", default="3")
++    parser.add_argument("--query-heads", type=int, default=8)
++    parser.add_argument("--kv-heads", type=int, default=1)
++    parser.add_argument("--head-size", type=int, default=128)
++    parser.add_argument("--block-size", type=int, default=16)
++    parser.add_argument(
++        "--candidates",
++        default="2d,16x8,32x8,32x4x32,64x4x32",
++    )
++    parser.add_argument("--warmups", type=int, default=10)
++    parser.add_argument("--repeats", type=int, default=31)
++    parser.add_argument("--seed", type=int, default=20260718)
++    parser.add_argument("--max-abs-error", type=float, default=3e-2)
++    parser.add_argument("--p99-abs-error", type=float, default=1e-2)
++    parser.add_argument("--mean-abs-error", type=float, default=3e-3)
++    parser.add_argument("--baseline-envelope-slack", type=float, default=1.0)
++    parser.add_argument(
++        "--require-clean-source",
++        action="store_true",
++        help="Fail unless every tracked and untracked source path is clean.",
++    )
++    return parser.parse_args()
++
++
++def main() -> int:
++    args = _parse_args()
++    _validate_loaded_source()
++    if args.warmups < 1 or args.repeats < 5:
++        raise ValueError("Use at least one warmup and five timed repeats")
++    declared_limits = (
++        (args.max_abs_error, 3e-2, "max_abs_error"),
++        (args.p99_abs_error, 1e-2, "p99_abs_error"),
++        (args.mean_abs_error, 3e-3, "mean_abs_error"),
++    )
++    for actual, maximum, name in declared_limits:
++        if actual <= 0 or actual > maximum:
++            raise ValueError(f"{name} must be in (0, {maximum}]")
++    if not 0 < args.baseline_envelope_slack <= 1:
++        raise ValueError("baseline_envelope_slack must be in (0, 1]")
++    if not torch.cuda.is_available():
++        raise RuntimeError("CUDA is required")
++    if torch.cuda.get_device_capability() != (7, 0):
++        raise RuntimeError("This benchmark requires an SM70 GPU")
++
++    seq_lens = _parse_positive_csv(args.seq_lens, "seq_lens")
++    query_lens = _parse_positive_csv(args.query_lens, "query_lens")
++    if len(seq_lens) != len(query_lens):
++        raise ValueError("seq_lens and query_lens must have equal lengths")
++    if (
++        args.query_heads,
++        args.kv_heads,
++        args.head_size,
++        args.block_size,
++    ) != (8, 1, 128, 16):
++        raise ValueError(
++            "This campaign benchmark is restricted to Hy3's TP8-local "
++            "Hq/Hkv/D/block=8/1/128/16 shape"
++        )
++    if len(seq_lens) not in (1, 2):
++        raise ValueError("This campaign benchmark supports batch size 1 or 2")
++    if any(query_len not in (2, 3, 4) for query_len in query_lens):
++        raise ValueError("MTP query lengths must be in 2..4")
++    if any(seq_len < 4096 for seq_len in seq_lens):
++        raise ValueError("Campaign performance cases must use at least 4K context")
++    if any(query_len > seq_len for query_len, seq_len in zip(query_lens, seq_lens)):
++        raise ValueError(
++            "Each query length must be no greater than its sequence length"
++        )
++    candidates = _parse_candidates(args.candidates)
++    (
++        query,
++        key_cache,
++        value_cache,
++        block_table,
++        seq_lens_tensor,
++        cu_seqlens_q,
++    ) = _make_inputs(
++        seq_lens=seq_lens,
++        query_lens=query_lens,
++        query_heads=args.query_heads,
++        kv_heads=args.kv_heads,
++        head_size=args.head_size,
++        block_size=args.block_size,
++        seed=args.seed,
++    )
++    reference = _fp32_reference(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        block_table=block_table,
++        seq_lens=seq_lens,
++        query_lens=query_lens,
++    )
++
++    raw_results = _benchmark_candidates(
++        candidates=candidates,
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        block_table=block_table,
++        seq_lens=seq_lens_tensor,
++        cu_seqlens_q=cu_seqlens_q,
++        query_lens=query_lens,
++        max_seq_len=max(seq_lens),
++        warmups=args.warmups,
++        repeats=args.repeats,
++    )
++
++    baseline_entry = next(entry for entry in raw_results if not entry[0].segmented)
++    baseline_output = baseline_entry[1]
++    baseline_median = statistics.median(baseline_entry[2])
++    baseline_error = _error_stats(baseline_output, reference)
++    results: list[Result] = []
++    for (
++        candidate,
++        output,
++        samples,
++        scratch_touched,
++        scratch_validation_complete,
++    ) in raw_results:
++        candidate_error = _error_stats(output, reference)
++        scratch = _make_scratch(query, candidate.segments)
++        planned_segmented = _can_use_3d_attention(
++            max_seqlen_q=max(query_lens),
++            num_query_tokens=query.shape[0],
++            num_seqs=len(seq_lens),
++            num_query_heads=query.shape[1],
++            head_size_padded=query.shape[2],
++            query_device=query.device,
++            seq_threshold_3d=query.shape[0] if candidate.segmented else 0,
++            num_segments=candidate.segments if candidate.segmented else 1,
++            softmax_segm_output=scratch[0],
++            softmax_segm_max=scratch[1],
++            softmax_segm_expsum=scratch[2],
++            multi_query_supported=(
++                args.query_heads == 8
++                and args.kv_heads == 1
++                and args.head_size == 128
++                and args.block_size == 16
++            ),
++            batch_invariant=False,
++        )
++        within_hard_fp32_tolerance = (
++            math.isfinite(candidate_error.maximum)
++            and candidate_error.maximum <= args.max_abs_error
++            and candidate_error.p99 <= args.p99_abs_error
++            and candidate_error.mean <= args.mean_abs_error
++        )
++        within_2d_fp32_envelope = (
++            candidate_error.maximum
++            <= max(
++                baseline_error.maximum * args.baseline_envelope_slack,
++                1e-5,
++            )
++            and candidate_error.p99
++            <= max(
++                baseline_error.p99 * args.baseline_envelope_slack,
++                1e-5,
++            )
++            and candidate_error.mean
++            <= max(
++                baseline_error.mean * args.baseline_envelope_slack,
++                1e-6,
++            )
++        )
++        invalid_reasons: list[str] = []
++        if planned_segmented is not candidate.segmented:
++            invalid_reasons.append("planner route does not match candidate")
++        if scratch_touched is not candidate.segmented:
++            invalid_reasons.append("observed scratch touch does not match route")
++        if not scratch_validation_complete:
++            invalid_reasons.append("dedicated scratch validation is incomplete")
++        if not bool(torch.isfinite(output).all().item()):
++            invalid_reasons.append("output contains NaN or Inf")
++        if not within_hard_fp32_tolerance:
++            invalid_reasons.append("output exceeds declared FP32 tolerance")
++        if not within_2d_fp32_envelope:
++            invalid_reasons.append("output exceeds current 2D FP32 envelope")
++        valid = not invalid_reasons
++        median_ms = float(statistics.median(samples))
++        backend_selectable = candidate.segments in (0, 16) and candidate.block_m == 16
++        results.append(
++            Result(
++                candidate=candidate.name,
++                planned_segmented=planned_segmented,
++                scratch_touched=scratch_touched,
++                scratch_validation_complete=scratch_validation_complete,
++                backend_selectable=backend_selectable,
++                segments=candidate.segments,
++                warps=candidate.warps,
++                block_m=candidate.block_m,
++                median_ms=median_ms,
++                mad_ms=_median_abs_deviation(samples),
++                minimum_ms=float(min(samples)),
++                maximum_ms=float(max(samples)),
++                samples_ms=samples,
++                speedup_vs_2d=(float(baseline_median / median_ms) if valid else None),
++                error_vs_fp32=candidate_error,
++                error_vs_2d=_error_stats(output, baseline_output),
++                within_2d_fp32_envelope=within_2d_fp32_envelope,
++                valid=valid,
++                invalid_reasons=invalid_reasons,
++            )
++        )
++
++    baseline_result = next(result for result in results if result.segments == 0)
++    valid_segmented = [
++        result.candidate for result in results if result.segments > 0 and result.valid
++    ]
++    valid_backend_segmented = [
++        result.candidate
++        for result in results
++        if result.segments > 0 and result.valid and result.backend_selectable
++    ]
++    source_dirty = _source_dirty()
++    source_gate_valid = not args.require_clean_source or not source_dirty
++    overall_valid = (
++        baseline_result.valid and bool(valid_backend_segmented) and source_gate_valid
++    )
++    env_keys = (
++        "VLLM_SM70_TRITON_ATTN_PREFILL_TILE_SIZE",
++        "VLLM_SM70_TRITON_ATTN_DECODE_TILE_SIZE",
++        "VLLM_SM70_TRITON_ATTN_NUM_WARPS",
++        "VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS",
++        "VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS",
++        "VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION",
++        "VLLM_SM70_TRITON_ATTN_PV_INPUT_PRECISION",
++        "VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS",
++        "VLLM_BATCH_INVARIANT",
++    )
++    payload = {
++        "valid": overall_valid,
++        "evidence_scope": "operator_microbenchmark_non_terminal",
++        "valid_segmented_candidates": valid_segmented,
++        "valid_backend_selectable_candidates": valid_backend_segmented,
++        "source": {
++            "sha": _source_sha(),
++            "dirty": source_dirty,
++            "clean_required": args.require_clean_source,
++            "content_sha256": _source_hashes(),
++            "loaded_unified_attention": str(_loaded_source_path()),
++            "command": [sys.executable, *sys.argv],
++        },
++        "environment": {key: os.environ.get(key) for key in env_keys},
++        "device": {
++            "name": torch.cuda.get_device_name(),
++            "capability": list(torch.cuda.get_device_capability()),
++            "torch": torch.__version__,
++            "cuda": torch.version.cuda,
++        },
++        "shape": {
++            "seq_lens": seq_lens,
++            "query_lens": query_lens,
++            "query_heads": args.query_heads,
++            "kv_heads": args.kv_heads,
++            "head_size": args.head_size,
++            "block_size": args.block_size,
++        },
++        "seed": args.seed,
++        "warmups": args.warmups,
++        "repeats": args.repeats,
++        "gates": {
++            "max_abs_error": args.max_abs_error,
++            "p99_abs_error": args.p99_abs_error,
++            "mean_abs_error": args.mean_abs_error,
++            "baseline_envelope_slack": args.baseline_envelope_slack,
++        },
++        "baseline_fp32_error": asdict(baseline_error),
++        "results": [asdict(result) for result in results],
++    }
++    args.json_out.parent.mkdir(parents=True, exist_ok=True)
++    args.json_out.write_text(json.dumps(payload, indent=2) + "\n")
++    print(json.dumps(payload, indent=2))
++    return 0 if overall_valid else 2
++
++
++if __name__ == "__main__":
++    raise SystemExit(main())
+diff --git a/docs/design/attention_backends.md b/docs/design/attention_backends.md
+index ed9f0d3016..7f2e8b9d7e 100644
+--- a/docs/design/attention_backends.md
++++ b/docs/design/attention_backends.md
+@@ -176,6 +176,7 @@ Priority is **1 = highest** (tried first).
+ | `FLASH_ATTN` | FA3* | fp16, bf16 | `auto`, `float16`, `bfloat16`, `fp8`, `fp8_e4m3`, `fp8_e5m2` | %16 | Any | ✅ | ✅ | ❌ | ✅ | All | 9.x |
+ | `FLASH_ATTN` | FA4* | fp16, bf16 | `auto`, `float16`, `bfloat16` | %16 | Any | ✅ | ✅ | ❌ | ✅ | All | ≥10.0 |
+ | `FLASH_ATTN_DIFFKV` | | fp16, bf16 | `auto` | Any | Any | ❌ | ❌ | ❌ | ✅ | Decoder | Any |
++| `FLASH_ATTN_V100` | | fp16, bf16 | `auto` | 16 | 64, 128, 256 | ❌ | ✅ | ❌ | ❌ | Decoder | Any |
+ | `FLEX_ATTENTION` | | fp16, bf16, fp32 | `auto`, `float16`, `bfloat16` | %16 | Any | ❌ | ✅ | ✅ | ❌ | Decoder, Encoder Only | Any |
+ | `ROCM_AITER_FA` | | fp16, bf16 | `auto`, `float16`, `bfloat16`, `fp8`, `fp8_e4m3`, `fp8_e5m2` | 16, 32 | 64, 128, 256 | ❌ | ✅ | ❌ | ❌ | Decoder | N/A |
+ | `ROCM_AITER_UNIFIED_ATTN` | | fp16, bf16 | `auto` | %16 | Any | ✅ | ❌ | ✅ | ❌ | All | N/A |
+diff --git a/tests/kernels/attention/test_sm70_triton_mtp_segmented_attention.py b/tests/kernels/attention/test_sm70_triton_mtp_segmented_attention.py
+new file mode 100644
+index 0000000000..2778c70c37
+--- /dev/null
++++ b/tests/kernels/attention/test_sm70_triton_mtp_segmented_attention.py
+@@ -0,0 +1,1039 @@
++# SPDX-License-Identifier: Apache-2.0
++# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
++
++from __future__ import annotations
++
++from collections.abc import Callable
++from types import SimpleNamespace
++
++import pytest
++import torch
++
++from vllm.config import CUDAGraphMode
++from vllm.platforms import current_platform
++from vllm.v1.attention.backends.triton_attn import (
++    TritonAttentionMetadataBuilder,
++    _segment_scratch_token_capacity,
++)
++from vllm.v1.attention.ops.triton_unified_attention import (
++    MAX_PAR_SOFTMAX_SEGMENTS,
++    _can_use_3d_attention,
++    unified_attention,
++)
++from vllm.v1.kv_cache_interface import FullAttentionSpec, KVQuantMode
++
++ScratchTensors = tuple[torch.Tensor, torch.Tensor, torch.Tensor]
++
++
++def _make_scratch(
++    *,
++    rows: int,
++    query_heads: int = 8,
++    segments: int = 16,
++    head_size: int = 128,
++    device: str = "cpu",
++) -> ScratchTensors:
++    return (
++        torch.full(
++            (rows, query_heads, segments, head_size),
++            float("nan"),
++            dtype=torch.float32,
++            device=device,
++        ),
++        torch.full(
++            (rows, query_heads, segments),
++            float("nan"),
++            dtype=torch.float32,
++            device=device,
++        ),
++        torch.full(
++            (rows, query_heads, segments),
++            float("nan"),
++            dtype=torch.float32,
++            device=device,
++        ),
++    )
++
++
++def _make_guarded_scratch(
++    *,
++    rows: int,
++    query_heads: int = 8,
++    segments: int = 16,
++    head_size: int = 128,
++    device: str = "cuda",
++) -> tuple[
++    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
++    tuple[torch.Tensor, torch.Tensor, torch.Tensor],
++]:
++    backing = (
++        torch.full(
++            (rows + 2, query_heads, segments, head_size),
++            1234.0,
++            dtype=torch.float32,
++            device=device,
++        ),
++        torch.full(
++            (rows + 2, query_heads, segments),
++            1234.0,
++            dtype=torch.float32,
++            device=device,
++        ),
++        torch.full(
++            (rows + 2, query_heads, segments),
++            1234.0,
++            dtype=torch.float32,
++            device=device,
++        ),
++    )
++    scratch = tuple(tensor[1:-1] for tensor in backing)
++    for tensor in scratch:
++        tensor.fill_(float("nan"))
++    return scratch, backing
++
++
++def _dispatch_kwargs(
++    scratch: ScratchTensors,
++) -> dict[str, object]:
++    segm_output, segm_max, segm_expsum = scratch
++    return {
++        "max_seqlen_q": 3,
++        "num_query_tokens": 6,
++        "num_seqs": 2,
++        "num_query_heads": 8,
++        "head_size_padded": 128,
++        "query_device": torch.device("cpu"),
++        "seq_threshold_3d": 6,
++        "num_segments": 16,
++        "softmax_segm_output": segm_output,
++        "softmax_segm_max": segm_max,
++        "softmax_segm_expsum": segm_expsum,
++        "multi_query_supported": True,
++        "batch_invariant": False,
++    }
++
++
++@pytest.mark.parametrize(
++    (
++        "seq_threshold_3d",
++        "max_num_seqs",
++        "max_decode_query_len",
++        "multi_query_supported",
++        "expected",
++    ),
++    [
++        (2, 2, 3, True, 6),
++        (8, 2, 3, True, 8),
++        (8, 8, 3, True, 24),
++        (8, 8, 3, False, 8),
++    ],
++)
++def test_sm70_mtp_segment_scratch_capacity_uses_query_tokens(
++    seq_threshold_3d: int,
++    max_num_seqs: int,
++    max_decode_query_len: int,
++    multi_query_supported: bool,
++    expected: int,
++) -> None:
++    assert (
++        _segment_scratch_token_capacity(
++            seq_threshold_3d=seq_threshold_3d,
++            max_num_seqs=max_num_seqs,
++            max_decode_query_len=max_decode_query_len,
++            multi_query_supported=multi_query_supported,
++        )
++        == expected
++    )
++
++
++def test_sm70_mtp_metadata_builder_allocates_graph_q6_scratch_on_sm70_shape(
++    monkeypatch: pytest.MonkeyPatch,
++) -> None:
++    monkeypatch.setattr(
++        current_platform,
++        "is_device_capability",
++        lambda *_: True,
++    )
++    monkeypatch.setattr(
++        "vllm.v1.attention.backends.triton_attn.get_num_attention_heads_from_layers",
++        lambda *_: None,
++    )
++    model_config = SimpleNamespace(
++        get_num_attention_heads=lambda _: 8,
++        get_num_kv_heads=lambda _: 1,
++        get_head_size=lambda: 128,
++    )
++    vllm_config = SimpleNamespace(
++        model_config=model_config,
++        parallel_config=SimpleNamespace(),
++        compilation_config=SimpleNamespace(
++            cudagraph_mode=CUDAGraphMode.FULL,
++            cudagraph_capture_sizes=[3, 6],
++        ),
++        speculative_config=SimpleNamespace(
++            num_speculative_tokens=2,
++            draft_model_config=None,
++        ),
++        scheduler_config=SimpleNamespace(max_num_seqs=2),
++    )
++    builder = TritonAttentionMetadataBuilder(
++        FullAttentionSpec(
++            block_size=16,
++            num_kv_heads=1,
++            head_size=128,
++            dtype=torch.float16,
++        ),
++        ["layer"],
++        vllm_config,
++        torch.device("cpu"),
++    )
++
++    assert builder.softmax_segm_output.shape == (6, 8, 16, 128)
++    assert builder.softmax_segm_max.shape == (6, 8, 16)
++    assert builder.softmax_segm_expsum.shape == (6, 8, 16)
++    for scratch in (
++        builder.softmax_segm_output,
++        builder.softmax_segm_max,
++        builder.softmax_segm_expsum,
++    ):
++        assert scratch.dtype == torch.float32
++        assert scratch.is_contiguous()
++        assert scratch.device.type == "cpu"
++
++
++def test_sm70_mtp_segmented_dispatch_requires_token_sized_scratch() -> None:
++    assert _can_use_3d_attention(**_dispatch_kwargs(_make_scratch(rows=6)))
++
++    for undersized_index in range(3):
++        scratch = list(_make_scratch(rows=6))
++        scratch[undersized_index] = scratch[undersized_index][:5]
++        assert not _can_use_3d_attention(
++            **_dispatch_kwargs(tuple(scratch)),
++        )
++
++    malformed = list(_make_scratch(rows=6))
++    malformed[1] = torch.empty((6, 8, 17), dtype=torch.float32)
++    assert not _can_use_3d_attention(
++        **_dispatch_kwargs(tuple(malformed)),
++    )
++
++    noncontiguous = list(_make_scratch(rows=6))
++    noncontiguous[0] = torch.empty(
++        (6, 8, 16, 256),
++        dtype=torch.float32,
++    )[..., ::2]
++    assert not _can_use_3d_attention(
++        **_dispatch_kwargs(tuple(noncontiguous)),
++    )
++
++
++@pytest.mark.parametrize(
++    ("override", "expected"),
++    [
++        ({"max_seqlen_q": 0}, False),
++        ({"max_seqlen_q": 4}, True),
++        ({"max_seqlen_q": 5}, False),
++        ({"multi_query_supported": False}, False),
++        (
++            {
++                "max_seqlen_q": 1,
++                "multi_query_supported": False,
++            },
++            True,
++        ),
++        ({"num_seqs": 0}, False),
++        ({"seq_threshold_3d": 0}, False),
++        ({"num_seqs": 7}, False),
++        ({"batch_invariant": True}, False),
++    ],
++)
++def test_sm70_mtp_segmented_dispatch_boundaries(
++    override: dict[str, object],
++    expected: bool,
++) -> None:
++    kwargs = _dispatch_kwargs(_make_scratch(rows=6))
++    kwargs.update(override)
++    assert _can_use_3d_attention(**kwargs) is expected
++
++
++@pytest.mark.parametrize(
++    ("override", "scratch_mutator"),
++    [
++        ({"num_segments": 3}, None),
++        ({"num_segments": MAX_PAR_SOFTMAX_SEGMENTS * 2}, None),
++        ({}, lambda tensors: (tensors[0].half(), *tensors[1:])),
++        (
++            {},
++            lambda tensors: (
++                torch.empty((6, 8, 16, 256), dtype=torch.float32)[..., ::2],
++                *tensors[1:],
++            ),
++        ),
++    ],
++)
++def test_sm70_mtp_segmented_dispatch_rejects_unsafe_scratch(
++    override: dict[str, object],
++    scratch_mutator: Callable[[ScratchTensors], ScratchTensors] | None,
++) -> None:
++    scratch = _make_scratch(rows=6)
++    if scratch_mutator is not None:
++        scratch = scratch_mutator(scratch)
++    kwargs = _dispatch_kwargs(scratch)
++    kwargs.update(override)
++    assert not _can_use_3d_attention(**kwargs)
++
++
++def _require_sm70() -> None:
++    if not torch.cuda.is_available() or not current_platform.is_device_capability(70):
++        pytest.skip("SM70 CUDA device is required")
++
++
++def _run_attention(
++    *,
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    query_lens: list[int],
++    seq_lens: list[int],
++    block_table: torch.Tensor,
++    scratch: ScratchTensors,
++    block_m: int = 0,
++    enable_segmented: bool = True,
++) -> torch.Tensor:
++    cu_seqlens_q = torch.tensor(
++        [0, *query_lens],
++        dtype=torch.int32,
++        device=query.device,
++    ).cumsum(dim=0)
++    seq_lens_tensor = torch.tensor(
++        seq_lens,
++        dtype=torch.int32,
++        device=query.device,
++    )
++    output = torch.full_like(query, float("nan"))
++    unified_attention(
++        q=query,
++        k=key_cache,
++        v=value_cache,
++        out=output,
++        cu_seqlens_q=cu_seqlens_q,
++        max_seqlen_q=max(query_lens),
++        seqused_k=seq_lens_tensor,
++        max_seqlen_k=max(seq_lens),
++        softmax_scale=query.shape[-1] ** -0.5,
++        causal=True,
++        window_size=(-1, -1),
++        block_table=block_table,
++        softcap=0.0,
++        q_descale=None,
++        k_descale=None,
++        v_descale=None,
++        seq_threshold_3D=scratch[0].shape[0] if enable_segmented else 0,
++        num_par_softmax_segments=scratch[0].shape[2],
++        softmax_segm_output=scratch[0],
++        softmax_segm_max=scratch[1],
++        softmax_segm_expsum=scratch[2],
++        kv_quant_mode=KVQuantMode.NONE,
++        sm70_mtp_block_m=block_m,
++    )
++    return output
++
++
++def _make_random_paged_case(
++    *,
++    query_lens: list[int],
++    seq_lens: list[int],
++    seed: int,
++) -> tuple[
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor,
++    torch.Tensor,
++]:
++    block_size = 16
++    blocks_per_seq = [(seq_len + block_size - 1) // block_size for seq_len in seq_lens]
++    used_blocks = sum(blocks_per_seq)
++    generator = torch.Generator(device="cuda")
++    generator.manual_seed(seed)
++    query = torch.randn(
++        (sum(query_lens), 8, 128),
++        dtype=torch.float16,
++        device="cuda",
++        generator=generator,
++    )
++
++    # Leave two physical pages and all partial-block tails poisoned. A valid
++    # kernel must only load the shuffled pages and slots named by metadata.
++    physical_block_count = used_blocks + 2
++    key_cache = torch.full(
++        (physical_block_count, block_size, 1, 128),
++        float("nan"),
++        dtype=torch.float16,
++        device="cuda",
++    )
++    value_cache = torch.full_like(key_cache, float("nan"))
++    physical_pages = torch.randperm(
++        physical_block_count,
++        dtype=torch.int64,
++        device="cuda",
++        generator=generator,
++    )
++    block_table = (
++        physical_pages[-1]
++        .to(torch.int32)
++        .expand(len(seq_lens), max(blocks_per_seq) + 1)
++        .clone()
++    )
++    page_offset = 0
++    for seq_idx, (seq_len, block_count) in enumerate(zip(seq_lens, blocks_per_seq)):
++        pages = physical_pages[page_offset : page_offset + block_count]
++        key_cache[pages] = torch.randn(
++            (block_count, block_size, 1, 128),
++            dtype=torch.float16,
++            device="cuda",
++            generator=generator,
++        )
++        value_cache[pages] = torch.randn(
++            (block_count, block_size, 1, 128),
++            dtype=torch.float16,
++            device="cuda",
++            generator=generator,
++        )
++        block_table[seq_idx, :block_count] = pages.to(torch.int32)
++        valid_tail = seq_len % block_size
++        if valid_tail:
++            key_cache[pages[-1], valid_tail:] = float("nan")
++            value_cache[pages[-1], valid_tail:] = float("nan")
++        page_offset += block_count
++
++    return query, key_cache, value_cache, block_table
++
++
++def _fp32_reference(
++    *,
++    query: torch.Tensor,
++    key_cache: torch.Tensor,
++    value_cache: torch.Tensor,
++    block_table: torch.Tensor,
++    query_lens: list[int],
++    seq_lens: list[int],
++) -> torch.Tensor:
++    block_size = key_cache.shape[1]
++    outputs: list[torch.Tensor] = []
++    query_offset = 0
++    for seq_idx, (query_len, seq_len) in enumerate(zip(query_lens, seq_lens)):
++        if query_len == 0:
++            continue
++        block_count = (seq_len + block_size - 1) // block_size
++        pages = block_table[seq_idx, :block_count].long()
++        key = key_cache[pages].flatten(0, 1)[:seq_len].float()
++        value = value_cache[pages].flatten(0, 1)[:seq_len].float()
++        query_slice = query[query_offset : query_offset + query_len].float()
++        grouped_query = query_slice.view(query_len, 1, 8, 128).permute(1, 2, 0, 3)
++        score = torch.einsum("grqd,kgd->grqk", grouped_query, key)
++        score *= 128**-0.5
++        key_positions = torch.arange(seq_len, device=query.device)
++        query_positions = (
++            seq_len - query_len + torch.arange(query_len, device=query.device)
++        )
++        causal_mask = key_positions[None, :] > query_positions[:, None]
++        score.masked_fill_(causal_mask[None, None, :, :], float("-inf"))
++        probability = torch.softmax(score, dim=-1)
++        outputs.append(
++            torch.einsum(
++                "grqk,kgd->qgrd",
++                probability,
++                value,
++            ).reshape(query_len, 8, 128)
++        )
++        query_offset += query_len
++    return torch.cat(outputs)
++
++
++def _error_envelope(
++    actual: torch.Tensor,
++    expected: torch.Tensor,
++) -> tuple[float, float, float]:
++    error = (actual.float() - expected.float()).abs().flatten()
++    return (
++        float(error.max().item()),
++        float(torch.quantile(error, 0.99).item()),
++        float(error.mean().item()),
++    )
++
++
++def _assert_within_current_2d_envelope(
++    *,
++    candidate: torch.Tensor,
++    baseline: torch.Tensor,
++    reference: torch.Tensor,
++) -> None:
++    candidate_error = _error_envelope(candidate, reference)
++    baseline_error = _error_envelope(baseline, reference)
++    hard_limits = (3e-2, 1e-2, 3e-3)
++    floors = (1e-5, 1e-5, 1e-6)
++    for candidate_value, baseline_value, hard_limit, floor in zip(
++        candidate_error,
++        baseline_error,
++        hard_limits,
++        floors,
++    ):
++        assert candidate_value <= hard_limit
++        assert candidate_value <= max(baseline_value, floor)
++
++
++@pytest.mark.parametrize(
++    ("query_lens", "seq_lens", "seed", "expect_segmented"),
++    [
++        pytest.param([1], [1], 20260708, True, id="legacy-q1-context1"),
++        pytest.param([2], [15], 20260709, True, id="mtp1-context15"),
++        pytest.param([3], [16], 20260710, True, id="mtp2-context16"),
++        pytest.param([3], [4096], 20260711, True, id="mtp2-4k"),
++        pytest.param([1], [65536], 20260712, True, id="legacy-q1-64k"),
++        pytest.param([3], [65536], 20260713, True, id="mtp2-b1-64k-seed1"),
++        pytest.param([3], [65536], 20260714, True, id="mtp2-b1-64k-seed2"),
++        pytest.param(
++            [3, 3],
++            [65536, 65536],
++            20260715,
++            True,
++            id="mtp2-b2-64k-seed1",
++        ),
++        pytest.param(
++            [3, 3],
++            [65536, 65536],
++            20260716,
++            True,
++            id="mtp2-b2-64k-seed2",
++        ),
++        pytest.param(
++            [3, 2],
++            [64001, 65521],
++            20260717,
++            True,
++            id="mtp-ragged-tails",
++        ),
++        pytest.param(
++            [3, 3],
++            [32768, 65536],
++            20260718,
++            True,
++            id="mtp-ragged-resolver",
++        ),
++        pytest.param([5], [4096], 20260719, False, id="q5-fallback"),
++    ],
++)
++@torch.inference_mode()
++def test_sm70_mtp_random_paged_attention_matches_fp32_and_current_2d(
++    query_lens: list[int],
++    seq_lens: list[int],
++    seed: int,
++    expect_segmented: bool,
++) -> None:
++    _require_sm70()
++    query, key_cache, value_cache, block_table = _make_random_paged_case(
++        query_lens=query_lens,
++        seq_lens=seq_lens,
++        seed=seed,
++    )
++    rows = query.shape[0]
++    baseline_scratch = _make_scratch(rows=rows, device="cuda")
++    baseline = _run_attention(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        query_lens=query_lens,
++        seq_lens=seq_lens,
++        block_table=block_table,
++        scratch=baseline_scratch,
++        enable_segmented=False,
++    )
++    candidate_scratch = _make_scratch(rows=rows, device="cuda")
++    candidate = _run_attention(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        query_lens=query_lens,
++        seq_lens=seq_lens,
++        block_table=block_table,
++        scratch=candidate_scratch,
++    )
++    reference = _fp32_reference(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        block_table=block_table,
++        query_lens=query_lens,
++        seq_lens=seq_lens,
++    )
++
++    assert torch.isfinite(baseline).all()
++    assert torch.isfinite(candidate).all()
++    assert all(torch.isnan(tensor).all() for tensor in baseline_scratch)
++    if expect_segmented:
++        observed_rows = torch.isfinite(candidate_scratch[2]).any(dim=(1, 2))
++        assert observed_rows.all()
++    else:
++        assert all(torch.isnan(tensor).all() for tensor in candidate_scratch)
++    _assert_within_current_2d_envelope(
++        candidate=candidate,
++        baseline=baseline,
++        reference=reference,
++    )
++
++
++@torch.inference_mode()
++def test_sm70_mtp_shared_physical_prefix_matches_current_2d() -> None:
++    _require_sm70()
++    query_lens = [3, 3]
++    seq_lens = [4096, 4096]
++    query, key_cache, value_cache, block_table = _make_random_paged_case(
++        query_lens=query_lens,
++        seq_lens=seq_lens,
++        seed=20260723,
++    )
++    # Share half of the physical prefix while retaining independent tails.
++    block_table[1, :128] = block_table[0, :128]
++    baseline = _run_attention(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        query_lens=query_lens,
++        seq_lens=seq_lens,
++        block_table=block_table,
++        scratch=_make_scratch(rows=6, device="cuda"),
++        enable_segmented=False,
++    )
++    candidate_scratch = _make_scratch(rows=6, device="cuda")
++    candidate = _run_attention(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        query_lens=query_lens,
++        seq_lens=seq_lens,
++        block_table=block_table,
++        scratch=candidate_scratch,
++    )
++    reference = _fp32_reference(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        block_table=block_table,
++        query_lens=query_lens,
++        seq_lens=seq_lens,
++    )
++
++    for scratch_tensor in candidate_scratch:
++        assert torch.isfinite(scratch_tensor).all()
++    _assert_within_current_2d_envelope(
++        candidate=candidate,
++        baseline=baseline,
++        reference=reference,
++    )
++
++
++@pytest.mark.parametrize("seed", [20260719, 20260720])
++@torch.inference_mode()
++def test_sm70_mtp_block_m32_exact_64k_candidate_matches_current_2d(
++    seed: int,
++) -> None:
++    _require_sm70()
++    query_lens = [3]
++    seq_lens = [65521]
++    query, key_cache, value_cache, block_table = _make_random_paged_case(
++        query_lens=query_lens,
++        seq_lens=seq_lens,
++        seed=seed,
++    )
++    baseline = _run_attention(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        query_lens=query_lens,
++        seq_lens=seq_lens,
++        block_table=block_table,
++        scratch=_make_scratch(rows=3, device="cuda"),
++        enable_segmented=False,
++    )
++    candidate_scratch = _make_scratch(
++        rows=3,
++        segments=32,
++        device="cuda",
++    )
++    candidate = _run_attention(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        query_lens=query_lens,
++        seq_lens=seq_lens,
++        block_table=block_table,
++        scratch=candidate_scratch,
++        block_m=32,
++    )
++    reference = _fp32_reference(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        block_table=block_table,
++        query_lens=query_lens,
++        seq_lens=seq_lens,
++    )
++
++    assert torch.isfinite(candidate_scratch[2]).any()
++    _assert_within_current_2d_envelope(
++        candidate=candidate,
++        baseline=baseline,
++        reference=reference,
++    )
++
++
++@pytest.mark.parametrize("query_len", [2, 3, 4])
++@pytest.mark.parametrize("block_m", [0, 32])
++@torch.inference_mode()
++def test_sm70_mtp_empty_causal_segment_does_not_hide_valid_values(
++    query_len: int,
++    block_m: int,
++) -> None:
++    _require_sm70()
++    device = "cuda"
++    query = torch.full(
++        (query_len, 8, 128),
++        10.0,
++        dtype=torch.float16,
++        device=device,
++    )
++    key_cache = torch.full(
++        (2, 16, 1, 128),
++        -10.0,
++        dtype=torch.float16,
++        device=device,
++    )
++    value_cache = torch.ones_like(key_cache)
++    block_table = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
++    scratch = _make_scratch(rows=query_len, device=device)
++
++    output = _run_attention(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        query_lens=[query_len],
++        seq_lens=[17],
++        block_table=block_table,
++        scratch=scratch,
++        block_m=block_m,
++    )
++
++    torch.testing.assert_close(
++        output,
++        torch.ones_like(output),
++        atol=2e-3,
++        rtol=0,
++    )
++    assert torch.isfinite(scratch[2]).any()
++
++
++@torch.inference_mode()
++def test_sm70_mtp_segmented_scratch_guards_remain_unchanged() -> None:
++    _require_sm70()
++    device = "cuda"
++    query_len = 3
++    query = torch.randn(
++        (query_len, 8, 128),
++        dtype=torch.float16,
++        device=device,
++    )
++    key_cache = torch.randn((2, 16, 1, 128), dtype=torch.float16, device=device)
++    value_cache = torch.randn_like(key_cache)
++    block_table = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
++    scratch, backing = _make_guarded_scratch(rows=query_len, device=device)
++
++    output = _run_attention(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        query_lens=[query_len],
++        seq_lens=[17],
++        block_table=block_table,
++        scratch=scratch,
++    )
++
++    assert torch.isfinite(output).all()
++    assert torch.isfinite(scratch[2]).any()
++    for tensor in backing:
++        assert (tensor[0] == 1234.0).all()
++        assert (tensor[-1] == 1234.0).all()
++
++
++@torch.inference_mode()
++def test_sm70_mtp_segmented_reduction_zeros_graph_padding() -> None:
++    _require_sm70()
++    device = "cuda"
++    query = torch.randn((6, 8, 128), dtype=torch.float16, device=device)
++    key_cache = torch.randn((2, 16, 1, 128), dtype=torch.float16, device=device)
++    value_cache = torch.randn_like(key_cache)
++    block_table = torch.tensor(
++        [[0, 1], [0, 1]],
++        dtype=torch.int32,
++        device=device,
++    )
++    scratch = _make_scratch(rows=6, device=device)
++
++    output = _run_attention(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        query_lens=[3, 0],
++        seq_lens=[17, 0],
++        block_table=block_table,
++        scratch=scratch,
++    )
++
++    assert torch.isfinite(output[:3]).all()
++    assert torch.isfinite(scratch[2][:3]).any()
++    torch.testing.assert_close(
++        output[3:],
++        torch.zeros_like(output[3:]),
++        atol=0,
++        rtol=0,
++    )
++
++
++@torch.inference_mode()
++def test_sm70_mtp_segmented_cuda_graph_replay_q3() -> None:
++    _require_sm70()
++    device = "cuda"
++    query, key_cache, value_cache, block_table = _make_random_paged_case(
++        query_lens=[3],
++        seq_lens=[65521],
++        seed=20260721,
++    )
++    output = torch.empty_like(query)
++    seq_lens = torch.tensor([65521], dtype=torch.int32, device=device)
++    cu_seqlens_q = torch.tensor([0, 3], dtype=torch.int32, device=device)
++    scratch = _make_scratch(rows=3, device=device)
++
++    def launch() -> None:
++        unified_attention(
++            q=query,
++            k=key_cache,
++            v=value_cache,
++            out=output,
++            cu_seqlens_q=cu_seqlens_q,
++            max_seqlen_q=3,
++            seqused_k=seq_lens,
++            max_seqlen_k=65521,
++            softmax_scale=query.shape[-1] ** -0.5,
++            causal=True,
++            window_size=(-1, -1),
++            block_table=block_table,
++            softcap=0.0,
++            q_descale=None,
++            k_descale=None,
++            v_descale=None,
++            seq_threshold_3D=3,
++            num_par_softmax_segments=16,
++            softmax_segm_output=scratch[0],
++            softmax_segm_max=scratch[1],
++            softmax_segm_expsum=scratch[2],
++            kv_quant_mode=KVQuantMode.NONE,
++        )
++
++    launch()
++    torch.accelerator.synchronize()
++    stable_pointers = (
++        output.data_ptr(),
++        *(tensor.data_ptr() for tensor in scratch),
++    )
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        launch()
++
++    for _ in range(2):
++        query.normal_()
++        output.fill_(float("nan"))
++        for tensor in scratch:
++            tensor.fill_(float("nan"))
++        allocated_before_replay = torch.accelerator.memory_allocated()
++        graph.replay()
++        torch.accelerator.synchronize()
++        assert torch.accelerator.memory_allocated() == allocated_before_replay
++        graph_output = output.clone()
++        baseline = _run_attention(
++            query=query,
++            key_cache=key_cache,
++            value_cache=value_cache,
++            query_lens=[3],
++            seq_lens=[65521],
++            block_table=block_table,
++            scratch=_make_scratch(rows=3, device=device),
++            enable_segmented=False,
++        )
++        reference = _fp32_reference(
++            query=query,
++            key_cache=key_cache,
++            value_cache=value_cache,
++            block_table=block_table,
++            query_lens=[3],
++            seq_lens=[65521],
++        )
++        _assert_within_current_2d_envelope(
++            candidate=graph_output,
++            baseline=baseline,
++            reference=reference,
++        )
++        for scratch_tensor in scratch:
++            assert torch.isfinite(scratch_tensor).all()
++        assert stable_pointers == (
++            output.data_ptr(),
++            *(tensor.data_ptr() for tensor in scratch),
++        )
++
++
++@torch.inference_mode()
++def test_sm70_mtp_segmented_cuda_graph_replay_live_padding_live() -> None:
++    _require_sm70()
++    device = "cuda"
++    query, key_cache, value_cache, block_table = _make_random_paged_case(
++        query_lens=[3, 3],
++        seq_lens=[65521, 65536],
++        seed=20260722,
++    )
++    output = torch.empty_like(query)
++    block_table_a = block_table.clone()
++    block_table_b = block_table.flip(0).clone()
++    seq_lens = torch.tensor([65521, 0], dtype=torch.int32, device=device)
++    cu_seqlens_q = torch.tensor([0, 3, 3], dtype=torch.int32, device=device)
++    scratch = _make_scratch(rows=6, device=device)
++
++    def launch() -> None:
++        unified_attention(
++            q=query,
++            k=key_cache,
++            v=value_cache,
++            out=output,
++            cu_seqlens_q=cu_seqlens_q,
++            max_seqlen_q=3,
++            seqused_k=seq_lens,
++            max_seqlen_k=65536,
++            softmax_scale=query.shape[-1] ** -0.5,
++            causal=True,
++            window_size=(-1, -1),
++            block_table=block_table,
++            softcap=0.0,
++            q_descale=None,
++            k_descale=None,
++            v_descale=None,
++            seq_threshold_3D=6,
++            num_par_softmax_segments=16,
++            softmax_segm_output=scratch[0],
++            softmax_segm_max=scratch[1],
++            softmax_segm_expsum=scratch[2],
++            kv_quant_mode=KVQuantMode.NONE,
++        )
++
++    launch()
++    torch.accelerator.synchronize()
++    stable_pointers = (
++        output.data_ptr(),
++        *(tensor.data_ptr() for tensor in scratch),
++    )
++    graph = torch.cuda.CUDAGraph()
++    with torch.cuda.graph(graph):
++        launch()
++
++    replay_cases = (
++        ([65521, 0], [3, 0], block_table_a),
++        ([65536, 65521], [3, 3], block_table_b),
++        ([65521, 0], [3, 0], block_table_a),
++    )
++    for replay_seq_lens, replay_query_lens, replay_block_table in replay_cases:
++        replay_cu_q = [0]
++        for query_len in replay_query_lens:
++            replay_cu_q.append(replay_cu_q[-1] + query_len)
++        live_rows = replay_cu_q[-1]
++        seq_lens.copy_(torch.tensor(replay_seq_lens, dtype=torch.int32, device=device))
++        cu_seqlens_q.copy_(torch.tensor(replay_cu_q, dtype=torch.int32, device=device))
++        block_table.copy_(replay_block_table)
++        query.normal_()
++        output.fill_(float("nan"))
++        for tensor in scratch:
++            tensor.fill_(float("nan"))
++        allocated_before_replay = torch.accelerator.memory_allocated()
++        graph.replay()
++        torch.accelerator.synchronize()
++        assert torch.accelerator.memory_allocated() == allocated_before_replay
++
++        graph_output = output.clone()
++        baseline = _run_attention(
++            query=query,
++            key_cache=key_cache,
++            value_cache=value_cache,
++            query_lens=replay_query_lens,
++            seq_lens=replay_seq_lens,
++            block_table=block_table,
++            scratch=_make_scratch(rows=6, device=device),
++            enable_segmented=False,
++        )
++        reference = _fp32_reference(
++            query=query,
++            key_cache=key_cache,
++            value_cache=value_cache,
++            block_table=block_table,
++            query_lens=replay_query_lens,
++            seq_lens=replay_seq_lens,
++        )
++        _assert_within_current_2d_envelope(
++            candidate=graph_output[:live_rows],
++            baseline=baseline[:live_rows],
++            reference=reference,
++        )
++        torch.testing.assert_close(
++            graph_output[live_rows:],
++            torch.zeros_like(graph_output[live_rows:]),
++            atol=0,
++            rtol=0,
++        )
++        for scratch_tensor in scratch:
++            assert torch.isfinite(scratch_tensor[:live_rows]).all()
++            assert torch.isnan(scratch_tensor[live_rows:]).all()
++        assert stable_pointers == (
++            output.data_ptr(),
++            *(tensor.data_ptr() for tensor in scratch),
++        )
++
++
++@pytest.mark.parametrize(
++    ("query_len", "scratch_rows"),
++    [(3, 2), (5, 5)],
++)
++@torch.inference_mode()
++def test_sm70_mtp_unsupported_shape_falls_back_without_scratch(
++    query_len: int,
++    scratch_rows: int,
++) -> None:
++    _require_sm70()
++    device = "cuda"
++    query = torch.randn(
++        (query_len, 8, 128),
++        dtype=torch.float16,
++        device=device,
++    )
++    key_cache = torch.randn((2, 16, 1, 128), dtype=torch.float16, device=device)
++    value_cache = torch.randn_like(key_cache)
++    block_table = torch.tensor([[0, 1]], dtype=torch.int32, device=device)
++    scratch = _make_scratch(rows=scratch_rows, device=device)
++    for tensor in scratch:
++        tensor.fill_(float("nan"))
++
++    output = _run_attention(
++        query=query,
++        key_cache=key_cache,
++        value_cache=value_cache,
++        query_lens=[query_len],
++        seq_lens=[17],
++        block_table=block_table,
++        scratch=scratch,
++    )
++
++    assert torch.isfinite(output).all()
++    assert all(torch.isnan(tensor).all() for tensor in scratch)
+diff --git a/tests/kernels/attention/test_triton_unified_attention.py b/tests/kernels/attention/test_triton_unified_attention.py
+index 6440ba3156..b42fc9d6f5 100644
+--- a/tests/kernels/attention/test_triton_unified_attention.py
++++ b/tests/kernels/attention/test_triton_unified_attention.py
+@@ -54,22 +54,21 @@ def ref_paged_attn(
+     for i in range(num_seqs):
+         query_len = query_lens[i]
+         kv_len = kv_lens[i]
+-        q = query[start_idx : start_idx + query_len]
+-        q *= scale
++        q = query[start_idx : start_idx + query_len].float() * scale
+ 
+         num_kv_blocks = (kv_len + block_size - 1) // block_size
+         block_indices = block_tables[i, :num_kv_blocks]
+ 
+         k = key_cache[block_indices].view(-1, num_kv_heads, head_size)
+-        k = k[:kv_len]
++        k = k[:kv_len].float()
+         v = value_cache[block_indices].view(-1, num_kv_heads, head_size)
+-        v = v[:kv_len]
++        v = v[:kv_len].float()
+ 
+         if q.shape[1] != k.shape[1]:
+             k = torch.repeat_interleave(k, q.shape[1] // k.shape[1], dim=1)
+             v = torch.repeat_interleave(v, q.shape[1] // v.shape[1], dim=1)
+-        attn = torch.einsum("qhd,khd->hqk", q, k).float()
+-        empty_mask = torch.ones(query_len, kv_len)
++        attn = torch.einsum("qhd,khd->hqk", q, k)
++        empty_mask = torch.ones(query_len, kv_len, device=query.device)
+         mask = torch.triu(empty_mask, diagonal=kv_len - query_len + 1).bool()
+         if sliding_window is not None:
+             sliding_window_mask = (
+@@ -83,7 +82,7 @@ def ref_paged_attn(
+         if soft_cap is not None and soft_cap > 0:
+             attn = soft_cap * torch.tanh(attn / soft_cap)
+         attn.masked_fill_(mask, float("-inf"))
+-        attn = torch.softmax(attn, dim=-1).to(v.dtype)
++        attn = torch.softmax(attn, dim=-1)
+         out = torch.einsum("hqk,khd->qhd", attn, v)
+ 
+         outputs.append(out)
+@@ -224,8 +223,13 @@ def test_triton_unified_attn(
+     if q_dtype is not None:
+         atol, rtol = 1.5e-1, 1.5e-1
+     (
+-        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
+-        f"{torch.max(torch.abs(output - ref_output))}",
++        torch.testing.assert_close(
++            output.float(),
++            ref_output,
++            atol=atol,
++            rtol=rtol,
++        ),
++        f"{torch.max(torch.abs(output.float() - ref_output))}",
+     )
+ 
+ 
+@@ -341,8 +345,13 @@ def test_triton_unified_attn_bf16_query_fp8_kv(
+ 
+     atol, rtol = 1.5e-1, 1.5e-1
+     (
+-        torch.testing.assert_close(output, ref_output, atol=atol, rtol=rtol),
+-        f"{torch.max(torch.abs(output - ref_output))}",
++        torch.testing.assert_close(
++            output.float(),
++            ref_output,
++            atol=atol,
++            rtol=rtol,
++        ),
++        f"{torch.max(torch.abs(output.float() - ref_output))}",
+     )
+ 
+ 
+@@ -460,13 +469,17 @@ def test_triton_unified_attn_fp16_input_fp8_output(
+         soft_cap=soft_cap,
+     )
+ 
+-    output_fp16 = output.to(torch.float32) * output_scale.item()
+-    output_fp16 = output_fp16.to(torch.float16)
++    output_dequantized = output.to(torch.float32) * output_scale.item()
+ 
+     atol, rtol = 2e-1, 2e-1
+     (
+-        torch.testing.assert_close(output_fp16, ref_output, atol=atol, rtol=rtol),
+-        f"{torch.max(torch.abs(output_fp16 - ref_output))}",
++        torch.testing.assert_close(
++            output_dequantized,
++            ref_output,
++            atol=atol,
++            rtol=rtol,
++        ),
++        f"{torch.max(torch.abs(output_dequantized - ref_output))}",
+     )
+ 
+ 
+@@ -576,7 +589,12 @@ def _run_use_td_case(
+         sliding_window=sliding_window,
+         soft_cap=soft_cap,
+     )
+-    torch.testing.assert_close(output, ref_output, atol=1.5e-2, rtol=1e-2)
++    torch.testing.assert_close(
++        output.float(),
++        ref_output,
++        atol=1.5e-2,
++        rtol=1e-2,
++    )
+ 
+ 
+ @pytest.mark.parametrize(
+diff --git a/vllm/v1/attention/backends/triton_attn.py b/vllm/v1/attention/backends/triton_attn.py
+index 75e6b41dc6..e20651bdf9 100644
+--- a/vllm/v1/attention/backends/triton_attn.py
++++ b/vllm/v1/attention/backends/triton_attn.py
+@@ -57,6 +57,22 @@ MIN_LAUNCH_GRID_SIZE_2D = 128  # Minimum launch grid size of 2D kernel
+ NUM_PAR_SOFTMAX_SEGMENTS = 16  # Number of parallel tiled softmax segments
+ 
+ 
++def _segment_scratch_token_capacity(
++    *,
++    seq_threshold_3d: int,
++    max_num_seqs: int,
++    max_decode_query_len: int,
++    multi_query_supported: bool,
++) -> int:
++    if not multi_query_supported:
++        return seq_threshold_3d
++    max_segmented_seqs = min(max_num_seqs, seq_threshold_3d)
++    return max(
++        seq_threshold_3d,
++        max_segmented_seqs * max_decode_query_len,
++    )
++
++
+ def _sm70_fp8_kv_needs_cpp_cache_update(
+     kv_cache_dtype: str,
+     key: torch.Tensor,
+@@ -194,10 +210,31 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+             )
+ 
+         self.num_par_softmax_segments = NUM_PAR_SOFTMAX_SEGMENTS
++        spec_config = getattr(self.vllm_config, "speculative_config", None)
++        num_speculative_tokens = (
++            int(spec_config.num_speculative_tokens or 0)
++            if spec_config is not None
++            else 0
++        )
++        max_decode_query_len = 1 + num_speculative_tokens
++        is_sm70_hy3_attention_shape = (
++            current_platform.is_device_capability(70)
++            and self.num_heads_q == 8
++            and self.num_heads_kv == 1
++            and self.headdim == 128
++            and 1 < max_decode_query_len <= 4
++        )
++        segm_token_capacity = _segment_scratch_token_capacity(
++            seq_threshold_3d=self.seq_threshold_3D,
++            max_num_seqs=int(self.vllm_config.scheduler_config.max_num_seqs),
++            max_decode_query_len=max_decode_query_len,
++            multi_query_supported=is_sm70_hy3_attention_shape,
++        )
++
+         headdim_padded = next_power_of_2(self.headdim)
+         self.softmax_segm_output = torch.empty(
+             (
+-                self.seq_threshold_3D,
++                segm_token_capacity,
+                 self.num_heads_q,
+                 self.num_par_softmax_segments,
+                 headdim_padded,
+@@ -206,16 +243,15 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+             device=device,
+         )
+         self.softmax_segm_max = torch.empty(
+-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
++            (segm_token_capacity, self.num_heads_q, self.num_par_softmax_segments),
+             dtype=torch.float32,
+             device=device,
+         )
+         self.softmax_segm_expsum = torch.empty(
+-            (self.seq_threshold_3D, self.num_heads_q, self.num_par_softmax_segments),
++            (segm_token_capacity, self.num_heads_q, self.num_par_softmax_segments),
+             dtype=torch.float32,
+             device=device,
+         )
+-        spec_config = getattr(self.vllm_config, "speculative_config", None)
+         self._is_speculative_draft_model = (
+             spec_config is not None
+             and getattr(spec_config, "draft_model_config", None)
+@@ -256,14 +292,12 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+ 
+         if self._draft_buffer_shape is not None:
+             old_reqs, old_block_cols, old_tokens = self._draft_buffer_shape
+-            if (
++            return (
+                 required_reqs <= old_reqs
+                 and block_cols == old_block_cols
+                 and required_tokens <= old_tokens
+                 and self._draft_slot_mapping_dtype == slot_dtype
+-            ):
+-                return True
+-            return False
++            )
+ 
+         self._draft_block_table = torch.empty(
+             (req_capacity, block_cols),
+@@ -344,9 +378,7 @@ class TritonAttentionMetadataBuilder(AttentionMetadataBuilder[TritonAttentionMet
+ 
+         attn_metadata.block_table = self._draft_block_table[:num_reqs]
+         attn_metadata.seq_lens = self._draft_seq_lens[:num_reqs]
+-        attn_metadata.query_start_loc = self._draft_query_start_loc[
+-            : num_reqs + 1
+-        ]
++        attn_metadata.query_start_loc = self._draft_query_start_loc[: num_reqs + 1]
+         attn_metadata.slot_mapping = self._draft_slot_mapping[:num_tokens]
+ 
+     def build_for_cudagraph_capture(
+diff --git a/vllm/v1/attention/ops/triton_unified_attention.py b/vllm/v1/attention/ops/triton_unified_attention.py
+index ef5b256eb6..b976db492c 100644
+--- a/vllm/v1/attention/ops/triton_unified_attention.py
++++ b/vllm/v1/attention/ops/triton_unified_attention.py
+@@ -34,6 +34,9 @@ logger = init_logger(__name__)
+ is_batch_invariant = envs.VLLM_BATCH_INVARIANT
+ float8_info = torch.finfo(current_platform.fp8_dtype())
+ 
++SM70_MAX_SEGMENTED_QUERY_LEN = 4
++MAX_PAR_SOFTMAX_SEGMENTS = 128
++
+ 
+ @triton.jit
+ def _cast_kv_tile(data, Q, tensor_scale, KV_QUANT_MODE: tl.constexpr):
+@@ -558,9 +561,7 @@ def kernel_unified_attention(
+             if PV_INPUT_PRECISION == "":
+                 acc += tl.dot(P.to(V.dtype), V)
+             else:
+-                acc += tl.dot(
+-                    P.to(V.dtype), V, input_precision=PV_INPUT_PRECISION
+-                )
++                acc += tl.dot(P.to(V.dtype), V, input_precision=PV_INPUT_PRECISION)
+ 
+     # ---- Epilogue ---------------------------------------------------------
+     if IS_3D:
+@@ -687,6 +688,17 @@ def reduce_segments(
+     query_token_idx = tl.program_id(0)
+     query_head_idx = tl.program_id(1)
+ 
++    num_query_tokens = tl.load(query_start_len_ptr + num_seqs)
++    if query_token_idx >= num_query_tokens:
++        output_offset = (
++            query_token_idx * output_stride_0
++            + query_head_idx * output_stride_1
++            + tl.arange(0, HEAD_SIZE_PADDED)
++        )
++        dim_mask = tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE
++        tl.store(output_ptr + output_offset, 0.0, mask=dim_mask)
++        return
++
+     seq_idx = find_seq_idx(
+         query_start_len_ptr, query_token_idx, num_seqs, BLOCK_Q, False
+     )
+@@ -705,18 +717,31 @@ def reduce_segments(
+     )
+     dim_mask = tl.where(tl.arange(0, HEAD_SIZE_PADDED) < HEAD_SIZE, 1, 0).to(tl.int1)
+ 
+-    # load segment maxima
++    # Empty causal segments have expsum=0. Their running maximum may have
++    # been normalized to zero by ``softmax_step`` to avoid NaNs inside the
++    # online update, so exclude them before finding the cross-segment max.
+     segm_offset = (
+         query_token_idx.to(tl.int64) * (num_query_heads * NUM_SEGMENTS_PER_SEQ)
+         + query_head_idx * NUM_SEGMENTS_PER_SEQ
+         + tl.arange(0, NUM_SEGMENTS_PER_SEQ)
+     )
+-    segm_max = tl.load(segm_max_ptr + segm_offset, mask=segm_mask, other=float("-inf"))
++    segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
++    nonempty_segm_mask = segm_mask & (segm_expsum > 0.0)
++    segm_max = tl.load(
++        segm_max_ptr + segm_offset,
++        mask=nonempty_segm_mask,
++        other=float("-inf"),
++    )
+     overall_max = tl.max(segm_max)
++    safe_overall_max = tl.where(overall_max > float("-inf"), overall_max, 0.0)
+ 
+     # load and rescale segment exp sums
+-    segm_expsum = tl.load(segm_expsum_ptr + segm_offset, mask=segm_mask, other=0.0)
+-    segm_expsum = segm_expsum * tl.exp(segm_max - overall_max)
++    segm_scale = tl.where(
++        nonempty_segm_mask,
++        tl.exp(segm_max - safe_overall_max),
++        0.0,
++    )
++    segm_expsum = segm_expsum * segm_scale
+     overall_expsum = tl.sum(segm_expsum)
+ 
+     # load, rescale, and add segment attention outputs
+@@ -732,7 +757,7 @@ def reduce_segments(
+         mask=segm_mask[:, None] & dim_mask[None, :],
+         other=0.0,
+     )
+-    segm_output *= tl.exp(segm_max - overall_max)[:, None]
++    segm_output *= segm_scale[:, None]
+     acc_sum = tl.sum(segm_output, axis=0)
+     # safely divide by overall_expsum, returning 0.0 if overall_expsum is 0
+     acc = tl.where(overall_expsum == 0.0, 0.0, acc_sum / overall_expsum)
+@@ -802,6 +827,93 @@ def _validate_sm70_triton_attn_input_precision(value: str | None, name: str) ->
+     return value
+ 
+ 
++def _can_use_3d_attention(
++    *,
++    max_seqlen_q: int,
++    num_query_tokens: int,
++    num_seqs: int,
++    num_query_heads: int,
++    head_size_padded: int,
++    query_device: torch.device,
++    seq_threshold_3d: int | None,
++    num_segments: int | None,
++    softmax_segm_output: torch.Tensor | None,
++    softmax_segm_max: torch.Tensor | None,
++    softmax_segm_expsum: torch.Tensor | None,
++    multi_query_supported: bool,
++    batch_invariant: bool,
++) -> bool:
++    """Return whether segmented attention is safe for this launch.
++
++    Segment scratch is indexed by flattened query token, not request. Check
++    every physical scratch dimension so a padded or speculative batch cannot
++    turn the 3D dispatch decision into an out-of-bounds write.
++    """
++    if (
++        seq_threshold_3d is None
++        or num_segments is None
++        or softmax_segm_output is None
++        or softmax_segm_max is None
++        or softmax_segm_expsum is None
++        or max_seqlen_q <= 0
++        or num_query_tokens <= 0
++        or num_seqs <= 0
++        or seq_threshold_3d <= 0
++        or num_seqs > seq_threshold_3d
++        or num_segments <= 0
++        or num_segments > MAX_PAR_SOFTMAX_SEGMENTS
++        or num_segments & (num_segments - 1) != 0
++        or batch_invariant
++    ):
++        return False
++
++    scratch_tensors = (
++        softmax_segm_output,
++        softmax_segm_max,
++        softmax_segm_expsum,
++    )
++    if any(
++        scratch.dtype != torch.float32
++        or scratch.device != query_device
++        or not scratch.is_contiguous()
++        for scratch in scratch_tensors
++    ):
++        return False
++
++    supports_query_len = max_seqlen_q <= 1 or (
++        multi_query_supported and max_seqlen_q <= SM70_MAX_SEGMENTED_QUERY_LEN
++    )
++    if not supports_query_len:
++        return False
++
++    required_output_shape = (
++        num_query_tokens,
++        num_query_heads,
++        num_segments,
++        head_size_padded,
++    )
++    required_scalar_shape = (
++        num_query_tokens,
++        num_query_heads,
++        num_segments,
++    )
++
++    def shape_covers(actual: torch.Size, required: tuple[int, ...]) -> bool:
++        return (
++            len(actual) == len(required)
++            and actual[0] >= required[0]
++            and tuple(actual[1:]) == required[1:]
++        )
++
++    return shape_covers(
++        softmax_segm_output.shape,
++        required_output_shape,
++    ) and all(
++        shape_covers(scratch.shape, required_scalar_shape)
++        for scratch in (softmax_segm_max, softmax_segm_expsum)
++    )
++
++
+ def unified_attention(
+     q,
+     k,
+@@ -843,6 +955,9 @@ def unified_attention(
+     # The non-TD branch is dead-code-eliminated at Triton compile time so
+     # disabling this flag costs nothing.
+     use_td: bool = False,
++    # Exact-shape development knob for the SM70 q<=4 GQA fusion campaign.
++    # Zero preserves production policy; 32 covers all q=3 rows in one block.
++    sm70_mtp_block_m: int = 0,
+ ):
+     assert causal, "Only causal attention is supported"
+     if sinks is not None:
+@@ -877,10 +992,31 @@ def unified_attention(
+     num_kv_heads = k.shape[2]
+     num_queries_per_kv = num_query_heads // num_kv_heads
+     head_size = q.shape[2]
++    is_sm70 = current_platform.is_device_capability(70)
+ 
+     BLOCK_M = (
+         16 if num_queries_per_kv <= 16 else triton.next_power_of_2(num_queries_per_kv)
+     )
++    if sm70_mtp_block_m not in (0, 16, 32):
++        raise ValueError("sm70_mtp_block_m must be one of 0, 16, or 32")
++    if sm70_mtp_block_m:
++        supports_sm70_mtp_block_m = (
++            is_sm70
++            and 1 < max_seqlen_q <= SM70_MAX_SEGMENTED_QUERY_LEN
++            and num_query_heads == 8
++            and num_kv_heads == 1
++            and head_size == 128
++            and block_size == 16
++            and q.dtype == torch.float16
++            and k.dtype == torch.float16
++            and v.dtype == torch.float16
++        )
++        if not supports_sm70_mtp_block_m:
++            raise ValueError(
++                "sm70_mtp_block_m is restricted to the SM70 FP16 "
++                "Hq/Hkv/D=8/1/128 q=2..4 path"
++            )
++        BLOCK_M = sm70_mtp_block_m
+     BLOCK_Q = BLOCK_M // num_queries_per_kv
+ 
+     # Ideally we would launch with kernel with:
+@@ -916,16 +1052,12 @@ def unified_attention(
+     sm70_safe_defaults = False
+     sm70_qk_input_precision = ""
+     sm70_pv_input_precision = ""
+-    if current_platform.is_device_capability(70):
++    if is_sm70:
+         sm70_prefill_tile_size = envs.VLLM_SM70_TRITON_ATTN_PREFILL_TILE_SIZE
+         sm70_decode_tile_size = envs.VLLM_SM70_TRITON_ATTN_DECODE_TILE_SIZE
+         sm70_num_warps = envs.VLLM_SM70_TRITON_ATTN_NUM_WARPS
+-        sm70_prefill_num_warps = (
+-            envs.VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS
+-        )
+-        sm70_decode_num_warps = (
+-            envs.VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS
+-        )
++        sm70_prefill_num_warps = envs.VLLM_SM70_TRITON_ATTN_PREFILL_NUM_WARPS
++        sm70_decode_num_warps = envs.VLLM_SM70_TRITON_ATTN_DECODE_NUM_WARPS
+         sm70_safe_defaults = envs.VLLM_SM70_TRITON_ATTN_SAFE_DEFAULTS
+         sm70_qk_input_precision = _validate_sm70_triton_attn_input_precision(
+             envs.VLLM_SM70_TRITON_ATTN_QK_INPUT_PRECISION,
+@@ -1027,20 +1159,43 @@ def unified_attention(
+             f"(out.stride(1) = {out.stride(1)} != head_size = {head_size})."
+         )
+ 
+-    # Launch the 2D kernel if
+-    # 1. No intermediate tiled softmax buffers for the 3D kernel have been allocated, or
+-    # 2. The batch includes at least one prefill request, or
+-    # 3. The number of sequences exceeds the configured threshold, or
+-    # 4. Batch invariance is enabled
+-    use_3d = not (
+-        seq_threshold_3D is None
+-        or num_par_softmax_segments is None
+-        or softmax_segm_output is None
+-        or softmax_segm_max is None
+-        or softmax_segm_expsum is None
+-        or max_seqlen_q > 1
+-        or num_seqs > seq_threshold_3D
+-        or is_batch_invariant
++    # Use segmented attention only when the platform supports this query
++    # shape and every scratch dimension covers the flattened query tokens.
++    # Unsupported shapes, large batches, and batch-invariant mode retain the
++    # established 2D path.
++    use_3d = _can_use_3d_attention(
++        max_seqlen_q=max_seqlen_q,
++        num_query_tokens=q.shape[0],
++        num_seqs=num_seqs,
++        num_query_heads=num_query_heads,
++        head_size_padded=head_size_padded,
++        query_device=q.device,
++        seq_threshold_3d=seq_threshold_3D,
++        num_segments=num_par_softmax_segments,
++        softmax_segm_output=softmax_segm_output,
++        softmax_segm_max=softmax_segm_max,
++        softmax_segm_expsum=softmax_segm_expsum,
++        multi_query_supported=(
++            is_sm70
++            and num_query_heads == 8
++            and num_kv_heads == 1
++            and head_size == 128
++            and block_size == 16
++            and q.dtype == torch.float16
++            and k.dtype == torch.float16
++            and v.dtype == torch.float16
++            and kv_quant_mode == KVQuantMode.NONE
++            and output_scale is None
++            and not use_alibi_slopes
++            and not use_qq_bias
++            and softcap <= 0
++            and sinks is None
++            and not use_mm_prefix
++            and sliding_window_val == 0
++            and chunk_lookback == -1
++            and not use_td
++        ),
++        batch_invariant=is_batch_invariant,
+     )
+ 
+     # The kernel signature is the same for 2D and 3D — only the launch
+@@ -1077,8 +1232,9 @@ def unified_attention(
+         tile_size = TILE_SIZE_DECODE
+ 
+     launch_kwargs: dict[str, Any] = {}
++    use_sm70_decode_schedule = use_3d or max_seqlen_q <= 1
+     sm70_launch_num_warps = (
+-        sm70_decode_num_warps if max_seqlen_q <= 1 else sm70_prefill_num_warps
++        sm70_decode_num_warps if use_sm70_decode_schedule else sm70_prefill_num_warps
+     )
+     if sm70_launch_num_warps:
+         launch_kwargs["num_warps"] = sm70_launch_num_warps

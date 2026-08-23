@@ -1,0 +1,36 @@
+commit 91e94afbf111aa76e5e7a552bf5df603f7acb124
+Author:     dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+AuthorDate: Mon Jun 15 02:39:13 2026 +0000
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Jun 15 02:39:13 2026 +0000
+
+    Bump inflect from 5.6.2 to 7.5.0
+    
+    Bumps [inflect](https://github.com/jaraco/inflect) from 5.6.2 to 7.5.0.
+    - [Release notes](https://github.com/jaraco/inflect/releases)
+    - [Changelog](https://github.com/jaraco/inflect/blob/main/NEWS.rst)
+    - [Commits](https://github.com/jaraco/inflect/compare/v5.6.2...v7.5.0)
+    
+    ---
+    updated-dependencies:
+    - dependency-name: inflect
+      dependency-version: 7.5.0
+      dependency-type: direct:production
+      update-type: version-update:semver-major
+    ...
+    
+    Signed-off-by: dependabot[bot] <support@github.com>
+
+diff --git a/requirements/test/cuda.txt b/requirements/test/cuda.txt
+index 245a86f93b..1b29796405 100644
+--- a/requirements/test/cuda.txt
++++ b/requirements/test/cuda.txt
+@@ -327,7 +327,7 @@ imageio==2.37.0
+     # via scikit-image
+ importlib-metadata==8.7.0
+     # via opentelemetry-api
+-inflect==5.6.2
++inflect==7.5.0
+     # via datamodel-code-generator
+ iniconfig==2.0.0
+     # via pytest

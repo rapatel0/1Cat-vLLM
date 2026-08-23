@@ -1,0 +1,375 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+from __future__ import annotations
+
+import pytest
+import torch
+
+
+def _make_sequential_cache(
+    *,
+    seq_len: int,
+    block_size: int,
+    num_kv_heads: int,
+    head_dim: int,
+    dtype: torch.dtype,
+    device: str,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    num_blocks = (seq_len + block_size - 1) // block_size
+    key_cache = torch.randn(
+        num_blocks,
+        block_size,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    value_cache = torch.randn_like(key_cache)
+    block_table = torch.arange(num_blocks, dtype=torch.int32, device=device).view(1, -1)
+    return key_cache, value_cache, block_table
+
+
+def _fp32_q3_reference(
+    q: torch.Tensor,
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    softmax_scale: float,
+) -> torch.Tensor:
+    batch_size, query_len, num_heads, head_dim = q.shape
+    block_size = key_cache.shape[1]
+    result = torch.empty_like(q, dtype=torch.float32)
+    for batch_idx in range(batch_size):
+        seq_len = int(seq_lens[batch_idx].item())
+        num_blocks = (seq_len + block_size - 1) // block_size
+        physical_blocks = block_table[batch_idx, :num_blocks].long()
+        keys = key_cache[physical_blocks, :, 0].reshape(-1, head_dim)[:seq_len]
+        values = value_cache[physical_blocks, :, 0].reshape(-1, head_dim)[:seq_len]
+        keys_fp32 = keys.float()
+        values_fp32 = values.float()
+        for query_idx in range(query_len):
+            visible_tokens = seq_len - (query_len - 1 - query_idx)
+            scores = torch.matmul(
+                q[batch_idx, query_idx].float(),
+                keys_fp32[:visible_tokens].T,
+            )
+            probabilities = torch.softmax(scores * softmax_scale, dim=-1)
+            result[batch_idx, query_idx] = torch.matmul(
+                probabilities,
+                values_fp32[:visible_tokens],
+            )
+    assert result.shape == (batch_size, query_len, num_heads, head_dim)
+    return result
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("query_len", [5, 16])
+@pytest.mark.parametrize("seq_len", [4097])
+@torch.inference_mode()
+def test_flash_v100_mtp_smallq_decode_matches_causal_prefill(
+    query_len: int,
+    seq_len: int,
+) -> None:
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("FlashAttention-V100 regression is SM70/V100 only")
+
+    flash_attn_v100 = pytest.importorskip("flash_attn_v100")
+    torch.manual_seed(1234)
+    device = "cuda"
+    dtype = torch.float16
+    block_size = 16
+    num_heads = 8
+    num_kv_heads = 1
+    head_dim = 256
+    scale = head_dim**-0.5
+
+    key_cache, value_cache, block_table = _make_sequential_cache(
+        seq_len=seq_len,
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_dim=head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    query = torch.randn(
+        query_len,
+        num_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device=device)
+
+    prefill_out = flash_attn_v100.flash_attn_prefill_paged(
+        query.unsqueeze(0),
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        softmax_scale=scale,
+        kv_cache_dtype="auto",
+        k_scale=1.0,
+        v_scale=1.0,
+        causal=True,
+    )[0]
+
+    # This is the same transformation used by Flash-V100 small-query MTP
+    # verification: each causal query row becomes an independent decode row
+    # whose visible KV length increases by one.
+    decode_block_table = block_table.repeat(query_len, 1).contiguous()
+    decode_seq_lens = torch.arange(
+        seq_len - query_len + 1,
+        seq_len + 1,
+        dtype=torch.int32,
+        device=device,
+    )
+    smallq_out = flash_attn_v100.flash_attn_decode_paged(
+        query,
+        key_cache,
+        value_cache,
+        decode_block_table,
+        decode_seq_lens,
+        softmax_scale=scale,
+        kv_cache_dtype="auto",
+        k_scale=1.0,
+        v_scale=1.0,
+        window_size=(-1, -1),
+        max_seq_len_hint=seq_len,
+        workspace_seq_capacity_hint=seq_len,
+    )
+
+    torch.accelerator.synchronize()
+    max_diff = (smallq_out - prefill_out).abs().max().item()
+    assert max_diff <= 1.5e-2
+    torch.testing.assert_close(smallq_out, prefill_out, atol=1.5e-2, rtol=1e-2)
+
+
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="CUDA is required")
+@pytest.mark.parametrize("partition_size", [512, 1024])
+@pytest.mark.parametrize("batch_size", [1, 2])
+@torch.inference_mode()
+def test_flash_v100_q3_d128_xqa_matches_fp32_and_causal_prefill(
+    partition_size: int,
+    batch_size: int,
+) -> None:
+    if torch.cuda.get_device_capability() != (7, 0):
+        pytest.skip("FlashAttention-V100 regression is SM70/V100 only")
+
+    flash_attn_v100 = pytest.importorskip("flash_attn_v100.flash_attn_interface")
+    if not flash_attn_v100.flash_attn_decode_paged_xqa_q3_d128_available():
+        pytest.skip("flash_attn_v100 extension lacks q3 D128 XQA decode")
+
+    torch.manual_seed(20260718)
+    device = "cuda"
+    dtype = torch.float16
+    query_len = 3
+    num_heads = 8
+    num_kv_heads = 1
+    head_dim = 128
+    block_size = 16
+    scale = head_dim**-0.5
+    if batch_size == 1 and partition_size == 1024:
+        seq_lens_list = [65536]
+    else:
+        seq_lens_list = [4097] if batch_size == 1 else [4097, 4081]
+    max_seq_len = max(seq_lens_list)
+    max_num_blocks = (max_seq_len + block_size - 1) // block_size
+    num_physical_blocks = batch_size * max_num_blocks
+
+    key_cache = torch.randn(
+        num_physical_blocks,
+        block_size,
+        num_kv_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    value_cache = torch.randn_like(key_cache)
+    physical_order = torch.randperm(
+        num_physical_blocks,
+        dtype=torch.int64,
+        device=device,
+    )
+    block_table = physical_order.to(torch.int32).view(
+        batch_size,
+        max_num_blocks,
+    )
+    seq_lens = torch.tensor(seq_lens_list, dtype=torch.int32, device=device)
+    query = torch.randn(
+        batch_size,
+        query_len,
+        num_heads,
+        head_dim,
+        dtype=dtype,
+        device=device,
+    )
+    out = torch.empty_like(query)
+    num_partitions = (
+        max_num_blocks * block_size + partition_size - 1
+    ) // partition_size
+    tmp_out = torch.empty(
+        batch_size,
+        query_len,
+        num_heads,
+        num_partitions,
+        head_dim,
+        dtype=torch.float32,
+        device=device,
+    )
+    max_logits = torch.empty(
+        batch_size,
+        query_len,
+        num_heads,
+        num_partitions,
+        dtype=torch.float32,
+        device=device,
+    )
+    exp_sums = torch.empty_like(max_logits)
+
+    actual = flash_attn_v100.flash_attn_decode_paged_xqa_q3_d128(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        tmp_out,
+        max_logits,
+        exp_sums,
+        out,
+        softmax_scale=scale,
+        partition_size=partition_size,
+    )
+    if batch_size == 2 and partition_size == 1024:
+        torch.accelerator.synchronize()
+        graph = torch.cuda.CUDAGraph()
+        with torch.cuda.graph(graph):
+            graph_actual = flash_attn_v100.flash_attn_decode_paged_xqa_q3_d128(
+                query,
+                key_cache,
+                value_cache,
+                block_table,
+                seq_lens,
+                tmp_out,
+                max_logits,
+                exp_sums,
+                out,
+                softmax_scale=scale,
+                partition_size=partition_size,
+            )
+        graph.replay()
+        torch.accelerator.synchronize()
+        assert graph_actual.data_ptr() == out.data_ptr()
+        seq_lens[1] = 0
+        out[1].fill_(float("nan"))
+        torch.accelerator.synchronize()
+        graph.replay()
+        torch.accelerator.synchronize()
+        torch.testing.assert_close(out[1], torch.zeros_like(out[1]))
+        seq_lens[1] = seq_lens_list[1]
+        torch.accelerator.synchronize()
+        graph.replay()
+        torch.accelerator.synchronize()
+
+    prefill = flash_attn_v100.flash_attn_prefill_paged(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        softmax_scale=scale,
+        kv_cache_dtype="auto",
+        k_scale=1.0,
+        v_scale=1.0,
+        causal=True,
+    )
+    reference = _fp32_q3_reference(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        scale,
+    )
+
+    torch.accelerator.synchronize()
+    assert actual.data_ptr() == out.data_ptr()
+    torch.testing.assert_close(
+        actual.float(),
+        reference,
+        atol=2.0e-2,
+        rtol=2.0e-2,
+    )
+    torch.testing.assert_close(actual, prefill, atol=2.0e-2, rtol=2.0e-2)
+
+    if batch_size == 1 and partition_size == 1024:
+        causal_query_seed = torch.randn(
+            batch_size,
+            1,
+            1,
+            head_dim,
+            dtype=dtype,
+            device=device,
+        )
+        causal_query = causal_query_seed.expand(
+            batch_size,
+            query_len,
+            num_heads,
+            head_dim,
+        ).contiguous()
+        seq_len = seq_lens_list[0]
+        for query_idx in range(query_len):
+            logical_token = seq_len - query_len + query_idx
+            physical_block = int(block_table[0, logical_token // block_size].item())
+            block_offset = logical_token % block_size
+            key_cache[physical_block, block_offset, 0].copy_(
+                causal_query_seed[0, 0, 0] * 4.0
+            )
+            value_cache[physical_block, block_offset, 0].fill_(float(query_idx + 1))
+
+        causal_actual = flash_attn_v100.flash_attn_decode_paged_xqa_q3_d128(
+            causal_query,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            tmp_out,
+            max_logits,
+            exp_sums,
+            out,
+            softmax_scale=scale,
+            partition_size=partition_size,
+        )
+        causal_prefill = flash_attn_v100.flash_attn_prefill_paged(
+            causal_query,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            softmax_scale=scale,
+            kv_cache_dtype="auto",
+            k_scale=1.0,
+            v_scale=1.0,
+            causal=True,
+        )
+        causal_reference = _fp32_q3_reference(
+            causal_query,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            scale,
+        )
+        torch.testing.assert_close(
+            causal_actual.float(),
+            causal_reference,
+            atol=2.0e-2,
+            rtol=2.0e-2,
+        )
+        torch.testing.assert_close(
+            causal_actual,
+            causal_prefill,
+            atol=2.0e-2,
+            rtol=2.0e-2,
+        )

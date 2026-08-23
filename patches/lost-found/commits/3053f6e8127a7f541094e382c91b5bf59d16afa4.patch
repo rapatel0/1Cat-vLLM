@@ -1,0 +1,35 @@
+commit 3053f6e8127a7f541094e382c91b5bf59d16afa4
+Author:     dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+AuthorDate: Mon Jun 15 02:39:27 2026 +0000
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Jun 15 02:39:27 2026 +0000
+
+    Bump pytest-asyncio from 0.24.0 to 1.4.0
+    
+    Bumps [pytest-asyncio](https://github.com/pytest-dev/pytest-asyncio) from 0.24.0 to 1.4.0.
+    - [Release notes](https://github.com/pytest-dev/pytest-asyncio/releases)
+    - [Commits](https://github.com/pytest-dev/pytest-asyncio/compare/v0.24.0...v1.4.0)
+    
+    ---
+    updated-dependencies:
+    - dependency-name: pytest-asyncio
+      dependency-version: 1.4.0
+      dependency-type: direct:production
+      update-type: version-update:semver-major
+    ...
+    
+    Signed-off-by: dependabot[bot] <support@github.com>
+
+diff --git a/requirements/test/cuda.txt b/requirements/test/cuda.txt
+index 245a86f93b..f1eaceeabf 100644
+--- a/requirements/test/cuda.txt
++++ b/requirements/test/cuda.txt
+@@ -739,7 +739,7 @@ pytest==8.3.5
+     #   pytest-subtests
+     #   pytest-timeout
+     #   schemathesis
+-pytest-asyncio==0.24.0
++pytest-asyncio==1.4.0
+     # via -r requirements/test/cuda.in
+ pytest-cov==6.3.0
+     # via -r requirements/test/cuda.in

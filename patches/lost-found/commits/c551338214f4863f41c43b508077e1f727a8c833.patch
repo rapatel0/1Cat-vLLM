@@ -1,0 +1,48 @@
+commit c551338214f4863f41c43b508077e1f727a8c833
+Author:     dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+AuthorDate: Tue Jun 23 21:23:52 2026 +0000
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Jun 23 21:23:52 2026 +0000
+
+    Bump actions/checkout from 6.0.1 to 7.0.0
+    
+    Bumps [actions/checkout](https://github.com/actions/checkout) from 6.0.1 to 7.0.0.
+    - [Release notes](https://github.com/actions/checkout/releases)
+    - [Commits](https://github.com/actions/checkout/compare/v6.0.1...v7)
+    
+    ---
+    updated-dependencies:
+    - dependency-name: actions/checkout
+      dependency-version: 7.0.0
+      dependency-type: direct:production
+      update-type: version-update:semver-major
+    ...
+    
+    Signed-off-by: dependabot[bot] <support@github.com>
+
+diff --git a/.github/workflows/macos-smoke-test.yml b/.github/workflows/macos-smoke-test.yml
+index ea1c8b0fea..e0a2a8b217 100644
+--- a/.github/workflows/macos-smoke-test.yml
++++ b/.github/workflows/macos-smoke-test.yml
+@@ -15,7 +15,7 @@ jobs:
+     timeout-minutes: 30
+ 
+     steps:
+-      - uses: actions/checkout@v6.0.1
++      - uses: actions/checkout@v7.0.0
+ 
+       - uses: astral-sh/setup-uv@v7
+         with:
+diff --git a/.github/workflows/pre-commit.yml b/.github/workflows/pre-commit.yml
+index 1dd31b0e50..b17ac505a1 100644
+--- a/.github/workflows/pre-commit.yml
++++ b/.github/workflows/pre-commit.yml
+@@ -48,7 +48,7 @@ jobs:
+     if: always() && (needs.pre-run-check.result == 'success' || needs.pre-run-check.result == 'skipped')
+     runs-on: ubuntu-latest
+     steps:
+-    - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
++    - uses: actions/checkout@9c091bb21b7c1c1d1991bb908d89e4e9dddfe3e0 # v7.0.0
+     - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
+       with:
+         python-version: "3.12"

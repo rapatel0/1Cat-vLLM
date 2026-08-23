@@ -1,0 +1,135 @@
+commit ebe5c1f0ef276c538e317a426fc8fb9b3edbc57e
+Merge: 109cbf09ef 667ba3995c
+Author:     woWoosuk Kwon <woosuk.kwon@berkeley.edu>
+AuthorDate: Mon May 15 05:27:39 2023 +0000
+Commit:     woWoosuk Kwon <woosuk.kwon@berkeley.edu>
+CommitDate: Mon May 15 05:27:39 2023 +0000
+
+    Merge branch 'main' into docstrings
+
+diff --cc cacheflow/model_executor/models/gpt2.py
+index 5d70176108,97673ca450..4810f38562
+--- a/cacheflow/model_executor/models/gpt2.py
++++ b/cacheflow/model_executor/models/gpt2.py
+@@@ -1,8 -1,21 +1,25 @@@
++ # coding=utf-8
++ # Adapted from https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/gpt2/modeling_gpt2.py
++ # Copyright 2023 The CacheFlow team.
++ # Copyright 2018 The OpenAI Team Authors and HuggingFace Inc. team.
++ # Copyright (c) 2018, NVIDIA CORPORATION.  All rights reserved.
++ #
++ # Licensed under the Apache License, Version 2.0 (the "License");
++ # you may not use this file except in compliance with the License.
++ # You may obtain a copy of the License at
++ #
++ #     http://www.apache.org/licenses/LICENSE-2.0
++ #
++ # Unless required by applicable law or agreed to in writing, software
++ # distributed under the License is distributed on an "AS IS" BASIS,
++ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ # See the License for the specific language governing permissions and
++ # limitations under the License.
+ -"""1D GPT-2 model compatible with HuggingFace weights."""
+ +"""Inference-only GPT-2 model compatible with HuggingFace weights.
+ +
+ +The input of the model is flattened to a 1D tensor of tokens. The model uses
+ +InputMetadata to extract the original 2D shape of the input.
+ +"""
+  from typing import Dict, List, Optional, Tuple
+  
+  import torch
+diff --cc cacheflow/model_executor/models/gpt_neox.py
+index 2bac506d6a,8b074aecca..916ba3f0ea
+--- a/cacheflow/model_executor/models/gpt_neox.py
++++ b/cacheflow/model_executor/models/gpt_neox.py
+@@@ -1,8 -1,20 +1,24 @@@
++ # coding=utf-8
++ # Adapted from https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/gpt_neox/modeling_gpt_neox.py
++ # Copyright 2023 The CacheFlow team.
++ # Copyright 2022 EleutherAI The HuggingFace Inc. team. All rights reserved.
++ #
++ # Licensed under the Apache License, Version 2.0 (the "License");
++ # you may not use this file except in compliance with the License.
++ # You may obtain a copy of the License at
++ #
++ #     http://www.apache.org/licenses/LICENSE-2.0
++ #
++ # Unless required by applicable law or agreed to in writing, software
++ # distributed under the License is distributed on an "AS IS" BASIS,
++ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ # See the License for the specific language governing permissions and
++ # limitations under the License.
+ -"""1D GPT-NeoX model compatible with HuggingFace weights."""
+ +"""Inference-only GPT-NeoX model compatible with HuggingFace weights.
+ +
+ +The input of the model is flattened to a 1D tensor of tokens. The model uses
+ +InputMetadata to extract the original 2D shape of the input.
+ +"""
+  from typing import Dict, List, Optional, Tuple
+  
+  import torch
+diff --cc cacheflow/model_executor/models/llama.py
+index a30e377498,f42210c7e0..04699cad4d
+--- a/cacheflow/model_executor/models/llama.py
++++ b/cacheflow/model_executor/models/llama.py
+@@@ -1,8 -1,25 +1,29 @@@
++ # coding=utf-8
++ # Adapted from https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/llama/modeling_llama.py
++ # Copyright 2023 The CacheFlow team.
++ # Copyright 2022 EleutherAI and the HuggingFace Inc. team. All rights reserved.
++ #
++ # This code is based on EleutherAI's GPT-NeoX library and the GPT-NeoX
++ # and OPT implementations in this library. It has been modified from its
++ # original forms to accommodate minor architectural differences compared
++ # to GPT-NeoX and OPT used by the Meta AI team that trained the model.
++ #
++ # Licensed under the Apache License, Version 2.0 (the "License");
++ # you may not use this file except in compliance with the License.
++ # You may obtain a copy of the License at
++ #
++ #     http://www.apache.org/licenses/LICENSE-2.0
++ #
++ # Unless required by applicable law or agreed to in writing, software
++ # distributed under the License is distributed on an "AS IS" BASIS,
++ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ # See the License for the specific language governing permissions and
++ # limitations under the License.
+ -"""1D LLaMA model compatible with HuggingFace weights."""
+ +"""Inference-only LLaMA model compatible with HuggingFace weights.
+ +
+ +The input of the model is flattened to a 1D tensor of tokens. The model uses
+ +InputMetadata to extract the original 2D shape of the input.
+ +"""
+  from typing import Dict, List, Optional, Tuple
+  
+  import torch
+diff --cc cacheflow/model_executor/models/opt.py
+index 1b98e01aaa,ddb09d42e7..e51abe8423
+--- a/cacheflow/model_executor/models/opt.py
++++ b/cacheflow/model_executor/models/opt.py
+@@@ -1,8 -1,20 +1,24 @@@
++ # coding=utf-8
++ # Adapted from https://github.com/huggingface/transformers/blob/v4.28.0/src/transformers/models/opt/modeling_opt.py
++ # Copyright 2023 The CacheFlow team.
++ # Copyright 2022 The Fairseq Authors and The HuggingFace Inc. team. All rights reserved.
++ #
++ # Licensed under the Apache License, Version 2.0 (the "License");
++ # you may not use this file except in compliance with the License.
++ # You may obtain a copy of the License at
++ #
++ #     http://www.apache.org/licenses/LICENSE-2.0
++ #
++ # Unless required by applicable law or agreed to in writing, software
++ # distributed under the License is distributed on an "AS IS" BASIS,
++ # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
++ # See the License for the specific language governing permissions and
++ # limitations under the License.
+ -"""1D OPT model compatible with HuggingFace weights."""
+ +"""Inference-only OPT model compatible with HuggingFace weights.
+ +
+ +The input of the model is flattened to a 1D tensor of tokens. The model uses
+ +InputMetadata to extract the original 2D shape of the input.
+ +"""
+  from typing import Dict, List, Optional, Tuple
+  
+  import torch

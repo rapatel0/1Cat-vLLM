@@ -1,0 +1,36 @@
+commit 488c920b4fa3e17aa9b5928b11ce740dfa6f59ed
+Author:     dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+AuthorDate: Mon Jun 15 02:04:53 2026 +0000
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Jun 15 02:04:53 2026 +0000
+
+    Bump actions/stale from 10.1.1 to 10.3.0
+    
+    Bumps [actions/stale](https://github.com/actions/stale) from 10.1.1 to 10.3.0.
+    - [Release notes](https://github.com/actions/stale/releases)
+    - [Changelog](https://github.com/actions/stale/blob/main/CHANGELOG.md)
+    - [Commits](https://github.com/actions/stale/compare/997185467fa4f803885201cee163a9f38240193d...eb5cf3af3ac0a1aa4c9c45633dd1ae542a27a899)
+    
+    ---
+    updated-dependencies:
+    - dependency-name: actions/stale
+      dependency-version: 10.3.0
+      dependency-type: direct:production
+      update-type: version-update:semver-minor
+    ...
+    
+    Signed-off-by: dependabot[bot] <support@github.com>
+
+diff --git a/.github/workflows/stale.yml b/.github/workflows/stale.yml
+index 44bf71db5e..ba807fab7c 100644
+--- a/.github/workflows/stale.yml
++++ b/.github/workflows/stale.yml
+@@ -15,7 +15,7 @@ jobs:
+       actions: write
+     runs-on: ubuntu-latest
+     steps:
+-      - uses: actions/stale@997185467fa4f803885201cee163a9f38240193d # v10.1.1
++      - uses: actions/stale@eb5cf3af3ac0a1aa4c9c45633dd1ae542a27a899 # v10.3.0
+         with:
+           # Increasing this value ensures that changes to this workflow
+           # propagate to all issues and PRs in days rather than months

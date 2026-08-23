@@ -1,0 +1,36 @@
+commit 69a30692c75e9bf40fc6fc2f2b3f50a30f190a41
+Author:     dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+AuthorDate: Mon Jun 15 02:39:20 2026 +0000
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Jun 15 02:39:20 2026 +0000
+
+    Bump redis from 5.2.0 to 8.0.0
+    
+    Bumps [redis](https://github.com/redis/redis-py) from 5.2.0 to 8.0.0.
+    - [Release notes](https://github.com/redis/redis-py/releases)
+    - [Changelog](https://github.com/redis/redis-py/blob/master/CHANGES)
+    - [Commits](https://github.com/redis/redis-py/compare/v5.2.0...v8.0.0)
+    
+    ---
+    updated-dependencies:
+    - dependency-name: redis
+      dependency-version: 8.0.0
+      dependency-type: direct:production
+      update-type: version-update:semver-major
+    ...
+    
+    Signed-off-by: dependabot[bot] <support@github.com>
+
+diff --git a/requirements/test/cuda.txt b/requirements/test/cuda.txt
+index 245a86f93b..bff359aedf 100644
+--- a/requirements/test/cuda.txt
++++ b/requirements/test/cuda.txt
+@@ -792,7 +792,7 @@ rapidfuzz==3.12.1
+     # via jiwer
+ ray==2.48.0
+     # via -r requirements/test/cuda.in
+-redis==5.2.0
++redis==8.0.0
+     # via tensorizer
+ referencing==0.35.1
+     # via

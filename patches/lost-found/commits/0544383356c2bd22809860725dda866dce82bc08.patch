@@ -1,0 +1,35 @@
+commit 0544383356c2bd22809860725dda866dce82bc08
+Author:     dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+AuthorDate: Tue Jun 30 21:23:27 2026 +0000
+Commit:     GitHub <noreply@github.com>
+CommitDate: Tue Jun 30 21:23:27 2026 +0000
+
+    Bump actions/setup-python from 6.1.0 to 6.3.0
+    
+    Bumps [actions/setup-python](https://github.com/actions/setup-python) from 6.1.0 to 6.3.0.
+    - [Release notes](https://github.com/actions/setup-python/releases)
+    - [Commits](https://github.com/actions/setup-python/compare/83679a892e2d95755f2dac6acb0bfd1e9ac5d548...ece7cb06caefa5fff74198d8649806c4678c61a1)
+    
+    ---
+    updated-dependencies:
+    - dependency-name: actions/setup-python
+      dependency-version: 6.3.0
+      dependency-type: direct:production
+      update-type: version-update:semver-minor
+    ...
+    
+    Signed-off-by: dependabot[bot] <support@github.com>
+
+diff --git a/.github/workflows/pre-commit.yml b/.github/workflows/pre-commit.yml
+index 1dd31b0e50..ddf4348bf8 100644
+--- a/.github/workflows/pre-commit.yml
++++ b/.github/workflows/pre-commit.yml
+@@ -49,7 +49,7 @@ jobs:
+     runs-on: ubuntu-latest
+     steps:
+     - uses: actions/checkout@8e8c483db84b4bee98b60c0593521ed34d9990e8 # v6.0.1
+-    - uses: actions/setup-python@83679a892e2d95755f2dac6acb0bfd1e9ac5d548 # v6.1.0
++    - uses: actions/setup-python@ece7cb06caefa5fff74198d8649806c4678c61a1 # v6.3.0
+       with:
+         python-version: "3.12"
+     - run: echo "::add-matcher::.github/workflows/matchers/actionlint.json"

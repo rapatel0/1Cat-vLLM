@@ -1,0 +1,85 @@
+commit 7f2e78ba4df2f7091c247155fc5aeecaa73a486d
+Author:     Vineeth Sai Varikuntla <vineethsai4444@gmail.com>
+AuthorDate: Mon Aug 3 12:02:23 2026 -0700
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Aug 3 19:02:23 2026 +0000
+
+    [Bugfix] Emit a valid media type from encode_{audio,image,video}_url (#49056)
+    
+    Signed-off-by: Vineeth Sai <vineethsai4444@gmail.com>
+
+diff --git a/tests/multimodal/test_utils.py b/tests/multimodal/test_utils.py
+index ffc8ce504c..97f46de13c 100644
+--- a/tests/multimodal/test_utils.py
++++ b/tests/multimodal/test_utils.py
+@@ -2,6 +2,7 @@
+ # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+ import pytest
+ import torch
++from PIL import Image
+ 
+ from vllm.multimodal.inputs import (
+     MultiModalBatchedField,
+@@ -10,7 +11,11 @@ from vllm.multimodal.inputs import (
+     MultiModalSharedField,
+     PlaceholderRange,
+ )
+-from vllm.multimodal.utils import argsort_mm_positions, group_and_batch_mm_items
++from vllm.multimodal.utils import (
++    argsort_mm_positions,
++    encode_image_url,
++    group_and_batch_mm_items,
++)
+ 
+ 
+ @pytest.mark.parametrize(
+@@ -224,6 +229,16 @@ def test_group_and_batch_mm_items_splits_shared_data_by_dtype():
+     assert [num_items for num_items, _ in res] == [1, 1, 1]
+ 
+ 
++def test_encode_image_url_uncommon_format_has_valid_mimetype():
++    """A format missing from mimetypes.types_map must still produce a
++    well-formed type/subtype media type, not a bare 'image'."""
++    # ".tga" is not registered in mimetypes.types_map, so it exercises the
++    # fallback path; Pillow can still encode it.
++    url = encode_image_url(Image.new("RGB", (2, 2)), format="TGA")
++    mimetype = url.removeprefix("data:").split(";", 1)[0]
++    assert mimetype == "image/tga"
++
++
+ def test_group_and_batch_mm_items_split_by_shared_data():
+     elem1 = MultiModalFieldElem(
+         data=torch.zeros(1, dtype=torch.uint8),
+diff --git a/vllm/multimodal/utils.py b/vllm/multimodal/utils.py
+index 25c811fd42..fc400710f0 100644
+--- a/vllm/multimodal/utils.py
++++ b/vllm/multimodal/utils.py
+@@ -57,7 +57,7 @@ def encode_audio_url(
+ ) -> str:
+     """Encode audio as a data URL."""
+     audio_b64 = encode_audio_base64(audio, sampling_rate, format=format)
+-    mimetype = mimetypes.types_map.get("." + format.lower(), "audio")
++    mimetype = mimetypes.types_map.get("." + format.lower(), f"audio/{format.lower()}")
+     return f"data:{mimetype};base64,{audio_b64}"
+ 
+ 
+@@ -90,7 +90,7 @@ def encode_image_url(
+     Pass `image_mode=None` to keep the original image mode.
+     """
+     image_b64 = encode_image_base64(image, image_mode=image_mode, format=format)
+-    mimetype = mimetypes.types_map.get("." + format.lower(), "image")
++    mimetype = mimetypes.types_map.get("." + format.lower(), f"image/{format.lower()}")
+     return f"data:{mimetype};base64,{image_b64}"
+ 
+ 
+@@ -114,7 +114,9 @@ def encode_video_url(
+     if format.lower() == "jpeg":
+         mimetype = "video/jpeg"
+     else:
+-        mimetype = mimetypes.types_map.get("." + format.lower(), "video")
++        mimetype = mimetypes.types_map.get(
++            "." + format.lower(), f"video/{format.lower()}"
++        )
+ 
+     return f"data:{mimetype};base64,{video_b64}"
+ 

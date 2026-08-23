@@ -1,0 +1,1 @@
+Generated caches excluded: .venv, __pycache__, .pytest_cache, .ruff_cache, egg-info, generated _version.py.

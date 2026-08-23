@@ -1,0 +1,64 @@
+worktree /Users/ravi/repos/1Cat-vLLM
+HEAD 999d1662b20ad6c9d7ae2f1a1432ba3d253c148e
+branch refs/heads/experiment/inkling-small-sm70
+
+worktree /private/tmp/onecat-cleanup-patches
+HEAD 675a12dedcca8cc020c033f1b1d0f1751d4b8efe
+branch refs/heads/archive/cleanup-20260823/patches
+
+worktree /private/tmp/onecat-pr266-investigate
+HEAD 32c786102888f4199a47e9fb2097d34e71f0c380
+detached
+
+worktree /Users/ravi/repos/1Cat-vLLM-dspark
+HEAD 3745a1bd34714aed11e1b4dd42f0f28d17cc989f
+branch refs/heads/experiment/deepseek-v4-dspark-perf-sm70
+
+worktree /Users/ravi/repos/1Cat-vLLM-dspark-port
+HEAD d3d7d015908e8741e7220580870dc06915cc11ff
+branch refs/heads/archive/cleanup-20260823/worktree/dspark-port
+
+worktree /Users/ravi/repos/1Cat-vLLM-forge-001
+HEAD f659fff9feaec028f7e105bae780125a230cbffc
+branch refs/heads/forge/001-integration
+
+worktree /Users/ravi/repos/1Cat-vLLM-forge-001-ab-analyzer
+HEAD 47d42de3c20a8fb40dd0c2cf4228c60be6e6fafe
+detached
+
+worktree /Users/ravi/repos/1Cat-vLLM-forge-001-live-baseline
+HEAD b69fa412033f8d1aadfcd40e0c97b549e4d47662
+branch refs/heads/forge/001-live-baseline
+
+worktree /Users/ravi/repos/1Cat-vLLM-forge-001-native
+HEAD b1961c1792c82c11e76ed947146866f34504df23
+branch refs/heads/forge/001-native-q3-d128
+
+worktree /Users/ravi/repos/1Cat-vLLM-forge-001-native-integration
+HEAD 47d42de3c20a8fb40dd0c2cf4228c60be6e6fafe
+branch refs/heads/forge/001-native-integration
+
+worktree /Users/ravi/repos/1Cat-vLLM-forge-001-service
+HEAD ca787347ac32ca267192e65751b6e7909bbf25d9
+branch refs/heads/forge/001-service-harness
+
+worktree /Users/ravi/repos/1Cat-vLLM-forge-001-tq64k
+HEAD 351f1bf9591f63921ce2cb4b54dd00aa8e49f686
+branch refs/heads/forge/001-tq64k-t3
+
+worktree /Users/ravi/repos/1Cat-vLLM-qwen38-dcp2
+HEAD 0bf176dfcb1bb173b0049b0fb64e4490f4751e7f
+branch refs/heads/experiment/qwen38-mtp-dcp2
+
+worktree /Users/ravi/repos/1Cat-vLLM-qwen38-dcp2-forge-state
+HEAD bc60e7de5d2a604756f5a34c4446b0f953f8b153
+branch refs/heads/forge/state
+
+worktree /Users/ravi/repos/1Cat-vLLM-qwen38-mtp
+HEAD ae68cb724d50e417b16f0f405d4a2de74fcd8892
+branch refs/heads/archive/cleanup-20260823/worktree/qwen38-mtp
+
+worktree /Users/ravi/repos/forge-worktrees/FORGE-001/1a9fb53166805b8ae3211d3dbb16053d/controller
+HEAD 3bc07baedc9066d079237cc34b74bcdeecbc380b
+branch refs/heads/forge/increment/001/1a9fb53166805b8ae3211d3dbb16053d
+

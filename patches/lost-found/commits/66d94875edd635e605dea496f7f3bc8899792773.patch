@@ -1,0 +1,36 @@
+commit 66d94875edd635e605dea496f7f3bc8899792773
+Author:     dependabot[bot] <49699333+dependabot[bot]@users.noreply.github.com>
+AuthorDate: Mon Jun 15 02:39:08 2026 +0000
+Commit:     GitHub <noreply@github.com>
+CommitDate: Mon Jun 15 02:39:08 2026 +0000
+
+    Bump pytest from 8.3.5 to 9.1.0
+    
+    Bumps [pytest](https://github.com/pytest-dev/pytest) from 8.3.5 to 9.1.0.
+    - [Release notes](https://github.com/pytest-dev/pytest/releases)
+    - [Changelog](https://github.com/pytest-dev/pytest/blob/main/CHANGELOG.rst)
+    - [Commits](https://github.com/pytest-dev/pytest/compare/8.3.5...9.1.0)
+    
+    ---
+    updated-dependencies:
+    - dependency-name: pytest
+      dependency-version: 9.1.0
+      dependency-type: direct:production
+      update-type: version-update:semver-major
+    ...
+    
+    Signed-off-by: dependabot[bot] <support@github.com>
+
+diff --git a/requirements/test/cuda.txt b/requirements/test/cuda.txt
+index 245a86f93b..d85f9e8799 100644
+--- a/requirements/test/cuda.txt
++++ b/requirements/test/cuda.txt
+@@ -725,7 +725,7 @@ pystemmer==3.0.0
+     # via mteb
+ pytablewriter==1.2.0
+     # via lm-eval
+-pytest==8.3.5
++pytest==9.1.0
+     # via
+     #   -r requirements/test/cuda.in
+     #   buildkite-test-collector
