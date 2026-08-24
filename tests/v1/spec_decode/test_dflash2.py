@@ -53,6 +53,37 @@ from vllm.v1.worker.gpu.spec_decode.dflash2.speculator import (
 )
 
 
+def test_dflash2_prefill_and_recycled_slot_transitions_run_eager():
+    speculator = object.__new__(DFlash2Speculator)
+    speculator._draft_request_ids_by_slot = [None, None]
+    prefill_batch = SimpleNamespace(
+        req_ids=["request-a", "request-b"],
+        num_reqs=2,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+        is_prefilling_np=np.array([True, True]),
+        seq_lens_cpu_upper_bound=torch.tensor([8192, 32768]),
+    )
+    decode_batch = SimpleNamespace(
+        req_ids=["request-a", "request-b"],
+        num_reqs=2,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+        is_prefilling_np=np.array([False, False]),
+        seq_lens_cpu_upper_bound=torch.tensor([8193, 32769]),
+    )
+    long_batch = SimpleNamespace(
+        req_ids=["request-a", "request-b"],
+        num_reqs=2,
+        idx_mapping_np=np.array([0, 1], dtype=np.int32),
+        is_prefilling_np=np.array([False, False]),
+        seq_lens_cpu_upper_bound=torch.tensor([8193, 65536]),
+    )
+
+    assert speculator._requires_eager_proposal(prefill_batch) is True
+    assert speculator._requires_eager_proposal(decode_batch) is True
+    assert speculator._requires_eager_proposal(decode_batch) is False
+    assert speculator._requires_eager_proposal(long_batch) is False
+
+
 def test_dflash_cuda_graph_uses_dedicated_pool(monkeypatch):
     dedicated_pool = object()
 

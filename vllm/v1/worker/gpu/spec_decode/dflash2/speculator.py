@@ -11,6 +11,7 @@ from vllm.model_executor.models.qwen3_dflash2 import (
     sanitize_dflash2_candidate_ids,
 )
 from vllm.triton_utils import tl, triton
+from vllm.v1.worker.gpu.input_batch import InputBatch
 from vllm.v1.worker.gpu.sample.gumbel import gumbel_noised_argmax
 from vllm.v1.worker.gpu.spec_decode.dflash.speculator import DFlashSpeculator
 
@@ -232,6 +233,28 @@ class DFlash2Speculator(DFlashSpeculator):
             # The cache kernel writes only K columns; all other vocabulary
             # columns must remain impossible.
             self.draft_logits.fill_(-float("inf"))
+        self._draft_request_ids_by_slot: list[str | None] = [
+            None
+        ] * self.max_num_reqs
+
+    def _requires_eager_proposal(self, input_batch: InputBatch) -> bool:
+        # Keep proposals eager while target prefill initializes hybrid state and
+        # once at each recycled request-slot transition. Every steady decode
+        # step then retains q=8 CUDA graphs, including long-context requests.
+        requires_eager = False
+        for req_id, slot, is_prefilling in zip(
+            input_batch.req_ids,
+            input_batch.idx_mapping_np,
+            input_batch.is_prefilling_np,
+        ):
+            slot = int(slot)
+            if is_prefilling:
+                requires_eager = True
+                continue
+            if self._draft_request_ids_by_slot[slot] != req_id:
+                self._draft_request_ids_by_slot[slot] = req_id
+                requires_eager = True
+        return requires_eager
 
     def draft_logits_spec(self, vllm_config: VllmConfig) -> tuple[torch.dtype, float]:
         # The selector walk and rejection sampler must consume identical scores.

@@ -163,6 +163,9 @@ class DFlashSpeculator(DraftModelSpeculator):
             progress_bar_desc=f"Capturing {self._speculator_name.lower()} CUDA graphs",
         )
 
+    def _requires_eager_proposal(self, input_batch: InputBatch) -> bool:
+        return False
+
     def load_draft_model(
         self,
         target_model: nn.Module,
@@ -450,7 +453,7 @@ class DFlashSpeculator(DraftModelSpeculator):
             uniform_token_count=self.num_query_per_req,
             dp_size=self.dp_size,
             dp_rank=self.dp_rank,
-            need_eager=is_profile,
+            need_eager=is_profile or self._requires_eager_proposal(input_batch),
         )
 
         num_reqs_padded = batch_desc.num_reqs or num_reqs
