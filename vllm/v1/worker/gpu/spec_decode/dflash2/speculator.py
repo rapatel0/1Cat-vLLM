@@ -236,11 +236,16 @@ class DFlash2Speculator(DFlashSpeculator):
         self._draft_request_ids_by_slot: list[str | None] = [
             None
         ] * self.max_num_reqs
+        # Let recurrent draft state settle eagerly before a recycled request
+        # slot enters CUDA-graph replay. Long-prefill parity showed that one
+        # transition proposal is insufficient after sustained slot reuse.
+        self._draft_eager_proposals_by_slot = [0] * self.max_num_reqs
 
     def _requires_eager_proposal(self, input_batch: InputBatch) -> bool:
-        # Keep proposals eager while target prefill initializes hybrid state and
-        # once at each recycled request-slot transition. Every steady decode
-        # step then retains q=8 CUDA graphs, including long-context requests.
+        # Keep proposals eager while target prefill initializes hybrid state
+        # and for the first few proposals after each recycled request-slot
+        # transition. Every later steady decode step retains CUDA graphs,
+        # including long-context requests.
         requires_eager = False
         for req_id, slot, is_prefilling in zip(
             input_batch.req_ids,
@@ -248,11 +253,14 @@ class DFlash2Speculator(DFlashSpeculator):
             input_batch.is_prefilling_np,
         ):
             slot = int(slot)
+            if self._draft_request_ids_by_slot[slot] != req_id:
+                self._draft_request_ids_by_slot[slot] = req_id
+                self._draft_eager_proposals_by_slot[slot] = 8
             if is_prefilling:
                 requires_eager = True
                 continue
-            if self._draft_request_ids_by_slot[slot] != req_id:
-                self._draft_request_ids_by_slot[slot] = req_id
+            if self._draft_eager_proposals_by_slot[slot] > 0:
+                self._draft_eager_proposals_by_slot[slot] -= 1
                 requires_eager = True
         return requires_eager
 
