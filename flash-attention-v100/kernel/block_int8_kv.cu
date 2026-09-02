@@ -1,5 +1,6 @@
 #include <cuda_fp16.h>
 #include <cuda_runtime.h>
+#include <math_constants.h>
 #include <stdint.h>
 #include <torch/extension.h>
 
@@ -38,11 +39,20 @@ __device__ __forceinline__ int8_t quantize_symmetric_int8(float value,
 }
 
 __global__ void reset_int8_block32_page_owners_kernel(
-    int* __restrict__ page_owners, const int num_blocks,
+    const int64_t* __restrict__ slot_mapping, int* __restrict__ page_owners,
+    const int num_tokens, const int num_blocks, const int block_size,
     const int64_t owner_stride) {
-  const int page = blockIdx.x * blockDim.x + threadIdx.x;
-  if (page < num_blocks) {
-    page_owners[static_cast<int64_t>(page) * owner_stride] = 0x7fffffff;
+  const int token_idx = blockIdx.x * blockDim.x + threadIdx.x;
+  if (token_idx >= num_tokens) {
+    return;
+  }
+  const int64_t slot = slot_mapping[token_idx];
+  if (slot < 0) {
+    return;
+  }
+  const int64_t physical_block = slot / block_size;
+  if (physical_block < num_blocks) {
+    page_owners[physical_block * owner_stride] = 0x7fffffff;
   }
 }
 
@@ -476,13 +486,13 @@ void flash_attention_int8_block32_reshape_and_cache(
   c10::cuda::CUDAGuard device_guard(key.device());
   const auto stream = at::cuda::getCurrentCUDAStream().stream();
   constexpr int kOwnerThreads = 256;
-  const int owner_blocks =
-      (key_cache.size(0) + kOwnerThreads - 1) / kOwnerThreads;
-  reset_int8_block32_page_owners_kernel<<<owner_blocks, kOwnerThreads, 0,
-                                          stream>>>(
-      page_owners.data_ptr<int>(), key_cache.size(0), page_owners.stride(0));
   const int token_blocks =
       (key.size(0) + kOwnerThreads - 1) / kOwnerThreads;
+  reset_int8_block32_page_owners_kernel<<<token_blocks, kOwnerThreads, 0,
+                                          stream>>>(
+      slot_mapping.data_ptr<int64_t>(), page_owners.data_ptr<int>(),
+      key.size(0), key_cache.size(0), key_cache.size(1),
+      page_owners.stride(0));
   mark_int8_block32_page_owners_kernel<<<token_blocks, kOwnerThreads, 0,
                                          stream>>>(
       slot_mapping.data_ptr<int64_t>(), page_owners.data_ptr<int>(),

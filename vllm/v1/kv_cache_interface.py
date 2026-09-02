@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# pyright: reportIncompatibleMethodOverride=false
 
 from __future__ import annotations
 
@@ -90,6 +91,7 @@ def make_int8_block32_kv_cache_views(
     block_size: int,
     num_kv_heads: int,
     head_size: int,
+    page_stride_bytes: int | None = None,
 ) -> tuple[
     torch.Tensor,
     torch.Tensor,
@@ -111,7 +113,16 @@ def make_int8_block32_kv_cache_views(
     page_bytes = (
         2 * side_payload_bytes + 2 * side_scale_elements * half_size + owner_size
     )
-    required_bytes = num_blocks * page_bytes
+    page_stride = page_bytes if page_stride_bytes is None else page_stride_bytes
+    if page_stride < page_bytes or page_stride % owner_size:
+        raise ValueError(
+            "INT8 block cache page stride must cover the payload and be "
+            "aligned for the publication owner"
+        )
+    raw_byte_offset = raw_cache.storage_offset()
+    if raw_byte_offset % owner_size:
+        raise ValueError("INT8 block cache storage offset must be 4-byte aligned")
+    required_bytes = num_blocks * page_stride
     if raw_cache.numel() != required_bytes:
         raise ValueError(
             "INT8 block cache allocation has an invalid size: "
@@ -119,31 +130,34 @@ def make_int8_block32_kv_cache_views(
         )
 
     payload_size = (num_blocks, block_size, num_kv_heads, head_size)
-    payload_stride = (page_bytes, num_kv_heads * head_size, head_size, 1)
+    payload_stride = (page_stride, num_kv_heads * head_size, head_size, 1)
     key_cache = torch.as_strided(raw_cache, size=payload_size, stride=payload_stride)
     value_cache = torch.as_strided(
         raw_cache,
         size=payload_size,
         stride=payload_stride,
-        storage_offset=side_payload_bytes,
+        storage_offset=raw_byte_offset + side_payload_bytes,
     )
 
     scale_base = torch.empty(0, dtype=torch.float16, device=raw_cache.device).set_(
         raw_cache.untyped_storage()
     )
     scale_size = (num_blocks, num_kv_heads, channel_blocks)
-    scale_stride = (page_bytes // half_size, channel_blocks, 1)
+    scale_stride = (page_stride // half_size, channel_blocks, 1)
     key_scales = torch.as_strided(
         scale_base,
         size=scale_size,
         stride=scale_stride,
-        storage_offset=2 * side_payload_bytes // half_size,
+        storage_offset=(raw_byte_offset + 2 * side_payload_bytes) // half_size,
     )
     value_scales = torch.as_strided(
         scale_base,
         size=scale_size,
         stride=scale_stride,
-        storage_offset=(2 * side_payload_bytes // half_size + side_scale_elements),
+        storage_offset=(
+            (raw_byte_offset + 2 * side_payload_bytes) // half_size
+            + side_scale_elements
+        ),
     )
 
     owner_base = torch.empty(0, dtype=torch.int32, device=raw_cache.device).set_(
@@ -152,8 +166,12 @@ def make_int8_block32_kv_cache_views(
     page_owners = torch.as_strided(
         owner_base,
         size=(num_blocks,),
-        stride=(page_bytes // owner_size,),
-        storage_offset=(2 * side_payload_bytes + 2 * side_scale_elements * half_size)
+        stride=(page_stride // owner_size,),
+        storage_offset=(
+            raw_byte_offset
+            + 2 * side_payload_bytes
+            + 2 * side_scale_elements * half_size
+        )
         // owner_size,
     )
     return key_cache, value_cache, key_scales, value_scales, page_owners
@@ -254,8 +272,6 @@ class AttentionSpec(KVCacheSpec):
                 2 * self.block_size * self.num_kv_heads * get_dtype_size(torch.float32)
             )
         elif self.kv_quant_mode.is_int8_block32:
-            if self.page_size_padded is not None:
-                raise ValueError("INT8 block cache does not support padded pages")
             scale_blocks = cdiv(self.head_size, INT8_BLOCK32_CHANNEL_SIZE)
             real_page_size += 2 * self.num_kv_heads * scale_blocks * get_dtype_size(
                 torch.float16

@@ -12436,8 +12436,15 @@ class GPUModelRunner(
                                 "INT8 block cache requires the scheduler and kernel "
                                 "page sizes to match"
                             )
-                        kv_caches[layer_name] = kv_cache_raw_tensors[layer_name].view(
-                            kernel_num_blocks, kv_cache_spec.page_size_bytes
+                        raw_tensor = kv_cache_raw_tensors[layer_name].view(torch.int8)
+                        real_page_size = replace(
+                            kv_cache_spec, page_size_padded=None
+                        ).page_size_bytes
+                        page_stride = kv_cache_spec.page_size_bytes
+                        kv_caches[layer_name] = torch.as_strided(
+                            raw_tensor,
+                            size=(kernel_num_blocks, real_page_size),
+                            stride=(page_stride, 1),
                         )
                         continue
 
@@ -12470,7 +12477,9 @@ class GPUModelRunner(
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     state_tensors = []
                     storage_offset_bytes = 0
-                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+                    for shape, dtype in zip(
+                        kv_cache_spec.shapes, kv_cache_spec.dtypes, strict=True
+                    ):
                         dtype_size = get_dtype_size(dtype)
                         num_element_per_page = (
                             kv_cache_spec.page_size_bytes // dtype_size

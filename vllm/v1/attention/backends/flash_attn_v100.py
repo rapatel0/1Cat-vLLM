@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false
+# pyright: reportGeneralTypeIssues=false, reportIncompatibleMethodOverride=false
+# pyright: reportIndexIssue=false, reportOptionalCall=false
+# pyright: reportOptionalMemberAccess=false, reportOptionalSubscript=false
 """Flash Attention V100 backend for SM70.
 
 Selecting this backend keeps both prefill and decode on Flash-V100 by default.
@@ -652,13 +656,26 @@ def _split_int8_block32_kv_cache(
     elements_per_token = 2 * num_kv_heads * head_size
     block_size, remainder = divmod(payload_bytes, elements_per_token)
     if block_size <= 0 or remainder:
-        raise ValueError("INT8 block cache page size does not match its head shape")
+        raise ValueError(
+            "INT8 block cache page size does not match its head shape: "
+            f"shape={tuple(kv_cache.shape)}, stride={kv_cache.stride()}, "
+            f"num_kv_heads={num_kv_heads}, head_size={head_size}, "
+            f"payload_bytes={payload_bytes}, remainder={remainder}"
+        )
+    page_stride_bytes = kv_cache.stride(0)
+    raw_cache = torch.empty(0, dtype=torch.int8, device=kv_cache.device).set_(
+        kv_cache.untyped_storage(),
+        kv_cache.storage_offset(),
+        (kv_cache.shape[0] * page_stride_bytes,),
+        (1,),
+    )
     return make_int8_block32_kv_cache_views(
-        kv_cache.reshape(-1),
+        raw_cache,
         num_blocks=kv_cache.shape[0],
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
+        page_stride_bytes=page_stride_bytes,
     )
 
 
@@ -1776,7 +1793,14 @@ def _get_int8_block32_ops():
     if not _int8_block32_ops_checked:
         _int8_block32_ops_checked = True
         try:
-            extension = importlib.import_module("flash_attn_v100_cuda")
+            try:
+                extension = importlib.import_module(
+                    "flash_attn_v100.flash_attn_v100_cuda"
+                )
+            except ImportError:
+                # Keep source-tree/development installs working when the extension
+                # is exposed only as a top-level module.
+                extension = importlib.import_module("flash_attn_v100_cuda")
             _int8_block32_decode_paged = extension.int8_block32_decode_paged
             _int8_block32_prefill_paged = extension.int8_block32_prefill_paged
             _int8_block32_reshape_and_cache = extension.int8_block32_reshape_and_cache
@@ -5759,9 +5783,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         if is_prefill:
             if self.kv_cache_dtype == "int8_block32" and is_capturing:
-                raise RuntimeError(
-                    "FLASH_ATTN_V100 INT8 block cache does not support "
-                    "small-query prefill graph capture"
+                return self._flash_v100_int8_small_query_prefill_as_decode(
+                    query,
+                    kv_cache,
+                    attn_metadata,
+                    output,
                 )
             available_query_tokens = min(
                 int(query.shape[0]),
@@ -5893,38 +5919,17 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if has_prefix_context and self.kv_cache_dtype == "int8_block32":
                 causal = bool(getattr(attn_metadata, "causal", True))
                 window_size = self._flash_v100_window_size(causal)
-                if (
-                    metadata_live_token_mismatch
-                    or not causal
-                    or window_size != (-1, -1)
-                    or self.int8_block32_prefill_paged is None
-                ):
+                if not causal or window_size != (-1, -1):
                     raise RuntimeError(
                         "FLASH_ATTN_V100 INT8 block cache prefix prefill "
-                        "requires causal full attention and live query metadata"
+                        "requires causal full attention"
                     )
-                key_cache, value_cache, key_scales, value_scales, _ = (
-                    _split_int8_block32_kv_cache(
-                        kv_cache,
-                        num_kv_heads=self.num_kv_heads,
-                        head_size=self.head_size,
-                    )
+                return self._flash_v100_int8_small_query_prefill_as_decode(
+                    query,
+                    kv_cache,
+                    attn_metadata,
+                    output,
                 )
-                num_actual_tokens = int(attn_metadata.num_actual_tokens)
-                self.int8_block32_prefill_paged(
-                    query[:num_actual_tokens],
-                    key_cache,
-                    value_cache,
-                    key_scales,
-                    value_scales,
-                    attn_metadata.block_table,
-                    attn_metadata.seq_lens,
-                    attn_metadata.query_start_loc,
-                    output[:num_actual_tokens],
-                    self.scale,
-                )
-                _record_route("prefill_prefix_int8_block32_register")
-                return output
             if has_prefix_context:
                 if _draft_graph_debug_enabled():
                     _draft_graph_debug_log(
@@ -7220,6 +7225,103 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 int(key_cache.shape[3]),
             )
 
+        return output
+
+    def _flash_v100_int8_small_query_prefill_as_decode(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run small causal prefix queries over the block-scaled INT8 cache."""
+        if not bool(getattr(attn_metadata, "causal", True)):
+            raise RuntimeError(
+                "FLASH_ATTN_V100 INT8 block cache small-query prefill "
+                "requires causal attention"
+            )
+        if (
+            self.int8_block32_decode_paged is None
+            or self.int8_block32_prefill_paged is None
+        ):
+            raise RuntimeError(
+                "FLASH_ATTN_V100 INT8 block cache attention ops are unavailable"
+            )
+
+        key_cache, value_cache, key_scales, value_scales, _ = (
+            _split_int8_block32_kv_cache(
+                kv_cache,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+            )
+        )
+        num_query_tokens = min(
+            int(attn_metadata.num_actual_tokens),
+            int(query.shape[0]),
+            int(output.shape[0]),
+        )
+        query = query[:num_query_tokens]
+        out_view = output[:num_query_tokens]
+        persistent_block_table = getattr(
+            attn_metadata,
+            "smallq_decode_block_table",
+            None,
+        )
+        persistent_seq_lens = getattr(
+            attn_metadata,
+            "smallq_decode_seq_lens",
+            None,
+        )
+        if (
+            persistent_block_table is not None
+            and persistent_seq_lens is not None
+            and int(persistent_block_table.shape[0]) >= num_query_tokens
+            and int(persistent_seq_lens.shape[0]) >= num_query_tokens
+            and not _metadata_expects_more_query_tokens_than_available(
+                attn_metadata,
+                num_query_tokens,
+            )
+        ):
+            self.int8_block32_decode_paged(
+                query,
+                key_cache,
+                value_cache,
+                key_scales,
+                value_scales,
+                persistent_block_table[:num_query_tokens],
+                persistent_seq_lens[:num_query_tokens],
+                out_view,
+                self.scale,
+            )
+            _record_route("prefill_smallq_int8_block32_register")
+            return output
+
+        if _is_cuda_graph_capturing(query):
+            raise RuntimeError(
+                "FLASH_ATTN_V100 INT8 small-query prefill entered CUDA graph "
+                "capture without persistent decode metadata"
+            )
+
+        query_start_loc = _normalize_query_start_loc_for_available_tokens(
+            attn_metadata.query_start_loc,
+            num_query_tokens,
+        ).to(
+            device=attn_metadata.seq_lens.device,
+            dtype=attn_metadata.query_start_loc.dtype,
+        )
+        self.int8_block32_prefill_paged(
+            query,
+            key_cache,
+            value_cache,
+            key_scales,
+            value_scales,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            query_start_loc,
+            out_view,
+            self.scale,
+        )
+        _record_route("prefill_prefix_int8_block32_register")
         return output
 
     def _flash_v100_small_query_prefill_as_decode(

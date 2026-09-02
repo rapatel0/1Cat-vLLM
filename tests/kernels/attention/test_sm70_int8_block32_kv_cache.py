@@ -13,7 +13,7 @@ from vllm.v1.kv_cache_interface import (
 def _require_sm70_extension():
     if not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0):
         pytest.skip("This test requires a CUDA SM70 device")
-    return pytest.importorskip("flash_attn_v100_cuda")
+    return pytest.importorskip("flash_attn_v100.flash_attn_v100_cuda")
 
 
 def test_int8_block32_publish_requantize_and_decode() -> None:
@@ -226,3 +226,128 @@ def test_int8_block32_publish_requantize_and_decode() -> None:
     torch.testing.assert_close(
         chunk_output.float(), chunk_reference, atol=2e-3, rtol=2e-3
     )
+
+
+@pytest.mark.parametrize("num_queries", [8, 16])
+@pytest.mark.parametrize("block_size", [16, 1648])
+def test_int8_block32_expanded_metadata_cuda_graph_replay(
+    num_queries: int,
+    block_size: int,
+) -> None:
+    extension = _require_sm70_extension()
+    torch.manual_seed(11 + num_queries)
+
+    num_blocks = 4
+    num_kv_heads = 1
+    num_query_heads = 2
+    head_size = 64
+    spec = AttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.int8,
+        kv_quant_mode=KVQuantMode.INT8_BLOCK32,
+    )
+    raw = torch.zeros(
+        num_blocks * spec.page_size_bytes,
+        dtype=torch.int8,
+        device="cuda",
+    )
+    key_cache, value_cache, key_scales, value_scales, _ = (
+        make_int8_block32_kv_cache_views(
+            raw,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+        )
+    )
+    key_cache.random_(-80, 81)
+    value_cache.random_(-80, 81)
+    key_scales.uniform_(0.002, 0.02)
+    value_scales.uniform_(0.002, 0.02)
+
+    query = torch.randn(
+        num_queries,
+        num_query_heads,
+        head_size,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    block_table = torch.empty(
+        num_queries,
+        2,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    for query_idx in range(num_queries):
+        if query_idx % 2 == 0:
+            block_table[query_idx] = torch.tensor([0, 1], device="cuda")
+        else:
+            block_table[query_idx] = torch.tensor([2, 3], device="cuda")
+    seq_lens = torch.arange(
+        block_size + 1,
+        block_size + 1 + num_queries,
+        dtype=torch.int32,
+        device="cuda",
+    ).clamp_max(2 * block_size)
+    output = torch.empty_like(query)
+    softmax_scale = 1.0 / math.sqrt(head_size)
+
+    def reference() -> torch.Tensor:
+        key_scale_values = key_scales.repeat_interleave(32, dim=-1).float()
+        value_scale_values = value_scales.repeat_interleave(32, dim=-1).float()
+        dequant_key = (key_cache.float() * key_scale_values[:, None]).half().float()
+        dequant_value = (
+            (value_cache.float() * value_scale_values[:, None]).half().float()
+        )
+        result = torch.empty_like(output, dtype=torch.float32)
+        for query_idx in range(num_queries):
+            seq_len = int(seq_lens[query_idx].item())
+            token_indices = torch.arange(seq_len, device="cuda")
+            physical_pages = block_table[
+                query_idx,
+                token_indices // block_size,
+            ].to(torch.long)
+            page_offsets = token_indices % block_size
+            key_sequence = dequant_key[physical_pages, page_offsets, 0]
+            value_sequence = dequant_value[physical_pages, page_offsets, 0]
+            scores = torch.einsum(
+                "hd,td->ht",
+                query[query_idx].float(),
+                key_sequence,
+            )
+            probabilities = torch.softmax(scores * softmax_scale, dim=-1)
+            result[query_idx] = torch.einsum(
+                "ht,td->hd",
+                probabilities,
+                value_sequence,
+            )
+        return result
+
+    def run_decode() -> None:
+        extension.int8_block32_decode_paged(
+            query,
+            key_cache,
+            value_cache,
+            key_scales,
+            value_scales,
+            block_table,
+            seq_lens,
+            output,
+            softmax_scale,
+        )
+
+    run_decode()
+    torch.cuda.synchronize()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_decode()
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), reference(), atol=2e-3, rtol=2e-3)
+
+    seq_lens.copy_(torch.flip(seq_lens, dims=[0]))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), reference(), atol=2e-3, rtol=2e-3)

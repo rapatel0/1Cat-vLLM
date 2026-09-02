@@ -20,6 +20,7 @@ from vllm.utils.math_utils import cdiv, round_up
 from vllm.utils.mem_utils import format_gib
 from vllm.utils.torch_utils import get_dtype_size
 from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
     ChunkedLocalAttentionSpec,
     CircularBufferSpec,
     FullAttentionSpec,
@@ -950,7 +951,7 @@ def get_num_blocks(
         available_memory: Memory available for KV cache in bytes.
         page_size: The page size of the KV cache.
     """
-    num_blocks = int(available_memory // page_size // num_layers)
+    num_blocks = available_memory // page_size // num_layers
     num_blocks = max(num_blocks, 0)
     return may_override_num_blocks(vllm_config, num_blocks)
 
@@ -1033,37 +1034,71 @@ def unify_kv_cache_spec_page_size(
         return kv_cache_spec
 
     max_page_size = max(page_sizes)
+    int8_specs = [
+        spec
+        for spec in kv_cache_spec.values()
+        if isinstance(spec, AttentionSpec) and spec.kv_quant_mode.is_int8_block32
+    ]
+    requires_page_padding = any(max_page_size % page_size for page_size in page_sizes)
+    if requires_page_padding:
+        if not int8_specs:
+            raise NotImplementedError(
+                "The page size of the layer is not divisible by the "
+                "maximum page size. Cannot unify by adjusting block_size."
+            )
+        # INT8 block32 adds fixed per-page scale/owner metadata, so its page
+        # size is not proportional to block_size. Round the common allocation
+        # up to a multiple of every unpadded, non-INT8 page and leave any extra
+        # bytes as page-local tail padding for INT8 and Mamba caches.
+        unpadded_page_sizes = [
+            spec.page_size_bytes
+            for spec in kv_cache_spec.values()
+            if not isinstance(spec, MambaSpec)
+            and not (
+                isinstance(spec, AttentionSpec) and spec.kv_quant_mode.is_int8_block32
+            )
+        ]
+        page_quantum = math.lcm(*unpadded_page_sizes) if unpadded_page_sizes else 4
+        max_page_size = round_up(max_page_size, page_quantum)
+
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
-        if layer_spec.page_size_bytes == max_page_size:
+        layer_page_size = layer_spec.page_size_bytes
+        if layer_page_size == max_page_size:
             new_kv_cache_spec[layer_name] = layer_spec
+            continue
+
+        is_int8_block32 = (
+            isinstance(layer_spec, AttentionSpec)
+            and layer_spec.kv_quant_mode.is_int8_block32
+        )
+        if is_int8_block32 or (
+            requires_page_padding and isinstance(layer_spec, MambaSpec)
+        ):
+            replace_args = {"page_size_padded": max_page_size}
         else:
-            layer_page_size = layer_spec.page_size_bytes
             if max_page_size % layer_page_size != 0:
                 raise NotImplementedError(
                     "The page size of the layer is not divisible by the "
                     "maximum page size. Cannot unify by adjusting block_size."
                 )
             ratio = max_page_size // layer_page_size
-            new_block_size = layer_spec.block_size * ratio
-            replace_args = {"block_size": new_block_size}
-            # A padded page does not grow when only block_size changes. This
-            # happens for hybrid Mamba targets when a higher-precision draft
-            # cache has a larger page than the target cache. Keep the logical
-            # block-size adjustment and grow the physical padding with it.
+            replace_args = {"block_size": layer_spec.block_size * ratio}
+            # A padded page does not grow when only block_size changes. Keep
+            # the logical block-size adjustment and grow its allocation too.
             if (
                 isinstance(layer_spec, MambaSpec)
                 or getattr(layer_spec, "page_size_padded", None) is not None
             ):
                 replace_args["page_size_padded"] = max_page_size
-            new_spec = replace(layer_spec, **replace_args)
-            assert new_spec.page_size_bytes == max_page_size, (
-                f"Failed to unify KV page for {layer_name}: "
-                f"spec={layer_spec!r}, old_page={layer_page_size}, "
-                f"target_page={max_page_size}, replacement={replace_args!r}, "
-                f"new_page={new_spec.page_size_bytes}"
-            )
-            new_kv_cache_spec[layer_name] = new_spec
+        new_spec = replace(layer_spec, **replace_args)
+        assert new_spec.page_size_bytes == max_page_size, (
+            f"Failed to unify KV page for {layer_name}: "
+            f"spec={layer_spec!r}, old_page={layer_page_size}, "
+            f"target_page={max_page_size}, replacement={replace_args!r}, "
+            f"new_page={new_spec.page_size_bytes}"
+        )
+        new_kv_cache_spec[layer_name] = new_spec
     return new_kv_cache_spec
 
 
@@ -2140,7 +2175,7 @@ def _select_deepseek_v4_tuple_width(
     def pool_pages(width: int) -> int:
         return width * sum(
             cdiv(tuple_count, width) * page_count
-            for tuple_count, page_count in zip(tuple_counts, page_counts)
+            for tuple_count, page_count in zip(tuple_counts, page_counts, strict=True)
         )
 
     return min(
@@ -2221,13 +2256,13 @@ def _get_kv_cache_groups_uniform_groups(
         # NOTE(yifan): for now, inside a UniformKV group, each page_size should
         # have the same number of layers. This also means we don't need to pad layers
         # inside a partial-full layer tuple.
-        assert len(set(len(layers) for layers in layers_per_size.values())) == 1
+        assert len({len(layers) for layers in layers_per_size.values()}) == 1
         num_layers_per_size = len(next(iter(layers_per_size.values())))
 
         # Split layers inside each UniformKV group for aligned #(layers).
         # See `_get_kv_cache_groups_uniform_page_size` for more details.
         num_tuple_groups = cdiv(num_layers_per_size, num_layer_tuples)
-        layer_tuples = list(zip(*layers_per_size.values()))
+        layer_tuples = list(zip(*layers_per_size.values(), strict=True))
         for i in range(num_tuple_groups):
             group_layer_tuples = layer_tuples[i::num_tuple_groups]
             # Flatten tuples and build dict for from_specs
@@ -2357,7 +2392,7 @@ def generate_scheduler_kv_cache_config(
     Generate the KV cache configuration for the scheduler.
     """
     assert all(
-        [cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs]
+        cfg.num_blocks == kv_cache_configs[0].num_blocks for cfg in kv_cache_configs
     )
     # All workers have the same kv_cache_config except layer names, so use
     # an arbitrary one to initialize the scheduler.
@@ -2394,7 +2429,7 @@ def _report_kv_cache_config(
     # their window, so a naive `num_blocks // num_groups * block_size` formula
     # underestimates capacity for these models. DCP/PCP sharding is already
     # accounted for in each spec's `max_memory_usage_bytes`.
-    num_tokens = int(max_concurrency * max_model_len)
+    num_tokens = math.floor(max_concurrency * max_model_len)
 
     logger.info_once("GPU KV cache size: %s tokens", f"{num_tokens:,}")
     logger.info_once(
@@ -2573,7 +2608,9 @@ def _auto_fit_max_model_len(
     # Find the max_model_len that fits across all workers.
     auto_fit_max = original_max
     limiting_worker_mem = available_memory[0]
-    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
+    for groups, avail_mem in zip(
+        projected_groups_per_worker, available_memory, strict=True
+    ):
         if not groups:
             continue
         worker_max = _estimate_max_model_len_from_groups(vllm_config, groups, avail_mem)
@@ -2719,7 +2756,9 @@ def get_kv_cache_configs(
     override = vllm_config.cache_config.num_gpu_blocks_override
     if override is not None:
         adjusted_memory: list[int] = []
-        for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
+        for groups, avail_mem in zip(
+            projected_groups_per_worker, available_memory, strict=True
+        ):
             if not groups:
                 adjusted_memory.append(avail_mem)
                 continue
@@ -2738,7 +2777,9 @@ def get_kv_cache_configs(
         )
 
     # Check if the available memory is enough per worker.
-    for groups, avail_mem in zip(projected_groups_per_worker, available_memory):
+    for groups, avail_mem in zip(
+        projected_groups_per_worker, available_memory, strict=True
+    ):
         if not groups:
             continue
         _check_enough_kv_cache_memory(
@@ -2750,7 +2791,10 @@ def get_kv_cache_configs(
 
     kv_cache_configs: list[KVCacheConfig] = []
     for projected_groups, kv_cache_spec_one_worker, available_memory_one_worker in zip(
-        projected_groups_per_worker, kv_cache_specs, available_memory
+        projected_groups_per_worker,
+        kv_cache_specs,
+        available_memory,
+        strict=True,
     ):
         assert sum(len(group.layer_names) for group in projected_groups) == len(
             kv_cache_spec_one_worker

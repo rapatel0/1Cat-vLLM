@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import torch
@@ -240,8 +240,13 @@ def _reshape_kv_cache(
                             "INT8 block cache requires the scheduler and kernel "
                             "page sizes to match"
                         )
-                    kv_caches[layer_name] = kv_raw_tensor.view(
-                        kernel_num_blocks, kv_cache_spec.page_size_bytes
+                    real_page_size = replace(
+                        kv_cache_spec, page_size_padded=None
+                    ).page_size_bytes
+                    kv_caches[layer_name] = torch.as_strided(
+                        kv_raw_tensor.view(torch.int8),
+                        size=(kernel_num_blocks, real_page_size),
+                        stride=(kv_cache_spec.page_size_bytes, 1),
                     )
                     continue
 
