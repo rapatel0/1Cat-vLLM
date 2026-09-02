@@ -1,3 +1,3 @@
 # iron-state-v5
 iron_id	title	kind	cadence	parent	status	updated_at	work_commit
-001	Repair SM70 INT8 block32 performance and capacity	initial	implement,verify,redteam	-	in_progress	2026-09-02T18:32:34Z	-
+001	Repair SM70 INT8 block32 performance and capacity	initial	implement,verify,redteam	-	blocked	2026-09-02T23:06:32Z	-
