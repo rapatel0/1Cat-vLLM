@@ -2052,7 +2052,9 @@ __launch_bounds__(kGroupedVerifyThreads, 1) void flash_attention_grouped_verify_
   const int split_id = blockIdx.y;
   const int group_idx = blockIdx.z;
   const int query_start =
-      query_start_loc == nullptr ? 0 : query_start_loc[group_idx];
+      query_start_loc == nullptr
+          ? (SPARSE_PAGE4 ? group_idx * MAX_QUERY_TOKENS : 0)
+          : query_start_loc[group_idx];
   const int group_query_len =
       query_start_loc == nullptr
           ? query_len

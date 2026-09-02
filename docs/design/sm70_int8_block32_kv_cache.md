@@ -62,17 +62,9 @@ The INT8 warm-prefill ratios are 1.066 and 1.063. The old INT8 warm prefill was 
 
 The candidate B1 aggregate throughput reached 86.637 tokens per second. The old INT8 maximum was 15.551 tokens per second.
 
-The matched B8 runs used 8,192 input tokens and 128 output tokens for each request.
+The sealed B8 comparison uses 8,192 input tokens and 128 output tokens for each request.
 
-| Route | Cold elapsed | Steady elapsed | Steady aggregate rate |
-| --- | ---: | ---: | ---: |
-| E5M2 grouped control | 30.733 s | 12.636 s | 81.038 tokens/s |
-| INT8 grouped candidate | 23.910 s | 11.728 s | 87.315 tokens/s |
-| INT8 grouped candidate | - | 10.775 s | 95.035 tokens/s |
-
-The median candidate steady elapsed time is 11.251 seconds. Its ratio to the E5M2 steady time is 0.890.
-
-Each TP worker recorded 4,896 direct grouped verifier calls. The scalar INT8 control reached only 25.184 aggregate tokens per second.
+The controller acceptance report records the replacement-candidate latency, throughput, route counts, and artifact hashes.
 
 ## Kernel probes
 
@@ -86,7 +78,7 @@ The forced scale-growth writer improved from 1.355069 ms to 0.202947 ms per call
 
 ## Correctness and graph evidence
 
-Eight CUDA tests passed on SM70. They cover these contracts:
+Nine CUDA tests passed on SM70. They cover these contracts:
 
 - signed payloads and separate K/V scales;
 - batch-final scale growth and historical re-quantization;
@@ -94,6 +86,7 @@ Eight CUDA tests passed on SM70. They cover these contracts:
 - reordered and arbitrary block tables;
 - padded page strides and nonzero storage offsets;
 - direct grouped INT8 verification;
+- independent query ranges for grouped sparse page4 attention;
 - bridge and attention CUDA Graph replay.
 
 Seven cache-interface tests passed. They cover view geometry, alignment, hybrid unification, and rejected layouts.
@@ -101,6 +94,8 @@ Seven cache-interface tests passed. They cover view geometry, alignment, hybrid 
 The B1 and B8 engines captured PIECEWISE, target FULL, and DFlash2 FULL graphs. Runtime counters confirmed direct grouped INT8 verification for both batch sizes.
 
 The complete SM70 routing policy file passed 120 tests. It includes the 16-request capability boundary and the exact fallback boundary.
+
+The sparse page4 regression matches the accepted parent output hashes before and after CUDA Graph replay.
 
 ## Rejected alternatives
 
@@ -114,18 +109,14 @@ Packed 64-bit INT8 loads were unsafe for valid four-byte-aligned pages. The fina
 
 The owner workspace is `/workspace/iron-001-6d92c8c5` in pod `qwen38-int8-bench`.
 
-The call 2 extension SHA256 is `63918518b8646f485fc9db0eb1abe8a9baa8991f69a3d35e7fe9fda8f7823168`.
+The controller acceptance report records the replacement extension SHA256.
 
-Material call 2 result SHA256 values:
+The accepted parent and replacement sparse page4 outputs use these SHA256 values:
 
-- B1 INT8 JSON: `27924c6555a9b86e6c8b5b9d24909dfa7ec01a910d3b1122a2e65559737ac8ba`;
-- B1 INT8 log: `1023c31436d4ea2f49ed01655fc2a58ad016d9a3c4139aa5873b0bef9a68d729`;
-- B8 E5M2 JSON: `829f2eb3f13012eb7e69680a483861fa9100d0ea238bde207b64880cc9912e91`;
-- B8 E5M2 log: `4eb01a09fb54e9b17c4b62879655afdd38de91c3cf16a51a275bbe3c0a7b618f`;
-- B8 INT8 JSON: `80dc5bfb34238d32851a4803c823156a563fb4fe334f1c1ec2cab5a07ce2a8f3`;
-- B8 INT8 log: `2bf40522eabf269cbb095a9c295d743b2e070293ab56201d8e9486e23b0c637c`;
-- focused tests: `f309fe435ec3e9b2f54cee19f5ae313ad0cbfe947fb1da4c25bc4dc81d0cb3fa`;
-- policy tests: `0e36f0357704b0bb029ae0e2027e42d79b052d95e7f36ce9495ea138d0c3307a`.
+- direct output: `9f79c318c6f1537ea1ddaeb5f8dbca992d2e498783599f28ae4a9f78c46d94dd`;
+- graph replay output: `7f3ae5e4f37ff45b9fc7eb1e9bd6a02c2a354f68f6b61c6db0d020defbfedce8`.
+
+The controller acceptance report records all replacement result hashes.
 
 The pinned QUASAR manifest has SHA256 `818a675a075f38a4f1f5917c77fe644e6a2a489a775f2ce121bcb92af0e6e1c3`.
 

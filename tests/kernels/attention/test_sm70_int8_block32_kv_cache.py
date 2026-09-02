@@ -425,6 +425,100 @@ def test_grouped_verify_reads_int8_block32_scales_directly() -> None:
 
 
 @torch.inference_mode()
+def test_grouped_sparse_page4_multi_group_reads_each_query_range() -> None:
+    _require_sm70_extension()
+    from flash_attn_v100.flash_attn_interface import flash_attn_v100_cuda
+
+    torch.manual_seed(31)
+    num_groups = 2
+    queries_per_group = 8
+    num_query_heads = 6
+    head_size = 256
+    query = torch.zeros(
+        num_groups * queries_per_group,
+        num_query_heads,
+        head_size,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    query[:queries_per_group, :, 0] = 4.0
+    query[queries_per_group:, :, 0] = -4.0
+    key_cache = torch.zeros(
+        1,
+        4,
+        1,
+        head_size,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    value_cache = torch.zeros_like(key_cache)
+    key_cache[0, 0, 0, 0] = 1.0
+    key_cache[0, 1, 0, 0] = -1.0
+    value_cache[0, 0, 0].fill_(2.0)
+    value_cache[0, 1, 0].fill_(-2.0)
+    block_table = torch.zeros(
+        (num_groups, 1),
+        dtype=torch.int32,
+        device="cuda",
+    )
+    token_masks = torch.full(
+        (num_groups, 1),
+        0xFFFFFFFF,
+        dtype=torch.uint32,
+        device="cuda",
+    )
+    seq_lens = torch.full(
+        (num_groups,),
+        4,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    output = torch.empty_like(query)
+    lse = torch.empty(
+        (num_groups * queries_per_group, num_query_heads),
+        dtype=torch.float32,
+        device="cuda",
+    )
+
+    def run_grouped_sparse() -> None:
+        flash_attn_v100_cuda.grouped_sparse_page4_fwd(
+            query,
+            key_cache,
+            value_cache,
+            output,
+            block_table,
+            token_masks,
+            seq_lens,
+            lse,
+            1.0,
+        )
+
+    def reference() -> torch.Tensor:
+        keys = key_cache[0, :, 0].float()
+        values = value_cache[0, :, 0].float()
+        scores = torch.einsum("qhd,kd->qhk", query.float(), keys)
+        probabilities = torch.softmax(scores, dim=-1)
+        return torch.einsum("qhk,kd->qhd", probabilities, values)
+
+    run_grouped_sparse()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), reference(), atol=2e-2, rtol=2e-2)
+    assert torch.all(output[:queries_per_group] > 0)
+    assert torch.all(output[queries_per_group:] < 0)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_grouped_sparse()
+    query[:queries_per_group, :, 0] = -3.0
+    query[queries_per_group:, :, 0] = 3.0
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), reference(), atol=2e-2, rtol=2e-2)
+    assert torch.all(output[:queries_per_group] < 0)
+    assert torch.all(output[queries_per_group:] > 0)
+
+
+@torch.inference_mode()
 def test_grouped_verify_batches_eight_int8_block32_requests() -> None:
     _require_sm70_extension()
     flash_attn_v100 = pytest.importorskip("flash_attn_v100")
