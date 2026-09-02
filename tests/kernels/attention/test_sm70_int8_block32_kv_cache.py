@@ -228,6 +228,202 @@ def test_int8_block32_publish_requantize_and_decode() -> None:
     )
 
 
+def test_int8_block32_bridge_preserves_paged_layout_and_graph_replay() -> None:
+    extension = _require_sm70_extension()
+    torch.manual_seed(19)
+
+    num_blocks = 4
+    block_size = 16
+    num_kv_heads = 2
+    head_size = 64
+    page_padding = 128
+    prefix_bytes = 12
+    spec = AttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.int8,
+        kv_quant_mode=KVQuantMode.INT8_BLOCK32,
+    )
+    page_stride = spec.page_size_bytes + page_padding
+    backing = torch.zeros(
+        prefix_bytes + num_blocks * page_stride + 16,
+        dtype=torch.int8,
+        device="cuda",
+    )
+    raw = backing[prefix_bytes : prefix_bytes + num_blocks * page_stride]
+    key_cache, value_cache, key_scales, value_scales, _ = (
+        make_int8_block32_kv_cache_views(
+            raw,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+            page_stride_bytes=page_stride,
+        )
+    )
+    key_cache.random_(-127, 128)
+    value_cache.random_(-127, 128)
+    key_scales.uniform_(0.001, 0.02)
+    value_scales.uniform_(0.001, 0.02)
+
+    batch_size = 2
+    output_block_size = 8
+    output_blocks_per_seq = 4
+    key_out = torch.empty(
+        batch_size * output_blocks_per_seq,
+        output_block_size,
+        num_kv_heads,
+        head_size,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    value_out = torch.empty_like(key_out)
+    block_table = torch.tensor(
+        [[3, 1], [2, 0]],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    seq_lens = torch.tensor([27, 19], dtype=torch.int32, device="cuda")
+
+    def run_bridge() -> None:
+        extension.int8_block32_paged_kv_to_fp16(
+            key_cache,
+            value_cache,
+            key_scales,
+            value_scales,
+            block_table,
+            seq_lens,
+            key_out,
+            value_out,
+        )
+
+    def check_output() -> None:
+        key_scale_values = key_scales.repeat_interleave(32, dim=-1)
+        value_scale_values = value_scales.repeat_interleave(32, dim=-1)
+        for batch_idx in range(batch_size):
+            seq_len = int(seq_lens[batch_idx].item())
+            token_indices = torch.arange(seq_len, device="cuda")
+            pages = block_table[batch_idx, token_indices // block_size].long()
+            offsets = token_indices % block_size
+            expected_key = (
+                key_cache[pages, offsets].float() * key_scale_values[pages].float()
+            ).half()
+            expected_value = (
+                value_cache[pages, offsets].float() * value_scale_values[pages].float()
+            ).half()
+            output_start = batch_idx * output_blocks_per_seq
+            actual_key = key_out[
+                output_start : output_start + output_blocks_per_seq
+            ].flatten(0, 1)[:seq_len]
+            actual_value = value_out[
+                output_start : output_start + output_blocks_per_seq
+            ].flatten(0, 1)[:seq_len]
+            torch.testing.assert_close(actual_key, expected_key, atol=0, rtol=0)
+            torch.testing.assert_close(actual_value, expected_value, atol=0, rtol=0)
+
+    run_bridge()
+    torch.cuda.synchronize()
+    check_output()
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_bridge()
+    block_table.copy_(torch.tensor([[0, 2], [1, 3]], dtype=torch.int32, device="cuda"))
+    graph.replay()
+    torch.cuda.synchronize()
+    check_output()
+
+
+def test_grouped_verify_reads_int8_block32_scales_directly() -> None:
+    _require_sm70_extension()
+    flash_attn_v100 = pytest.importorskip("flash_attn_v100")
+    torch.manual_seed(23)
+
+    query_len = 8
+    num_query_heads = 6
+    num_kv_heads = 1
+    head_size = 256
+    block_size = 16
+    seq_len = 24
+    spec = AttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.int8,
+        kv_quant_mode=KVQuantMode.INT8_BLOCK32,
+    )
+    raw = torch.zeros(2 * spec.page_size_bytes, dtype=torch.int8, device="cuda")
+    key_cache, value_cache, key_scales, value_scales, _ = (
+        make_int8_block32_kv_cache_views(
+            raw,
+            num_blocks=2,
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+        )
+    )
+    key_cache.random_(-127, 128)
+    value_cache.random_(-127, 128)
+    key_scales.uniform_(0.001, 0.02)
+    value_scales.uniform_(0.001, 0.02)
+    query = torch.randn(
+        query_len,
+        num_query_heads,
+        head_size,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    block_table = torch.tensor([[1, 0]], dtype=torch.int32, device="cuda")
+    seq_lens = torch.tensor([seq_len], dtype=torch.int32, device="cuda")
+    output = torch.empty_like(query)
+    softmax_scale = 1.0 / math.sqrt(head_size)
+
+    flash_attn_v100.flash_attn_grouped_verify_paged(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        softmax_scale=softmax_scale,
+        out=output,
+        kv_cache_dtype="int8_block32",
+        one_pass=True,
+    )
+
+    token_indices = torch.arange(seq_len, device="cuda")
+    pages = block_table[0, token_indices // block_size].long()
+    offsets = token_indices % block_size
+    key_scale_values = key_scales.repeat_interleave(32, dim=-1)
+    value_scale_values = value_scales.repeat_interleave(32, dim=-1)
+    key_sequence = (
+        (key_cache[pages, offsets, 0].float() * key_scale_values[pages, 0].float())
+        .half()
+        .float()
+    )
+    value_sequence = (
+        (value_cache[pages, offsets, 0].float() * value_scale_values[pages, 0].float())
+        .half()
+        .float()
+    )
+    reference = torch.empty_like(output, dtype=torch.float32)
+    prefix_len = seq_len - query_len
+    for query_idx in range(query_len):
+        visible_len = prefix_len + query_idx + 1
+        scores = torch.einsum(
+            "hd,td->ht",
+            query[query_idx].float(),
+            key_sequence[:visible_len],
+        )
+        probabilities = torch.softmax(scores * softmax_scale, dim=-1)
+        reference[query_idx] = torch.einsum(
+            "ht,td->hd",
+            probabilities,
+            value_sequence[:visible_len],
+        )
+
+    torch.testing.assert_close(output.float(), reference, atol=3e-2, rtol=3e-2)
+
+
 @pytest.mark.parametrize("num_queries", [8, 16])
 @pytest.mark.parametrize("block_size", [16, 1648])
 def test_int8_block32_expanded_metadata_cuda_graph_replay(

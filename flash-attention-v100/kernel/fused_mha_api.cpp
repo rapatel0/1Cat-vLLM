@@ -58,6 +58,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("int8_block32_reshape_and_cache",
         &flash_attention_int8_block32_reshape_and_cache,
         "Quantize FP16 K/V into an INT8 cache with adaptive page block scales");
+  m.def("int8_block32_paged_kv_to_fp16",
+        &flash_attention_int8_block32_paged_kv_to_fp16,
+        "Expand paged block-scaled INT8 K/V into an FP16 workspace");
   m.def("int8_block32_decode_paged", &flash_attention_int8_block32_decode_paged,
         "Decode paged block-scaled INT8 K/V with in-register dequantization");
   m.def("int8_block32_prefill_paged",

@@ -524,6 +524,7 @@ _fp8_e5m2_paged_kv_to_fp16_checked = False
 _int8_block32_decode_paged = None
 _int8_block32_prefill_paged = None
 _int8_block32_reshape_and_cache = None
+_int8_block32_paged_kv_to_fp16 = None
 _int8_block32_ops_checked = False
 _flash_attn_turboquant_decode_paged = None
 _flash_attn_turboquant_decode_checked = False
@@ -1788,7 +1789,7 @@ def _try_sm70_fa2_d256_prefill(
 
 def _get_int8_block32_ops():
     global _int8_block32_decode_paged, _int8_block32_prefill_paged
-    global _int8_block32_reshape_and_cache
+    global _int8_block32_reshape_and_cache, _int8_block32_paged_kv_to_fp16
     global _int8_block32_ops_checked
     if not _int8_block32_ops_checked:
         _int8_block32_ops_checked = True
@@ -1804,14 +1805,21 @@ def _get_int8_block32_ops():
             _int8_block32_decode_paged = extension.int8_block32_decode_paged
             _int8_block32_prefill_paged = extension.int8_block32_prefill_paged
             _int8_block32_reshape_and_cache = extension.int8_block32_reshape_and_cache
+            _int8_block32_paged_kv_to_fp16 = getattr(
+                extension,
+                "int8_block32_paged_kv_to_fp16",
+                None,
+            )
         except (ImportError, AttributeError):
             _int8_block32_decode_paged = None
             _int8_block32_prefill_paged = None
             _int8_block32_reshape_and_cache = None
+            _int8_block32_paged_kv_to_fp16 = None
     return (
         _int8_block32_decode_paged,
         _int8_block32_prefill_paged,
         _int8_block32_reshape_and_cache,
+        _int8_block32_paged_kv_to_fp16,
     )
 
 
@@ -4459,6 +4467,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.int8_block32_decode_paged,
             self.int8_block32_prefill_paged,
             self.int8_block32_reshape_and_cache,
+            self.int8_block32_paged_kv_to_fp16,
         ) = _get_int8_block32_ops()
         # V100 FA2 kernels consume fp16 Q. FP8 KV cache support is implemented
         # as storage compression only, with K/V dequantized inside FA2 kernels.
@@ -5332,9 +5341,21 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         global _logged_prefill_smallq_grouped_verify_gate
         block_table = getattr(attn_metadata, "block_table", None)
         seq_lens = getattr(attn_metadata, "seq_lens", None)
+        fp8_source = bool(
+            self.kv_cache_dtype == "fp8_e5m2"
+            and key_cache.dtype == torch.uint8
+            and value_cache.dtype == torch.uint8
+        )
+        int8_block32_source = bool(
+            self.kv_cache_dtype == "int8_block32"
+            and key_cache.dtype == torch.int8
+            and value_cache.dtype == torch.int8
+            and self.int8_block32_paged_kv_to_fp16 is not None
+        )
         allowed = bool(
             self.use_dflash2_grouped_verify
             and self.flash_attn_grouped_verify_paged is not None
+            and (fp8_source or int8_block32_source)
             and getattr(attn_metadata, "is_dflash_selector_target", False)
             and getattr(attn_metadata, "max_model_len", 0)
             >= self.dflash2_grouped_verify_min_model_len
@@ -5355,11 +5376,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and key_cache.shape[1] in (1648, 1728, 3296, 3456)
             and tuple(key_cache.shape[2:]) == (1, 256)
             and tuple(value_cache.shape) == tuple(key_cache.shape)
-            and key_cache.dtype == torch.uint8
-            and value_cache.dtype == torch.uint8
             and key_cache.stride(-1) == 1
             and value_cache.stride(-1) == 1
-            and self.kv_cache_dtype == "fp8_e5m2"
             and block_table is not None
             and block_table.ndim == 2
             and block_table.shape[0] == 1
@@ -7227,6 +7245,139 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         return output
 
+    def _bridge_int8_block32_cache(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        key_scales: torch.Tensor,
+        value_scales: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        capacity_hint: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Expand active signed INT8 pages into a graph-stable FP16 workspace."""
+        if (
+            self.int8_block32_paged_kv_to_fp16 is None
+            or block_table.ndim != 2
+            or block_table.shape[0] != 1
+            or seq_lens.ndim != 1
+            or seq_lens.shape[0] != 1
+        ):
+            return None
+
+        input_block_size = int(key_cache.shape[1])
+        input_capacity = int(block_table.shape[1]) * input_block_size
+        if capacity_hint is None or capacity_hint <= 0:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            capacity_hint = int(seq_lens.max().item())
+        active_capacity = min(input_capacity, max(1, capacity_hint))
+        active_input_blocks = min(
+            int(block_table.shape[1]),
+            _cdiv_int(active_capacity, input_block_size),
+        )
+        if active_input_blocks <= 0:
+            return None
+        active_block_table = block_table[:, :active_input_blocks]
+        required_blocks = _cdiv_int(
+            active_input_blocks * input_block_size,
+            _FP8_PREFILL_BRIDGE_PAGE_SIZE,
+        )
+        workspace = _get_fp8_prefill_bridge_workspace(
+            key_cache,
+            required_blocks,
+        )
+        if workspace is None:
+            return None
+        key_out, value_out, output_block_table = workspace
+        self.int8_block32_paged_kv_to_fp16(
+            key_cache,
+            value_cache,
+            key_scales,
+            value_scales,
+            active_block_table,
+            seq_lens,
+            key_out,
+            value_out,
+        )
+        return key_out, value_out, output_block_table
+
+    def _call_dflash2_int8_grouped_verify(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        logger.info_once(
+            "FLASH_ATTN_V100 DFlash2 direct signed INT8 grouped verifier active."
+        )
+        self.flash_attn_grouped_verify_paged(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata.block_table[:1],
+            attn_metadata.seq_lens[:1],
+            softmax_scale=self.scale,
+            out=out,
+            kv_cache_dtype="int8_block32",
+            k_scale=1.0,
+            v_scale=1.0,
+            one_pass=True,
+        )
+        _record_route("prefill_smallq_dflash2_int8_block32_grouped_verify")
+
+    def _run_int8_block32_prefill_bridge(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        key_scales: torch.Tensor,
+        value_scales: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        seq_len: int,
+        out: torch.Tensor,
+    ) -> bool:
+        if not self.use_flash_v100_prefill_paged or query.shape[0] < 32:
+            return False
+        bridged = self._bridge_int8_block32_cache(
+            key_cache,
+            value_cache,
+            key_scales,
+            value_scales,
+            block_table,
+            seq_lens,
+            capacity_hint=seq_len,
+        )
+        if bridged is None:
+            return False
+        key_out, value_out, output_block_table = bridged
+        query_batched = query.unsqueeze(0)
+        out_batched = out.unsqueeze(0)
+        result = self.flash_attn_prefill_paged(
+            query_batched,
+            key_out,
+            value_out,
+            output_block_table,
+            seq_lens,
+            softmax_scale=self.scale,
+            out=out_batched,
+            kv_cache_dtype="auto",
+            k_scale=1.0,
+            v_scale=1.0,
+            causal=True,
+            window_size=(-1, -1),
+        )
+        if result.data_ptr() != out_batched.data_ptr():
+            out_batched.copy_(result)
+        _record_route("prefill_prefix_int8_block32_bridge_fp16")
+        return True
+
     def _flash_v100_int8_small_query_prefill_as_decode(
         self,
         query: torch.Tensor,
@@ -7262,6 +7413,46 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         )
         query = query[:num_query_tokens]
         out_view = output[:num_query_tokens]
+        if self._dflash2_grouped_verify_allowed(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            num_query_tokens=num_query_tokens,
+        ):
+            self._call_dflash2_int8_grouped_verify(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                out=out_view,
+            )
+            return output
+
+        if (
+            num_query_tokens >= 32
+            and attn_metadata.block_table.shape[0] == 1
+            and not torch.cuda.is_current_stream_capturing()
+        ):
+            seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+            seq_len = (
+                int(seq_lens_cpu[0].item())
+                if seq_lens_cpu is not None
+                else int(attn_metadata.seq_lens[0].item())
+            )
+            if self._run_int8_block32_prefill_bridge(
+                query,
+                key_cache,
+                value_cache,
+                key_scales,
+                value_scales,
+                attn_metadata.block_table[:1],
+                attn_metadata.seq_lens[:1],
+                seq_len=seq_len,
+                out=out_view,
+            ):
+                return output
+
         persistent_block_table = getattr(
             attn_metadata,
             "smallq_decode_block_table",

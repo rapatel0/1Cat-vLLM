@@ -1430,6 +1430,30 @@ def flash_attn_prefill_paged(
     return _copy_bhmd_to_bmhd_out(out_, out_original)
 
 
+def int8_block32_paged_kv_to_fp16(
+    key_cache: torch.Tensor,
+    value_cache: torch.Tensor,
+    key_scales: torch.Tensor,
+    value_scales: torch.Tensor,
+    block_table: torch.Tensor,
+    seq_lens: torch.Tensor,
+    key_out: torch.Tensor,
+    value_out: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Expand signed block32 K/V into preallocated FP16 paged workspaces."""
+    flash_attn_v100_cuda.int8_block32_paged_kv_to_fp16(
+        key_cache,
+        value_cache,
+        key_scales,
+        value_scales,
+        maybe_contiguous(block_table),
+        maybe_contiguous(seq_lens),
+        key_out,
+        value_out,
+    )
+    return key_out, value_out
+
+
 def fp8_e5m2_paged_kv_to_fp16(
     key_cache: torch.Tensor,
     value_cache: torch.Tensor,

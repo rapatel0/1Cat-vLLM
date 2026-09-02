@@ -1,3 +1,5 @@
+import math
+
 import pytest
 import torch
 
@@ -189,11 +191,16 @@ def test_int8_block32_hybrid_unification_uses_tail_padding() -> None:
     assert isinstance(unified_int8, AttentionSpec)
     assert isinstance(unified_mamba, MambaSpec)
     assert {spec.page_size_bytes for spec in unified.values()} == {common_page}
-    assert common_page == draft_spec.page_size_bytes
-    assert unified["draft"].block_size == draft_spec.block_size
-    assert unified_int8.block_size == int8_spec.block_size
+    int8_fixed_bytes = int8_spec.page_size_bytes - int8_spec.real_page_size_bytes
+    metadata_aware_page = 2 * int8_spec.real_page_size_bytes + int8_fixed_bytes
+    assert common_page == math.ceil(metadata_aware_page / 16) * 16
+    unified_draft = unified["draft"]
+    assert isinstance(unified_draft, AttentionSpec)
+    assert unified_draft.block_size == draft_spec.block_size
+    assert unified_draft.page_size_padded == common_page
+    assert unified_int8.block_size == 2 * int8_spec.block_size
     assert unified_int8.page_size_padded == common_page
-    assert unified_mamba.block_size == mamba_spec.block_size
+    assert unified_mamba.block_size == 2 * mamba_spec.block_size
     assert unified_mamba.page_size_padded == common_page
 
 

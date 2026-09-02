@@ -11,7 +11,7 @@
 namespace {
 
 constexpr int kChannelBlockSize = 32;
-constexpr int kThreads = 256;
+constexpr int kThreads = 256;  // Eight warps per page-scale owner.
 
 __device__ __forceinline__ float warp_max(float value) {
 #pragma unroll
@@ -81,19 +81,20 @@ __global__ void int8_block32_reshape_and_cache_kernel(
     const int* __restrict__ page_owners,
     const int64_t* __restrict__ slot_mapping, const int num_tokens,
     const int num_blocks, const int block_size, const int num_heads,
-    const int head_dim, const int channel_blocks,
-    const int64_t owner_stride, const int64_t key_stride0,
-    const int64_t key_stride1, const int64_t value_stride0,
-    const int64_t value_stride1, const int64_t key_block_stride,
-    const int64_t key_token_stride, const int64_t key_head_stride,
-    const int64_t value_block_stride, const int64_t value_token_stride,
-    const int64_t value_head_stride, const int64_t scale_block_stride,
-    const int64_t scale_head_stride) {
+    const int head_dim, const int channel_blocks, const int64_t owner_stride,
+    const int64_t key_stride0, const int64_t key_stride1,
+    const int64_t value_stride0, const int64_t value_stride1,
+    const int64_t key_block_stride, const int64_t key_token_stride,
+    const int64_t key_head_stride, const int64_t value_block_stride,
+    const int64_t value_token_stride, const int64_t value_head_stride,
+    const int64_t scale_block_stride, const int64_t scale_head_stride) {
+  constexpr int kWarps = kThreads / 32;
   const int head_idx = blockIdx.x;
   const int channel_block = blockIdx.y;
   const int owner_token = blockIdx.z;
-  const int lane = threadIdx.x;
-  if (head_idx >= num_heads || channel_block >= channel_blocks || lane >= 32 ||
+  const int lane = threadIdx.x % 32;
+  const int warp_idx = threadIdx.x / 32;
+  if (head_idx >= num_heads || channel_block >= channel_blocks ||
       owner_token >= num_tokens) {
     return;
   }
@@ -116,13 +117,23 @@ __global__ void int8_block32_reshape_and_cache_kernel(
   const int64_t scale_index =
       static_cast<int64_t>(physical_block) * scale_block_stride +
       static_cast<int64_t>(head_idx) * scale_head_stride + channel_block;
+  __shared__ int reset_page;
+  __shared__ float key_warp_max[kWarps];
+  __shared__ float value_warp_max[kWarps];
+  __shared__ float old_key_scale_shared;
+  __shared__ float old_value_scale_shared;
+  __shared__ float next_key_scale_shared;
+  __shared__ float next_value_scale_shared;
 
-  bool reset_page = false;
-  for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
-    reset_page |= slot_mapping[token_idx] == page_slot_base;
+  if (threadIdx.x == 0) {
+    reset_page = 0;
+    for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
+      reset_page |= slot_mapping[token_idx] == page_slot_base;
+    }
   }
+  __syncthreads();
   if (reset_page) {
-    for (int token = 0; token < block_size; ++token) {
+    for (int token = warp_idx; token < block_size; token += kWarps) {
       if (valid) {
         key_cache[static_cast<int64_t>(physical_block) * key_block_stride +
                   static_cast<int64_t>(token) * key_token_stride +
@@ -132,75 +143,93 @@ __global__ void int8_block32_reshape_and_cache_kernel(
                     static_cast<int64_t>(head_idx) * value_head_stride + d] = 0;
       }
     }
-    if (lane == 0) {
+  }
+  if (threadIdx.x == 0) {
+    if (reset_page) {
       key_scales[scale_index] = __float2half(0.0f);
       value_scales[scale_index] = __float2half(0.0f);
     }
+    old_key_scale_shared = __half2float(key_scales[scale_index]);
+    old_value_scale_shared = __half2float(value_scales[scale_index]);
   }
-  __syncwarp();
+  __syncthreads();
 
-  // Exactly one CTA owns each physical page, so noncontiguous or reordered
-  // slot mappings cannot race page-local scale growth. First determine the
-  // batch-final scale, then re-quantize historical values at most once.
-  const float old_key_scale = __half2float(key_scales[scale_index]);
-  const float old_value_scale = __half2float(value_scales[scale_index]);
+  // One CTA remains the semantic owner for this page scale. Its warps split
+  // the page scan without weakening batch-final scale publication.
   float batch_key_max = 0.0f;
   float batch_value_max = 0.0f;
-  for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
+  for (int token_idx = warp_idx; token_idx < num_tokens; token_idx += kWarps) {
     const int64_t slot = slot_mapping[token_idx];
     if (slot < page_slot_base || slot >= page_slot_base + block_size) {
       continue;
     }
     const float key_input =
-        valid ? __half2float(key[static_cast<int64_t>(token_idx) * key_stride0 +
-                                 static_cast<int64_t>(head_idx) * key_stride1 + d])
+        valid ? __half2float(
+                    key[static_cast<int64_t>(token_idx) * key_stride0 +
+                        static_cast<int64_t>(head_idx) * key_stride1 + d])
               : 0.0f;
     const float value_input =
         valid ? __half2float(
                     value[static_cast<int64_t>(token_idx) * value_stride0 +
                           static_cast<int64_t>(head_idx) * value_stride1 + d])
               : 0.0f;
-    batch_key_max = fmaxf(
-        batch_key_max,
-        __shfl_sync(0xffffffff, warp_max(fabsf(key_input)), 0));
-    batch_value_max = fmaxf(
-        batch_value_max,
-        __shfl_sync(0xffffffff, warp_max(fabsf(value_input)), 0));
+    batch_key_max = fmaxf(batch_key_max, fabsf(key_input));
+    batch_value_max = fmaxf(batch_value_max, fabsf(value_input));
   }
+  batch_key_max = warp_max(batch_key_max);
+  batch_value_max = warp_max(batch_value_max);
+  if (lane == 0) {
+    key_warp_max[warp_idx] = batch_key_max;
+    value_warp_max[warp_idx] = batch_value_max;
+  }
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    float key_max = 0.0f;
+    float value_max = 0.0f;
+#pragma unroll
+    for (int warp = 0; warp < kWarps; ++warp) {
+      key_max = fmaxf(key_max, key_warp_max[warp]);
+      value_max = fmaxf(value_max, value_warp_max[warp]);
+    }
+    next_key_scale_shared = __half2float(
+        __float2half_ru(fmaxf(old_key_scale_shared, key_max / 127.0f)));
+    next_value_scale_shared = __half2float(
+        __float2half_ru(fmaxf(old_value_scale_shared, value_max / 127.0f)));
+  }
+  __syncthreads();
 
-  const float next_key_scale = __half2float(
-      __float2half_ru(fmaxf(old_key_scale, batch_key_max / 127.0f)));
-  const float next_value_scale = __half2float(
-      __float2half_ru(fmaxf(old_value_scale, batch_value_max / 127.0f)));
-  if (next_key_scale > old_key_scale && old_key_scale > 0.0f && valid) {
-    for (int token = 0; token < block_size; ++token) {
+  if (next_key_scale_shared > old_key_scale_shared &&
+      old_key_scale_shared > 0.0f && valid) {
+    for (int token = warp_idx; token < block_size; token += kWarps) {
       const int64_t index =
           static_cast<int64_t>(physical_block) * key_block_stride +
           static_cast<int64_t>(token) * key_token_stride +
           static_cast<int64_t>(head_idx) * key_head_stride + d;
       key_cache[index] = quantize_symmetric_int8(
-          static_cast<float>(key_cache[index]) * old_key_scale,
-          next_key_scale);
+          static_cast<float>(key_cache[index]) * old_key_scale_shared,
+          next_key_scale_shared);
     }
   }
-  if (next_value_scale > old_value_scale && old_value_scale > 0.0f && valid) {
-    for (int token = 0; token < block_size; ++token) {
+  if (next_value_scale_shared > old_value_scale_shared &&
+      old_value_scale_shared > 0.0f && valid) {
+    for (int token = warp_idx; token < block_size; token += kWarps) {
       const int64_t index =
           static_cast<int64_t>(physical_block) * value_block_stride +
           static_cast<int64_t>(token) * value_token_stride +
           static_cast<int64_t>(head_idx) * value_head_stride + d;
       value_cache[index] = quantize_symmetric_int8(
-          static_cast<float>(value_cache[index]) * old_value_scale,
-          next_value_scale);
+          static_cast<float>(value_cache[index]) * old_value_scale_shared,
+          next_value_scale_shared);
     }
   }
-  if (lane == 0) {
-    key_scales[scale_index] = __float2half(next_key_scale);
-    value_scales[scale_index] = __float2half(next_value_scale);
+  __syncthreads();
+  if (threadIdx.x == 0) {
+    key_scales[scale_index] = __float2half(next_key_scale_shared);
+    value_scales[scale_index] = __float2half(next_value_scale_shared);
   }
-  __syncwarp();
+  __syncthreads();
 
-  for (int token_idx = 0; token_idx < num_tokens; ++token_idx) {
+  for (int token_idx = warp_idx; token_idx < num_tokens; token_idx += kWarps) {
     const int64_t slot = slot_mapping[token_idx];
     if (slot < page_slot_base || slot >= page_slot_base + block_size) {
       continue;
@@ -210,9 +239,9 @@ __global__ void int8_block32_reshape_and_cache_kernel(
       const float key_input =
           __half2float(key[static_cast<int64_t>(token_idx) * key_stride0 +
                            static_cast<int64_t>(head_idx) * key_stride1 + d]);
-      const float value_input =
-          __half2float(value[static_cast<int64_t>(token_idx) * value_stride0 +
-                             static_cast<int64_t>(head_idx) * value_stride1 + d]);
+      const float value_input = __half2float(
+          value[static_cast<int64_t>(token_idx) * value_stride0 +
+                static_cast<int64_t>(head_idx) * value_stride1 + d]);
       const int64_t key_index =
           static_cast<int64_t>(physical_block) * key_block_stride +
           static_cast<int64_t>(block_offset) * key_token_stride +
@@ -221,10 +250,101 @@ __global__ void int8_block32_reshape_and_cache_kernel(
           static_cast<int64_t>(physical_block) * value_block_stride +
           static_cast<int64_t>(block_offset) * value_token_stride +
           static_cast<int64_t>(head_idx) * value_head_stride + d;
-      key_cache[key_index] = quantize_symmetric_int8(key_input, next_key_scale);
+      key_cache[key_index] =
+          quantize_symmetric_int8(key_input, next_key_scale_shared);
       value_cache[value_index] =
-          quantize_symmetric_int8(value_input, next_value_scale);
+          quantize_symmetric_int8(value_input, next_value_scale_shared);
     }
+  }
+}
+
+__global__ void int8_block32_paged_kv_to_fp16_kernel(
+    const int8_t* __restrict__ key_cache,
+    const int8_t* __restrict__ value_cache,
+    const __half* __restrict__ key_scales,
+    const __half* __restrict__ value_scales,
+    const int* __restrict__ block_table, const int* __restrict__ seq_lens,
+    __half* __restrict__ key_out, __half* __restrict__ value_out,
+    const int batch_size, const int max_num_blocks, const int input_block_size,
+    const int output_blocks_per_seq, const int output_block_size,
+    const int num_heads, const int head_dim, const int channel_blocks,
+    const int64_t key_block_stride, const int64_t key_token_stride,
+    const int64_t key_head_stride, const int64_t value_block_stride,
+    const int64_t value_token_stride, const int64_t value_head_stride,
+    const int64_t scale_block_stride, const int64_t scale_head_stride,
+    const int64_t key_out_block_stride, const int64_t key_out_token_stride,
+    const int64_t key_out_head_stride, const int64_t value_out_block_stride,
+    const int64_t value_out_token_stride, const int64_t value_out_head_stride) {
+  const int batch_idx = blockIdx.y;
+  if (batch_idx >= batch_size) {
+    return;
+  }
+
+  const int pairs_per_head = head_dim / 2;
+  const int64_t pairs_per_token =
+      static_cast<int64_t>(num_heads) * pairs_per_head;
+  const int max_tokens = output_blocks_per_seq * output_block_size;
+  const int seq_len = seq_lens[batch_idx];
+  const int padded_seq_len = (seq_len + 15) & ~15;
+  const int active_seq_len =
+      padded_seq_len < max_tokens ? padded_seq_len : max_tokens;
+  const int64_t active_pairs =
+      static_cast<int64_t>(active_seq_len) * pairs_per_token;
+  const int64_t thread_stride = static_cast<int64_t>(gridDim.x) * blockDim.x;
+  for (int64_t pair_idx =
+           static_cast<int64_t>(blockIdx.x) * blockDim.x + threadIdx.x;
+       pair_idx < active_pairs; pair_idx += thread_stride) {
+    const int token_idx = static_cast<int>(pair_idx / pairs_per_token);
+    const int pair_in_token = static_cast<int>(pair_idx % pairs_per_token);
+    const int head_idx = pair_in_token / pairs_per_head;
+    const int element_idx = (pair_in_token % pairs_per_head) * 2;
+
+    __half2 key_pair = __float2half2_rn(0.0f);
+    __half2 value_pair = __float2half2_rn(0.0f);
+    if (token_idx < seq_len) {
+      const int logical_block = token_idx / input_block_size;
+      const int input_block_offset = token_idx % input_block_size;
+      const int physical_block =
+          __ldg(&block_table[batch_idx * max_num_blocks + logical_block]);
+      const int64_t key_input_offset =
+          static_cast<int64_t>(physical_block) * key_block_stride +
+          static_cast<int64_t>(input_block_offset) * key_token_stride +
+          static_cast<int64_t>(head_idx) * key_head_stride + element_idx;
+      const int64_t value_input_offset =
+          static_cast<int64_t>(physical_block) * value_block_stride +
+          static_cast<int64_t>(input_block_offset) * value_token_stride +
+          static_cast<int64_t>(head_idx) * value_head_stride + element_idx;
+      const int channel_block = element_idx / kChannelBlockSize;
+      const int64_t scale_offset =
+          static_cast<int64_t>(physical_block) * scale_block_stride +
+          static_cast<int64_t>(head_idx) * scale_head_stride + channel_block;
+      const char2 key_codes =
+          *reinterpret_cast<const char2*>(key_cache + key_input_offset);
+      const char2 value_codes =
+          *reinterpret_cast<const char2*>(value_cache + value_input_offset);
+      const float key_scale = __half2float(key_scales[scale_offset]);
+      const float value_scale = __half2float(value_scales[scale_offset]);
+      key_pair = __floats2half2_rn(static_cast<float>(key_codes.x) * key_scale,
+                                   static_cast<float>(key_codes.y) * key_scale);
+      value_pair =
+          __floats2half2_rn(static_cast<float>(value_codes.x) * value_scale,
+                            static_cast<float>(value_codes.y) * value_scale);
+    }
+
+    const int output_block_offset = token_idx / output_block_size;
+    const int output_token_offset = token_idx % output_block_size;
+    const int output_block =
+        batch_idx * output_blocks_per_seq + output_block_offset;
+    const int64_t key_output_offset =
+        static_cast<int64_t>(output_block) * key_out_block_stride +
+        static_cast<int64_t>(output_token_offset) * key_out_token_stride +
+        static_cast<int64_t>(head_idx) * key_out_head_stride + element_idx;
+    const int64_t value_output_offset =
+        static_cast<int64_t>(output_block) * value_out_block_stride +
+        static_cast<int64_t>(output_token_offset) * value_out_token_stride +
+        static_cast<int64_t>(head_idx) * value_out_head_stride + element_idx;
+    *reinterpret_cast<__half2*>(key_out + key_output_offset) = key_pair;
+    *reinterpret_cast<__half2*>(value_out + value_output_offset) = value_pair;
   }
 }
 
@@ -500,7 +620,7 @@ void flash_attention_int8_block32_reshape_and_cache(
       page_owners.stride(0));
 
   const dim3 grid(key_cache.size(2), key_scales.size(2), key.size(0));
-  int8_block32_reshape_and_cache_kernel<<<grid, 32, 0, stream>>>(
+  int8_block32_reshape_and_cache_kernel<<<grid, kThreads, 0, stream>>>(
       reinterpret_cast<const __half*>(key.data_ptr<at::Half>()),
       reinterpret_cast<const __half*>(value.data_ptr<at::Half>()),
       key_cache.data_ptr<int8_t>(), value_cache.data_ptr<int8_t>(),
@@ -513,6 +633,80 @@ void flash_attention_int8_block32_reshape_and_cache(
       key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
       value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
       key_scales.stride(0), key_scales.stride(1));
+  C10_CUDA_KERNEL_LAUNCH_CHECK();
+}
+
+void flash_attention_int8_block32_paged_kv_to_fp16(
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& key_scales, const at::Tensor& value_scales,
+    const at::Tensor& block_table, const at::Tensor& seq_lens,
+    at::Tensor& key_out, at::Tensor& value_out) {
+  check_int8_block32_cache(key_cache, value_cache, key_scales, value_scales);
+  TORCH_CHECK(block_table.is_cuda() && seq_lens.is_cuda() &&
+                  key_out.is_cuda() && value_out.is_cuda(),
+              "INT8 block bridge tensors must be CUDA tensors");
+  TORCH_CHECK(block_table.scalar_type() == at::kInt &&
+                  seq_lens.scalar_type() == at::kInt,
+              "INT8 block bridge metadata must use int32");
+  TORCH_CHECK(key_out.scalar_type() == at::kHalf &&
+                  value_out.scalar_type() == at::kHalf,
+              "INT8 block bridge output caches must use fp16");
+  TORCH_CHECK(block_table.dim() == 2 && block_table.is_contiguous() &&
+                  seq_lens.dim() == 1 && seq_lens.is_contiguous() &&
+                  block_table.size(0) == seq_lens.size(0),
+              "INT8 block bridge metadata shape mismatch");
+  TORCH_CHECK(key_out.dim() == 4 && value_out.dim() == 4 &&
+                  key_out.sizes() == value_out.sizes(),
+              "INT8 block bridge requires matching paged FP16 outputs");
+  TORCH_CHECK(key_cache.size(2) == key_out.size(2) &&
+                  key_cache.size(3) == key_out.size(3),
+              "INT8 block bridge head shape must not change");
+  TORCH_CHECK(key_cache.size(3) % 2 == 0,
+              "INT8 block bridge requires an even head dimension");
+  TORCH_CHECK(key_out.stride(3) == 1 && value_out.stride(3) == 1,
+              "INT8 block bridge output head dimensions must be contiguous");
+  const int batch_size = block_table.size(0);
+  TORCH_CHECK(batch_size > 0, "INT8 block bridge batch must be non-empty");
+  TORCH_CHECK(key_out.size(0) % batch_size == 0,
+              "INT8 block bridge output pages must divide across the batch");
+  const int output_blocks_per_seq = key_out.size(0) / batch_size;
+  const int input_capacity = block_table.size(1) * key_cache.size(1);
+  const int output_capacity = output_blocks_per_seq * key_out.size(1);
+  TORCH_CHECK(output_capacity >= input_capacity,
+              "INT8 block bridge output must cover the input block table");
+  TORCH_CHECK(key_cache.device() == value_cache.device() &&
+                  key_cache.device() == key_scales.device() &&
+                  key_cache.device() == value_scales.device() &&
+                  key_cache.device() == block_table.device() &&
+                  key_cache.device() == seq_lens.device() &&
+                  key_cache.device() == key_out.device() &&
+                  key_cache.device() == value_out.device(),
+              "INT8 block bridge tensors must share one CUDA device");
+
+  c10::cuda::CUDAGuard device_guard(key_cache.device());
+  const int64_t total_pairs = static_cast<int64_t>(output_capacity) *
+                              key_cache.size(2) * (key_cache.size(3) / 2);
+  constexpr int kBridgeBlocks = 320;
+  const int64_t required_blocks = (total_pairs + kThreads - 1) / kThreads;
+  const dim3 grid(static_cast<unsigned int>(required_blocks < kBridgeBlocks
+                                                ? required_blocks
+                                                : kBridgeBlocks),
+                  batch_size);
+  const auto stream = at::cuda::getCurrentCUDAStream().stream();
+  int8_block32_paged_kv_to_fp16_kernel<<<grid, kThreads, 0, stream>>>(
+      key_cache.data_ptr<int8_t>(), value_cache.data_ptr<int8_t>(),
+      reinterpret_cast<const __half*>(key_scales.data_ptr<at::Half>()),
+      reinterpret_cast<const __half*>(value_scales.data_ptr<at::Half>()),
+      block_table.data_ptr<int>(), seq_lens.data_ptr<int>(),
+      reinterpret_cast<__half*>(key_out.data_ptr<at::Half>()),
+      reinterpret_cast<__half*>(value_out.data_ptr<at::Half>()), batch_size,
+      block_table.size(1), key_cache.size(1), output_blocks_per_seq,
+      key_out.size(1), key_cache.size(2), key_cache.size(3), key_scales.size(2),
+      key_cache.stride(0), key_cache.stride(1), key_cache.stride(2),
+      value_cache.stride(0), value_cache.stride(1), value_cache.stride(2),
+      key_scales.stride(0), key_scales.stride(1), key_out.stride(0),
+      key_out.stride(1), key_out.stride(2), value_out.stride(0),
+      value_out.stride(1), value_out.stride(2));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
 }
 

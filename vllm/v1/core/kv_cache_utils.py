@@ -1040,40 +1040,94 @@ def unify_kv_cache_spec_page_size(
         if isinstance(spec, AttentionSpec) and spec.kv_quant_mode.is_int8_block32
     ]
     requires_page_padding = any(max_page_size % page_size for page_size in page_sizes)
+    grown_int8_block_size: int | None = None
+    original_int8_block_size: int | None = None
     if requires_page_padding:
         if not int8_specs:
             raise NotImplementedError(
                 "The page size of the layer is not divisible by the "
                 "maximum page size. Cannot unify by adjusting block_size."
             )
-        # INT8 block32 adds fixed per-page scale/owner metadata, so its page
-        # size is not proportional to block_size. Round the common allocation
-        # up to a multiple of every unpadded, non-INT8 page and leave any extra
-        # bytes as page-local tail padding for INT8 and Mamba caches.
-        unpadded_page_sizes = [
-            spec.page_size_bytes
-            for spec in kv_cache_spec.values()
-            if not isinstance(spec, MambaSpec)
-            and not (
-                isinstance(spec, AttentionSpec) and spec.kv_quant_mode.is_int8_block32
+
+        # INT8 block32 pages contain a token-scaled payload and fixed scale /
+        # owner metadata. Grow the logical INT8 page before adding tail
+        # padding. This preserves cache-token capacity when another hybrid
+        # group is close to an integer multiple of the INT8 payload page.
+        int8_layouts = set()
+        for spec in int8_specs:
+            unpadded_spec = replace(spec, page_size_padded=None)
+            payload_bytes = unpadded_spec.real_page_size_bytes
+            fixed_bytes = unpadded_spec.page_size_bytes - payload_bytes
+            payload_bytes_per_token, remainder = divmod(payload_bytes, spec.block_size)
+            if remainder:
+                break
+            int8_layouts.add(
+                (
+                    spec.block_size,
+                    payload_bytes_per_token,
+                    fixed_bytes,
+                )
             )
-        ]
-        page_quantum = math.lcm(*unpadded_page_sizes) if unpadded_page_sizes else 4
-        max_page_size = round_up(max_page_size, page_quantum)
+        if len(int8_layouts) == 1:
+            (
+                layout_block_size,
+                payload_bytes_per_token,
+                fixed_bytes,
+            ) = int8_layouts.pop()
+            original_int8_block_size = layout_block_size
+            min_block_size = cdiv(
+                max(max_page_size - fixed_bytes, 1),
+                payload_bytes_per_token,
+            )
+            grown_int8_block_size = round_up(
+                min_block_size,
+                layout_block_size,
+            )
+            metadata_aware_page_size = (
+                grown_int8_block_size * payload_bytes_per_token + fixed_bytes
+            )
+            # Hybrid pages carry FP16 draft tensors whose vectorized kernels
+            # require every physical page to retain 16-byte base alignment.
+            max_page_size = round_up(metadata_aware_page_size, 16)
+        else:
+            # Multiple incompatible INT8 layouts have no single metadata-aware
+            # block size. Retain the safe padded-page behavior.
+            unpadded_page_sizes = [
+                spec.page_size_bytes
+                for spec in kv_cache_spec.values()
+                if not isinstance(spec, MambaSpec)
+                and not (
+                    isinstance(spec, AttentionSpec)
+                    and spec.kv_quant_mode.is_int8_block32
+                )
+            ]
+            page_quantum = math.lcm(*unpadded_page_sizes) if unpadded_page_sizes else 4
+            max_page_size = round_up(max_page_size, page_quantum)
 
     new_kv_cache_spec = {}
     for layer_name, layer_spec in kv_cache_spec.items():
         layer_page_size = layer_spec.page_size_bytes
-        if layer_page_size == max_page_size:
-            new_kv_cache_spec[layer_name] = layer_spec
-            continue
-
         is_int8_block32 = (
             isinstance(layer_spec, AttentionSpec)
             and layer_spec.kv_quant_mode.is_int8_block32
         )
-        if is_int8_block32 or (
-            requires_page_padding and isinstance(layer_spec, MambaSpec)
+        if grown_int8_block_size is not None and (
+            is_int8_block32
+            or (
+                isinstance(layer_spec, MambaSpec)
+                and layer_spec.block_size == original_int8_block_size
+            )
+        ):
+            replace_args = {
+                "block_size": grown_int8_block_size,
+                "page_size_padded": max_page_size,
+            }
+        elif layer_page_size == max_page_size:
+            new_kv_cache_spec[layer_name] = layer_spec
+            continue
+        elif (requires_page_padding and isinstance(layer_spec, MambaSpec)) or (
+            isinstance(layer_spec, AttentionSpec)
+            and (grown_int8_block_size is not None or is_int8_block32)
         ):
             replace_args = {"page_size_padded": max_page_size}
         else:

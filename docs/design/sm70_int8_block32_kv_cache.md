@@ -1,164 +1,127 @@
-# SM70 signed INT8 block32 KV-cache validation
+# SM70 signed INT8 block32 KV-cache production repair
 
-## Scope
+## Status
 
-This report covers the signed block32 INT8 KV-cache implementation for the
-SM70 `FLASH_ATTN_V100` backend, Qwen3.8-27B-FP8 plus DFlash2, hybrid Mamba
-cache alignment, and CUDA Graph replay. The source base is
-`94f64714263e3af4399bbc0dd78069e5ce3a84b9`; the reviewed implementation diff
-before this report has SHA256
-`d80f2c26c17f0feca04525340ec4fa452eead4fd8cdc3e50f55ed1b09a866baf`.
+This report covers the SM70 `int8_block32` repair for Qwen3.8-27B-FP8 with DFlash2.
 
-The validated runtime used Python 3.12, CUDA 12.8, PyTorch 2.10.0+cu128, and
-four Tesla V100-SXM2-32GB GPUs at compute capability 7.0.
+The repair passes the B1 performance threshold and restores E5M2 cache capacity. It does not enable INT8 by default.
 
-## Representation and update contract
+The controller did not promote an image. B8 still uses the exact scalar fallback and needs a grouped multi-request route.
 
-Each physical page contains signed INT8 K and V payloads, separate FP16 K and V
-scales per KV head and 32-channel block, and one INT32 publication owner.
-Page-scale growth computes the batch-final scale first and re-quantizes
-historical values at most once before publishing incoming values. Page reset is
-triggered by a write to offset zero, so reused pages do not retain stale payload
-or scale state. One elected CTA owns each physical page during an update,
-including reordered and noncontiguous slot mappings.
+## Representation contract
 
-Hybrid caches retain logical INT8 page width while using the unified physical
-page stride. Both the legacy and V2 GPU model runners create strided views, and
-the backend preserves physical stride and nonzero base storage offsets when it
-splits payload, scale, and owner views.
+Each physical page keeps these fields:
 
-## Build and package evidence
+- signed INT8 K and V payloads;
+- separate FP16 K and V scales for each KV head and 32-channel block;
+- one INT32 publication owner.
 
-The final synchronized source built this wheel:
+One CTA owns each page scale during a publication. Eight warps divide reset, maximum collection, historical re-quantization, and incoming writes.
 
-- path: `/workspace/int8-block32-build-final/wheels/1cat_vllm-1.5.0.dev0+sm70int8-cp312-cp312-linux_x86_64.whl`
-- size: 151,242,314 bytes
-- SHA256: `ae2ea6340750798230a09e6971511b4b46f6b09379ac553e18602f3320539cf8`
-- independent install: `/workspace/int8-block32-build-final/install-final`
+The writer selects the batch-final scale before it changes historical payloads. It re-quantizes historical values once when a scale grows.
 
-The independent install imported `vllm._C` and the bundled Flash-V100 CUDA
-extension. The extension exposed the INT8 reshape, paged decode, and paged
-prefill operators. Packaged Python files compared byte-for-byte equal to the
-synchronized source.
+A write to page offset zero resets the page. Arbitrary block tables, reordered slots, and nonzero storage offsets remain valid.
 
-## Test evidence
+## Read architecture
 
-The final wheel install passed 19 focused tests. Coverage includes:
+DFlash2 B1 q8 and q16 verification uses the existing grouped SM70 verifier. A signed INT8 loader expands each eight-channel vector into the verifier shared-memory tile.
 
-- signed payloads and independent K/V scales;
-- batch-final scale growth and historical re-quantization;
-- reordered block tables and page reuse/reset;
-- padded physical-page stride and nonzero storage offsets;
-- FP16-draft hybrid page growth behavior;
-- CUDA Graph replay across parameterized decode shapes;
-- persistent DFlash2 small-query metadata, graph padding masks, and overflow
-  rejection.
+The loader reads scales from the sealed page layout. It uses two aligned 32-bit payload loads because valid page strides require only four-byte alignment.
 
-Ruff, Ruff format, `git diff --check`, pi-lens blocking diagnostics, and an
-independent read-only diff review passed. The reviewer returned "OK with
-notes"; its only note was the missing nonzero-storage-offset regression test,
-which was added and passed.
+Large B1 prefix prefill uses a bounded FP16 bridge and the existing paged FP16 kernel. Unsupported shapes retain the exact scalar INT8 kernels.
 
-## Final-wheel graph smoke
+Non-INT8 routes remain unchanged. Flash-Next behavior remains unchanged.
 
-The independent final wheel completed TP4 DFlash2 generation with
-`int8_block32`, Flash-V100, TurboMind FP8 weights, and Mamba align. PIECEWISE,
-FULL target, and FULL DFlash2 graphs all captured and replayed. The request
-returned 16/16 tokens without corruption.
+## Hybrid capacity repair
 
-- aggregate output: 36.849 tok/s
-- steady decode: 48.458 tok/s
-- TTFT: 0.1234 s
-- acceptance length: 1.600
-- result SHA256: `35d16add5d3296102f1448e438b29c75eb1475689c72402809b650858cd9f907`
+The old unifier padded a 1,648-token INT8 page toward the larger draft page. Fixed scale and owner bytes prevented exact division.
 
-## FP16 versus INT8 performance
+The repair grows the INT8 and aligned Mamba block size to 3,296 tokens. It then aligns the common physical page stride to 16 bytes.
 
-The matched short-context matrix used TP4, DFlash2 q7, Flash-V100, FULL CUDA
-Graphs, prefix caching, Mamba align, three repeats, 128 output tokens, and the
-same prompt/seeds. `auto` resolves to the FP16 target cache in this runtime.
-Cold TTFT includes the first full prompt; warm TTFT includes prefix-cache hits.
+The candidate reports 1,595,299 cache tokens. The matched E5M2 control reports 1,595,299 cache tokens.
 
-| Target KV | Batch / input | Aggregate mean / median | Mean steady decode | Cold / warm TTFT |
-| --- | --- | ---: | ---: | ---: |
-| FP16 (`auto`) | 1 / 8,192 | 78.457 / 95.171 tok/s | 119.979 tok/s | 2.095 / 0.282 s |
-| INT8 block32 | 1 / 8,192 | 13.402 / 15.786 tok/s | 22.802 tok/s | 8.582 / 2.955 s |
-| FP16 (`auto`) | 8 / 4,096 | 80.889 / 97.510 tok/s | 15.016 tok/s/request | 3.829 / 1.747 s |
-| INT8 block32 | 8 / 4,096 | 46.035 / 51.836 tok/s | 9.088 tok/s/request | 11.081 / 5.706 s |
+The first unaligned candidate reported 1,561,055 tokens but caused a CUDA alignment fault. The final 16-byte stride removed that fault.
 
-INT8 is therefore functional but not a performance win: aggregate throughput
-is 82.9% lower at batch 1 and 43.1% lower at batch 8 in this matrix.
+## TP4 V100 performance
 
-Result SHA256 values:
+The matched runs used four V100-SXM2-32GB GPUs, B1, 8,192 input tokens, 128 output tokens, and DFlash2 q7.
 
-- FP16 B1: `7d5e7f78457b24adc602ef08387bfd0db7f59904bdd1b4e1157fb0b7e29e67ab`
-- INT8 B1: `0873fa20d6fdaa04a746479db3ca906db84b161f348f6a1b0673bcbb5dc0bdf1`
-- FP16 B8: `7010f190217df3d3b835e69748673a1b165b84c52df6ad4e584f7c2a178279d2`
-- INT8 B8: `ba99fc66416c7d9fb4990831c71a3b4a9e3b34d14851343f0d9982e4e9beb5ff`
-
-## Quality evidence
-
-A deterministic 16-question GSM8K comparison used the same shuffled rows,
-greedy DFlash2 drafting, temperature zero, 512 output tokens, and graph mode.
-Both cache formats passed and failed the exact same questions.
-
-| Target KV | Accuracy | Invalid answers | Aggregate output | Acceptance length |
+| Route | Warm prefill | Decode rounds | Decode time | Time per round |
 | --- | ---: | ---: | ---: | ---: |
-| FP16 (`auto`) | 13/16 (81.25%) | 0/16 | 194.714 tok/s | 4.3463 |
-| INT8 block32 | 13/16 (81.25%) | 0/16 | 184.627 tok/s | 4.3141 |
+| E5M2 grouped control | 0.409023 s | 42 | 0.875713 s | 20.850 ms |
+| INT8 direct grouped, steady slice 1 | 0.435971 s | 44 | 1.027303 s | 23.348 ms |
+| INT8 direct grouped, steady slice 2 | 0.434932 s | 48 | 1.118698 s | 23.306 ms |
 
-- dataset SHA256: `3730d312f6e3440559ace48831e51066acaca737f6eabec99bccb9e4b3c39d14`
-- FP16 result SHA256: `e5b3d1cac7076600baef6365436f3aa0d62e44663c42b5cabf370f904385595c`
-- INT8 result SHA256: `825a1e7b687096f938fe4cf75e3e0ddd7143253dcc52b91ec92a85f8ae192bc3`
+The INT8 round ratios are 1.120 and 1.118. Both values pass the required 1.25 limit.
 
-## Long-context result
+The INT8 warm-prefill ratios are 1.066 and 1.063. The old INT8 warm prefill was 2.948006 seconds.
 
-The FP16 control completed 261,632 input plus 512 output tokens at batch 1:
+The candidate B1 aggregate throughput reached 86.637 tokens per second. The old INT8 maximum was 15.551 tokens per second.
 
-- cold TTFT: 376.593 s;
-- warm steady decode: 16.81--18.68 tok/s;
-- aggregate mean: 11.770 tok/s;
-- result SHA256: `b251d1e28cffb27b35f81a68a6ae8a5d9970cdf65456130f2f6dcf582440a819`.
+The B8, 4,096-token validation completed three repeats. Its aggregate rates were 30.138, 53.760, and 55.433 tokens per second.
 
-The corresponding INT8 engine initialized, captured graphs, and reported a
-927,111-token cache capacity (3.54x concurrency at 262,144 tokens), but the
-first measured request did not complete after approximately 1 hour 47 minutes.
-The enclosing matrix reached its two-hour bound and was terminated. The long
-batch-8 cases were not reached. This is a measured performance timeout, not an
-OOM or cache-capacity rejection.
+B8 remains on the scalar exact route. This route is safe but does not remove the existing B8 performance gap.
 
-## Flash-Next and TP8 disposition
+## Kernel probes
 
-The requested `unsloth/Qwen3.8-Flash-Next-FP8` checkpoint contains 185.5 GB of
-weight files. It cannot fit a TP4 deployment on the available 128 GB aggregate
-VRAM. The staging job failed without creating a destination, and its Kubernetes
-job was deleted. The only local Flash-Next checkpoint is NVFP4, not FP8. TP8
-was not attempted because only four GPUs are exposed. No image or checkpoint
-was promoted.
+The grouped q8 8K operator used 100 synchronized calls.
 
-## Reproduction and retained artifacts
+- INT8 direct grouped: 0.066386 ms per call.
+- E5M2 grouped: 0.055009 ms per call.
+- Ratio: 1.207.
 
-The local evidence bundle is under
-`.pi/benchmarks/results/int8-block32/` in the enclosing workspace. It includes
-the wheel checksum, final-wheel smoke, short matrix, GSM8K pair and dataset,
-long-context control, timed-out INT8 log, and raw logs. The benchmark driver is
-`.pi/benchmarks/benchmark_qwen38_dflash_kv.py`.
+The forced scale-growth writer improved from 1.355069 ms to 0.202947 ms per call. This is a 6.68-fold improvement.
 
-The essential runtime settings were:
+## Correctness and graph evidence
 
-```bash
-export PYTHONPATH=/workspace/int8-block32-build-final/install-final
-export FLASH_ATTN_V100=1
-export VLLM_SM70_FP8_TURBOMIND=1
-export CUDA_VISIBLE_DEVICES=0,1,2,3
-export NCCL_P2P_LEVEL=NVL
-```
+Seven CUDA tests passed on SM70. They cover these contracts:
 
-## Promotion decision
+- signed payloads and separate K/V scales;
+- batch-final scale growth and historical re-quantization;
+- page reset and reuse;
+- reordered and arbitrary block tables;
+- padded page strides and nonzero storage offsets;
+- direct grouped INT8 verification;
+- bridge and attention CUDA Graph replay.
 
-Correctness, graph replay, packaging, and the bounded GSM8K quality comparison
-pass. Performance does not: the short matrix regresses materially and the 261K
-INT8 request exceeds the two-hour campaign bound. This implementation must not
-be promoted as a faster or production-default KV-cache path. It remains an
-explicit experimental cache format pending kernel performance work and a
-completed long-context and batch-8 matrix.
+Seven cache-interface tests passed. They cover view geometry, alignment, hybrid unification, and rejected layouts.
+
+The B1 and B8 engines captured PIECEWISE, target FULL, and DFlash2 FULL graphs. Runtime route counters confirmed direct grouped INT8 verification for B1.
+
+## Rejected alternatives
+
+A global INT8-to-FP16 bridge was correct and graph-safe. Its complete round time was about 35.5 ms, so the controller rejected it for verification.
+
+An unaligned metadata-aware common page recovered capacity but broke vector alignment. The controller rejected that stride.
+
+Packed 64-bit INT8 loads were unsafe for valid four-byte-aligned pages. The final loader uses 32-bit loads.
+
+## Provenance
+
+The owner workspace is `/workspace/iron-001-6d92c8c5` in pod `qwen38-int8-bench`.
+
+The final focused extension SHA256 is `245bd9dadb472623e29d1dc3af4fc0d0e97ef8d29b18df654c50ec985782d134`.
+
+Material result SHA256 values:
+
+- B1 INT8 JSON: `fbd79b7bc38feb8420c05ce41167089978e2e70b0e5d41a4ec426be7137468d3`;
+- B1 INT8 log: `b6e343bd4e485938d8c3860ded5607b46379a4c1334180073588e9c62a15b2fb`;
+- B1 E5M2 JSON: `9b79727a116c89f3c781cc93f44a3f5d5b1c561b9d088f6565c57736956db765`;
+- B1 E5M2 log: `d0ec8e73e97ec509b2412c4bb8f3f36c91773db8f783e0a7aa9ffc48ba21398b`;
+- B8 INT8 JSON: `7f1f6ba1375f25042086dcae0489f649e3ce24ebacdbdfcd2a59533794341011`;
+- B8 INT8 log: `858e51d3502a21f7557fa65d3b67b5ce88c90edb65a3067f18d87afbe15b8972`;
+- final focused tests: `bd121539ac658411b0ba51eea34430c102882d333e6e34b30f9fd61e00c30891`;
+- final policy tests: `10e74799a26f450173a7f6ae6eb88dda32d8a1554e248b717a5c9cde2ad6059d`;
+- writer probe: `19792cb97f6ad1ad3c5beee9fbed3d8c6ddf77129b89be2f9f3cd8d52242fb7d`.
+
+The pinned QUASAR manifest has SHA256 `818a675a075f38a4f1f5917c77fe644e6a2a489a775f2ce121bcb92af0e6e1c3`.
+
+The pinned revision is `d8e6fbfa3e3a78899b440222b827430045a05b44`. The validated download contains 17 files and 20,582,483,351 bytes.
+
+## Remaining gate
+
+The bounded GSM8K run completed generation, but its driver failed before result publication because the owner source lacked Git metadata.
+
+The prior sealed 16-question comparison scored 13/16 for both FP16 and INT8. A final candidate still requires a provenance-bearing rerun.
+
+B8 also needs a grouped multi-request verifier before production promotion. Until those gates pass, this route remains explicit and non-default.
