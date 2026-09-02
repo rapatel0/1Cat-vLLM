@@ -118,10 +118,14 @@ The pinned QUASAR manifest has SHA256 `818a675a075f38a4f1f5917c77fe644e6a2a489a7
 
 The pinned revision is `d8e6fbfa3e3a78899b440222b827430045a05b44`. The validated download contains 17 files and 20,582,483,351 bytes.
 
+## Quality evidence
+
+The final provenance-bearing GSM8K run scored 13/16, or 81.25%. It reported zero invalid answers across 16 questions.
+
+The prior FP16 control also scored 13/16. The final INT8 result SHA256 is `5272d991b5fd19341b7ebb3e2207d8346920f9615beadf385800d4ceca31f18e`.
+
+The final quality log SHA256 is `af6a35cb1a3159ad2e982df00e162e89e05a5f050d1c7c70088860284c9838e4`.
+
 ## Remaining gate
 
-The bounded GSM8K run completed generation, but its driver failed before result publication because the owner source lacked Git metadata.
-
-The prior sealed 16-question comparison scored 13/16 for both FP16 and INT8. A final candidate still requires a provenance-bearing rerun.
-
-B8 also needs a grouped multi-request verifier before production promotion. Until those gates pass, this route remains explicit and non-default.
+B8 needs a grouped multi-request verifier before production promotion. Until that gate passes, this route remains explicit and non-default.
