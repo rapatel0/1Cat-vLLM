@@ -1319,6 +1319,33 @@ def _get_flash_ops():
     )
 
 
+def _grouped_verify_query_partition_is_valid(
+    query_start_loc_cpu: torch.Tensor | None,
+    *,
+    num_requests: int,
+    num_query_tokens: int,
+    max_query_tokens: int,
+) -> bool:
+    if (
+        num_requests <= 0
+        or num_query_tokens <= 0
+        or max_query_tokens <= 0
+        or query_start_loc_cpu is None
+        or query_start_loc_cpu.device.type != "cpu"
+        or query_start_loc_cpu.dtype != torch.int32
+        or query_start_loc_cpu.ndim != 1
+        or query_start_loc_cpu.numel() != num_requests + 1
+    ):
+        return False
+    offsets: list[int] = query_start_loc_cpu.tolist()
+    if offsets[0] != 0 or offsets[-1] != num_query_tokens:
+        return False
+    return all(
+        0 < query_end - query_start <= max_query_tokens
+        for query_start, query_end in zip(offsets, offsets[1:], strict=False)
+    )
+
+
 def _get_flash_grouped_verify_op():
     """Load the optional exact SM70 DFlash2 grouped verifier."""
     global _flash_attn_grouped_verify_paged
@@ -5355,7 +5382,27 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         num_requests = (
             int(query_start_loc.numel()) - 1 if query_start_loc is not None else 0
         )
+        query_start_loc_cpu = getattr(
+            attn_metadata,
+            "query_start_loc_cpu",
+            None,
+        )
+        if (
+            query_start_loc_cpu is None
+            and query_start_loc is not None
+            and query_start_loc.device.type == "cpu"
+        ):
+            query_start_loc_cpu = query_start_loc
         max_query_len = int(getattr(attn_metadata, "max_query_len", 0))
+        partition_max_query_tokens = (
+            16 if num_requests == 1 and num_query_tokens > 8 else 8
+        )
+        query_partition_valid = _grouped_verify_query_partition_is_valid(
+            query_start_loc_cpu,
+            num_requests=num_requests,
+            num_query_tokens=num_query_tokens,
+            max_query_tokens=partition_max_query_tokens,
+        )
         fp8_source = bool(
             self.kv_cache_dtype == "fp8_e5m2"
             and key_cache.dtype == torch.uint8
@@ -5420,6 +5467,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and query_start_loc.device == query.device
             and query_start_loc.dtype == torch.int32
             and query_start_loc.is_contiguous()
+            and query_partition_valid
         )
         if (
             self.use_dflash2_grouped_verify
@@ -7498,6 +7546,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             query_start_loc=(
                 query_start_loc[: num_requests + 1] if num_requests > 1 else None
             ),
+            _query_partition_validated=True,
         )
         _record_route("prefill_smallq_dflash2_int8_block32_grouped_verify")
 

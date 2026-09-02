@@ -1069,6 +1069,33 @@ def flash_attn_grouped_verify_max_requests() -> int:
     return int(get_max_requests())
 
 
+def _validate_grouped_verify_query_partition(
+    query_start_loc: torch.Tensor,
+    *,
+    num_query_tokens: int,
+    max_query_tokens: int,
+) -> None:
+    if query_start_loc.ndim != 1 or query_start_loc.dtype != torch.int32:
+        return
+    if query_start_loc.is_cuda and torch.cuda.is_current_stream_capturing():
+        return
+
+    offsets: list[int] = query_start_loc.detach().cpu().tolist()
+    if not offsets or offsets[0] != 0:
+        raise ValueError("grouped verify offsets must start at zero")
+    if offsets[-1] != num_query_tokens:
+        raise ValueError(
+            "grouped verify terminal offset must equal the query token count"
+        )
+    for query_start, query_end in zip(offsets, offsets[1:], strict=False):
+        if query_end <= query_start:
+            raise ValueError("grouped verify offsets must be strictly increasing")
+        if query_end - query_start > max_query_tokens:
+            raise ValueError(
+                "grouped verify request query length exceeds the native limit"
+            )
+
+
 def flash_attn_grouped_verify_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1082,6 +1109,7 @@ def flash_attn_grouped_verify_paged(
     v_scale: float = 1.0,
     one_pass: bool = False,
     query_start_loc: torch.Tensor | None = None,
+    _query_partition_validated: bool = False,
 ) -> torch.Tensor:
     """Exact grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
 
@@ -1103,6 +1131,12 @@ def flash_attn_grouped_verify_paged(
     if num_requests <= 0:
         raise ValueError("grouped verify requires at least one request")
     max_query_tokens = 16 if num_requests == 1 and q.shape[0] > 8 else 8
+    if query_start_loc is not None and not _query_partition_validated:
+        _validate_grouped_verify_query_partition(
+            query_start_loc,
+            num_query_tokens=int(q.shape[0]),
+            max_query_tokens=max_query_tokens,
+        )
     workspace = _get_grouped_verify_workspace(
         q,
         num_requests=num_requests,

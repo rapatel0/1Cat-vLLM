@@ -28,6 +28,10 @@ DFlash2 q8 verification groups up to 16 requests in one native SM70 launch. B1 q
 
 The kernel reads each request's query range, sequence length, and block-table row. A signed INT8 loader expands each eight-channel vector into shared memory.
 
+The grouped dispatch validates the packed query partition before computation. Offsets must start at zero, end at the query count, and increase strictly.
+
+Each multi-request query range must contain at most eight tokens. A device assertion preserves this validation during CUDA Graph replay.
+
 The loader reads scales from the sealed page layout. It uses two aligned 32-bit payload loads because valid page strides require four-byte alignment.
 
 Large prefix prefill uses a bounded FP16 bridge and the existing paged FP16 kernel. Mixed prefill batches split into exact per-request routes.
@@ -78,7 +82,7 @@ The forced scale-growth writer improved from 1.355069 ms to 0.202947 ms per call
 
 ## Correctness and graph evidence
 
-Nine CUDA tests passed on SM70. They cover these contracts:
+The SM70 CUDA regression suite covers these contracts:
 
 - signed payloads and separate K/V scales;
 - batch-final scale growth and historical re-quantization;
@@ -86,6 +90,7 @@ Nine CUDA tests passed on SM70. They cover these contracts:
 - reordered and arbitrary block tables;
 - padded page strides and nonzero storage offsets;
 - direct grouped INT8 verification;
+- malformed and variable grouped query partitions;
 - independent query ranges for grouped sparse page4 attention;
 - bridge and attention CUDA Graph replay.
 
@@ -93,7 +98,7 @@ Seven cache-interface tests passed. They cover view geometry, alignment, hybrid 
 
 The B1 and B8 engines captured PIECEWISE, target FULL, and DFlash2 FULL graphs. Runtime counters confirmed direct grouped INT8 verification for both batch sizes.
 
-The complete SM70 routing policy file passed 120 tests. It includes the 16-request capability boundary and the exact fallback boundary.
+The complete SM70 routing policy suite covers query-partition bounds, the 16-request limit, and exact fallback.
 
 The sparse page4 regression matches the accepted parent output hashes before and after CUDA Graph replay.
 
@@ -124,11 +129,7 @@ The pinned revision is `d8e6fbfa3e3a78899b440222b827430045a05b44`. The validated
 
 ## Quality evidence
 
-The final provenance-bearing GSM8K run scored 13/16, or 81.25%. It reported zero invalid answers across 16 questions.
-
-The prior FP16 control also scored 13/16. The final INT8 result SHA256 is `5272d991b5fd19341b7ebb3e2207d8346920f9615beadf385800d4ceca31f18e`.
-
-The final quality log SHA256 is `af6a35cb1a3159ad2e982df00e162e89e05a5f050d1c7c70088860284c9838e4`.
+The controller acceptance report records the frozen-candidate GSM8K comparison and content hashes.
 
 ## Production posture
 

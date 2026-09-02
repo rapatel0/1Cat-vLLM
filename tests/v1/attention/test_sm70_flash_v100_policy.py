@@ -1797,6 +1797,43 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
     assert torch.all(output == 1)
 
 
+@pytest.mark.parametrize(
+    ("offsets", "num_query_tokens", "max_query_tokens", "expected"),
+    [
+        ([0, 8], 8, 8, True),
+        ([0, 16], 16, 16, True),
+        ([0, 1, 9], 9, 8, True),
+        ([0, 8, 16], 16, 8, True),
+        ([0, 9, 16], 16, 8, False),
+        ([1, 8, 15], 15, 8, False),
+        ([0, 8, 15], 16, 8, False),
+        ([0, 8, 7], 7, 8, False),
+        ([0, 8, 8], 8, 8, False),
+    ],
+)
+def test_flash_v100_grouped_verify_query_partition_policy(
+    offsets: list[int],
+    num_query_tokens: int,
+    max_query_tokens: int,
+    expected: bool,
+):
+    from vllm.v1.attention.backends.flash_attn_v100 import (
+        _grouped_verify_query_partition_is_valid,
+    )
+
+    query_start_loc = torch.tensor(offsets, dtype=torch.int32)
+
+    assert (
+        _grouped_verify_query_partition_is_valid(
+            query_start_loc,
+            num_requests=len(offsets) - 1,
+            num_query_tokens=num_query_tokens,
+            max_query_tokens=max_query_tokens,
+        )
+        is expected
+    )
+
+
 def test_flash_v100_dflash2_int8_grouped_verify_batches_eight_requests():
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 
@@ -1826,6 +1863,7 @@ def test_flash_v100_dflash2_int8_grouped_verify_batches_eight_requests():
         captured["block_table"] = block_table
         captured["seq_lens"] = seq_lens
         captured["query_start_loc"] = kwargs["query_start_loc"]
+        captured["query_partition_validated"] = kwargs["_query_partition_validated"]
         kwargs["out"].fill_(1)
 
     impl.flash_attn_grouped_verify_paged = grouped_verify
@@ -1886,6 +1924,7 @@ def test_flash_v100_dflash2_int8_grouped_verify_batches_eight_requests():
     assert captured_block_table.data_ptr() == block_table.data_ptr()
     assert captured_seq_lens.data_ptr() == seq_lens.data_ptr()
     assert captured_query_start_loc.data_ptr() == query_start_loc.data_ptr()
+    assert captured["query_partition_validated"] is True
     assert torch.all(output == 1)
 
     impl.dflash2_grouped_verify_max_requests = 1
