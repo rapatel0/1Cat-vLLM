@@ -4,9 +4,9 @@
 
 This report covers the SM70 `int8_block32` repair for Qwen3.8-27B-FP8 with DFlash2.
 
-The repair passes the B1 performance threshold and restores E5M2 cache capacity. It does not enable INT8 by default.
+The repair passes the B1 and B8 performance thresholds. It also restores E5M2 cache capacity.
 
-The controller did not promote an image. B8 still uses the exact scalar fallback and needs a grouped multi-request route.
+The controller did not enable INT8 by default or promote an image.
 
 ## Representation contract
 
@@ -24,11 +24,15 @@ A write to page offset zero resets the page. Arbitrary block tables, reordered s
 
 ## Read architecture
 
-DFlash2 B1 q8 and q16 verification uses the existing grouped SM70 verifier. A signed INT8 loader expands each eight-channel vector into the verifier shared-memory tile.
+DFlash2 q8 verification groups up to 16 requests in one native SM70 launch. B1 q16 verification uses the same verifier with one request.
 
-The loader reads scales from the sealed page layout. It uses two aligned 32-bit payload loads because valid page strides require only four-byte alignment.
+The kernel reads each request's query range, sequence length, and block-table row. A signed INT8 loader expands each eight-channel vector into shared memory.
 
-Large B1 prefix prefill uses a bounded FP16 bridge and the existing paged FP16 kernel. Unsupported shapes retain the exact scalar INT8 kernels.
+The loader reads scales from the sealed page layout. It uses two aligned 32-bit payload loads because valid page strides require four-byte alignment.
+
+Large prefix prefill uses a bounded FP16 bridge and the existing paged FP16 kernel. Mixed prefill batches split into exact per-request routes.
+
+Unsupported shapes retain the exact scalar INT8 kernels.
 
 Non-INT8 routes remain unchanged. Flash-Next behavior remains unchanged.
 
@@ -58,9 +62,17 @@ The INT8 warm-prefill ratios are 1.066 and 1.063. The old INT8 warm prefill was 
 
 The candidate B1 aggregate throughput reached 86.637 tokens per second. The old INT8 maximum was 15.551 tokens per second.
 
-The B8, 4,096-token validation completed three repeats. Its aggregate rates were 30.138, 53.760, and 55.433 tokens per second.
+The matched B8 runs used 8,192 input tokens and 128 output tokens for each request.
 
-B8 remains on the scalar exact route. This route is safe but does not remove the existing B8 performance gap.
+| Route | Cold elapsed | Steady elapsed | Steady aggregate rate |
+| --- | ---: | ---: | ---: |
+| E5M2 grouped control | 30.733 s | 12.636 s | 81.038 tokens/s |
+| INT8 grouped candidate | 23.910 s | 11.728 s | 87.315 tokens/s |
+| INT8 grouped candidate | - | 10.775 s | 95.035 tokens/s |
+
+The median candidate steady elapsed time is 11.251 seconds. Its ratio to the E5M2 steady time is 0.890.
+
+Each TP worker recorded 4,896 direct grouped verifier calls. The scalar INT8 control reached only 25.184 aggregate tokens per second.
 
 ## Kernel probes
 
@@ -74,7 +86,7 @@ The forced scale-growth writer improved from 1.355069 ms to 0.202947 ms per call
 
 ## Correctness and graph evidence
 
-Seven CUDA tests passed on SM70. They cover these contracts:
+Eight CUDA tests passed on SM70. They cover these contracts:
 
 - signed payloads and separate K/V scales;
 - batch-final scale growth and historical re-quantization;
@@ -86,7 +98,9 @@ Seven CUDA tests passed on SM70. They cover these contracts:
 
 Seven cache-interface tests passed. They cover view geometry, alignment, hybrid unification, and rejected layouts.
 
-The B1 and B8 engines captured PIECEWISE, target FULL, and DFlash2 FULL graphs. Runtime route counters confirmed direct grouped INT8 verification for B1.
+The B1 and B8 engines captured PIECEWISE, target FULL, and DFlash2 FULL graphs. Runtime counters confirmed direct grouped INT8 verification for both batch sizes.
+
+The complete SM70 routing policy file passed 120 tests. It includes the 16-request capability boundary and the exact fallback boundary.
 
 ## Rejected alternatives
 
@@ -100,19 +114,18 @@ Packed 64-bit INT8 loads were unsafe for valid four-byte-aligned pages. The fina
 
 The owner workspace is `/workspace/iron-001-6d92c8c5` in pod `qwen38-int8-bench`.
 
-The final focused extension SHA256 is `245bd9dadb472623e29d1dc3af4fc0d0e97ef8d29b18df654c50ec985782d134`.
+The call 2 extension SHA256 is `63918518b8646f485fc9db0eb1abe8a9baa8991f69a3d35e7fe9fda8f7823168`.
 
-Material result SHA256 values:
+Material call 2 result SHA256 values:
 
-- B1 INT8 JSON: `fbd79b7bc38feb8420c05ce41167089978e2e70b0e5d41a4ec426be7137468d3`;
-- B1 INT8 log: `b6e343bd4e485938d8c3860ded5607b46379a4c1334180073588e9c62a15b2fb`;
-- B1 E5M2 JSON: `9b79727a116c89f3c781cc93f44a3f5d5b1c561b9d088f6565c57736956db765`;
-- B1 E5M2 log: `d0ec8e73e97ec509b2412c4bb8f3f36c91773db8f783e0a7aa9ffc48ba21398b`;
-- B8 INT8 JSON: `7f1f6ba1375f25042086dcae0489f649e3ce24ebacdbdfcd2a59533794341011`;
-- B8 INT8 log: `858e51d3502a21f7557fa65d3b67b5ce88c90edb65a3067f18d87afbe15b8972`;
-- final focused tests: `bd121539ac658411b0ba51eea34430c102882d333e6e34b30f9fd61e00c30891`;
-- final policy tests: `10e74799a26f450173a7f6ae6eb88dda32d8a1554e248b717a5c9cde2ad6059d`;
-- writer probe: `19792cb97f6ad1ad3c5beee9fbed3d8c6ddf77129b89be2f9f3cd8d52242fb7d`.
+- B1 INT8 JSON: `27924c6555a9b86e6c8b5b9d24909dfa7ec01a910d3b1122a2e65559737ac8ba`;
+- B1 INT8 log: `1023c31436d4ea2f49ed01655fc2a58ad016d9a3c4139aa5873b0bef9a68d729`;
+- B8 E5M2 JSON: `829f2eb3f13012eb7e69680a483861fa9100d0ea238bde207b64880cc9912e91`;
+- B8 E5M2 log: `4eb01a09fb54e9b17c4b62879655afdd38de91c3cf16a51a275bbe3c0a7b618f`;
+- B8 INT8 JSON: `80dc5bfb34238d32851a4803c823156a563fb4fe334f1c1ec2cab5a07ce2a8f3`;
+- B8 INT8 log: `2bf40522eabf269cbb095a9c295d743b2e070293ab56201d8e9486e23b0c637c`;
+- focused tests: `f309fe435ec3e9b2f54cee19f5ae313ad0cbfe947fb1da4c25bc4dc81d0cb3fa`;
+- policy tests: `0e36f0357704b0bb029ae0e2027e42d79b052d95e7f36ce9495ea138d0c3307a`.
 
 The pinned QUASAR manifest has SHA256 `818a675a075f38a4f1f5917c77fe644e6a2a489a775f2ce121bcb92af0e6e1c3`.
 
@@ -126,6 +139,6 @@ The prior FP16 control also scored 13/16. The final INT8 result SHA256 is `5272d
 
 The final quality log SHA256 is `af6a35cb1a3159ad2e982df00e162e89e05a5f050d1c7c70088860284c9838e4`.
 
-## Remaining gate
+## Production posture
 
-B8 needs a grouped multi-request verifier before production promotion. Until that gate passes, this route remains explicit and non-default.
+The grouped verifier removes the B8 scalar bottleneck. The route remains explicit and non-default until release promotion finishes.

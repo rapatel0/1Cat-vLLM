@@ -2,15 +2,19 @@
 #define FUSED_MHA_H
 
 #include <cuda_runtime.h>
+#include <optional>
 #include <string>
+#include <vector>
 #include <torch/extension.h>
 #include <ATen/ATen.h>
 
 std::vector<at::Tensor> flash_attention_forward(
     at::Tensor& q, const at::Tensor& k, const at::Tensor& v,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& out_, std::optional<at::Tensor>& alibi_slopes_,
     const float p_dropout, const float softmax_scale, bool is_causal,
     int window_size_left, int window_size_right, const float softcap,
+    // pi-lens-ignore: clang:no_member_template
     const bool return_softmax, std::optional<at::Generator> gen_);
 
 at::Tensor flash_attention_qk_scores(const at::Tensor& q, const at::Tensor& k,
@@ -19,17 +23,20 @@ at::Tensor flash_attention_qk_scores(const at::Tensor& q, const at::Tensor& k,
 
 at::Tensor flash_attention_decode_paged(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& seq_lens, at::Tensor& tmp_out, at::Tensor& max_logits,
     at::Tensor& exp_sums, const at::Tensor& active_num_partitions,
     const float softmax_scale, const int partition_size,
     const int launch_num_partitions, const std::string& kv_cache_dtype,
     const float k_scale, const float v_scale, const int window_size_left,
+    // pi-lens-ignore: clang:no_member_template
     const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
     const int64_t anchored_window);
 
 at::Tensor flash_attention_decode_paged_xqa(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& seq_lens, at::Tensor& tmp_out, at::Tensor& max_logits,
     at::Tensor& exp_sums, const at::Tensor& active_num_partitions,
@@ -40,6 +47,7 @@ at::Tensor flash_attention_decode_paged_xqa(
 
 at::Tensor flash_attention_decode_paged_xqa_staged(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& seq_lens, at::Tensor& tmp_out, at::Tensor& max_logits,
     at::Tensor& exp_sums, at::Tensor& online_rescales,
@@ -50,16 +58,22 @@ at::Tensor flash_attention_decode_paged_xqa_staged(
 
 at::Tensor flash_attention_grouped_verify_paged(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& seq_lens, at::Tensor& partial_out,
     at::Tensor& partial_lse, const float softmax_scale,
     const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
-    const bool one_pass);
+    const bool one_pass,
+    // pi-lens-ignore: clang:no_member_template
+    const std::optional<at::Tensor>& query_start_loc);
 
 int64_t flash_attention_grouped_verify_max_query_tokens();
 
+int64_t flash_attention_grouped_verify_max_requests();
+
 at::Tensor flash_attention_grouped_sparse_page4(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& token_masks, const at::Tensor& seq_lens, at::Tensor& lse,
     const float softmax_scale);
@@ -73,6 +87,7 @@ at::Tensor flash_attention_grouped_sparse_page4_plan(
 
 at::Tensor flash_attention_decode_paged_wmma(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& seq_lens, const float softmax_scale,
     const std::string& kv_cache_dtype, const float k_scale,
@@ -86,6 +101,7 @@ at::Tensor flash_attention_decode_qk_scores(
 
 at::Tensor flash_attention_turboquant_decode_paged(
     const at::Tensor& q_rot, const at::Tensor& kv_cache,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& seq_lens, at::Tensor& tmp_out, at::Tensor& max_logits,
     at::Tensor& exp_sums, const at::Tensor& centroids,
@@ -94,16 +110,19 @@ at::Tensor flash_attention_turboquant_decode_paged(
 
 at::Tensor flash_attention_prefill_paged(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& seq_lens, const float softmax_scale,
     const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
     const bool is_causal, const int window_size_left,
+    // pi-lens-ignore: clang:no_member_template
     const int window_size_right, const std::optional<at::Tensor>& anchor_lens,
     const int64_t anchored_window);
 
 std::vector<at::Tensor>
 flash_attention_prefill_paged_d256_bm32_allp_pair_scratch(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& out_, std::optional<at::Tensor>& softmax_lse_,
     const at::Tensor& block_table, const at::Tensor& seq_lens,
     const float softmax_scale);
@@ -111,6 +130,7 @@ flash_attention_prefill_paged_d256_bm32_allp_pair_scratch(
 std::vector<at::Tensor>
 flash_attention_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& out_, std::optional<at::Tensor>& softmax_lse_,
     at::Tensor& split_tmp_out, at::Tensor& split_tmp_row_max,
     at::Tensor& split_tmp_row_sum, const at::Tensor& block_table,
@@ -118,6 +138,7 @@ flash_attention_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3(
 
 at::Tensor flash_attention_prefill_paged_bfla(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& seq_lens, const at::Tensor& bfla_block_mask,
     const int bfla_mask_block_n, const float softmax_scale,
@@ -127,6 +148,7 @@ at::Tensor flash_attention_prefill_paged_bfla(
 
 at::Tensor flash_attention_prefill_paged_splitkv(
     const at::Tensor& q, const at::Tensor& k_cache, const at::Tensor& v_cache,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& out_, const at::Tensor& block_table,
     const at::Tensor& seq_lens, const float softmax_scale,
     const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
@@ -167,11 +189,15 @@ void flash_attention_int8_block32_prefill_paged(
 std::vector<at::Tensor> flash_attention_backward(
     const at::Tensor& dout, const at::Tensor& q, const at::Tensor& k,
     const at::Tensor& v, const at::Tensor& out, const at::Tensor& softmax_lse,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& dq_, std::optional<at::Tensor>& dk_,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& dv_, std::optional<at::Tensor>& alibi_slopes_,
     const float p_dropout, const float softmax_scale, const bool is_causal,
     int window_size_left, int window_size_right, const float softcap,
+    // pi-lens-ignore: clang:no_member_template
     const bool deterministic, std::optional<at::Generator> gen_,
+    // pi-lens-ignore: clang:no_member_template
     std::optional<at::Tensor>& rng_state);
 
 #endif

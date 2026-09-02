@@ -424,6 +424,137 @@ def test_grouped_verify_reads_int8_block32_scales_directly() -> None:
     torch.testing.assert_close(output.float(), reference, atol=3e-2, rtol=3e-2)
 
 
+@torch.inference_mode()
+def test_grouped_verify_batches_eight_int8_block32_requests() -> None:
+    _require_sm70_extension()
+    flash_attn_v100 = pytest.importorskip("flash_attn_v100")
+    torch.manual_seed(29)
+
+    num_requests = 8
+    query_len = 8
+    num_query_heads = 6
+    num_kv_heads = 1
+    head_size = 256
+    block_size = 16
+    num_blocks = num_requests * 2
+    spec = AttentionSpec(
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        dtype=torch.int8,
+        kv_quant_mode=KVQuantMode.INT8_BLOCK32,
+    )
+    raw = torch.zeros(
+        num_blocks * spec.page_size_bytes,
+        dtype=torch.int8,
+        device="cuda",
+    )
+    key_cache, value_cache, key_scales, value_scales, _ = (
+        make_int8_block32_kv_cache_views(
+            raw,
+            num_blocks=num_blocks,
+            block_size=block_size,
+            num_kv_heads=num_kv_heads,
+            head_size=head_size,
+        )
+    )
+    key_cache.random_(-127, 128)
+    value_cache.random_(-127, 128)
+    key_scales.uniform_(0.001, 0.02)
+    value_scales.uniform_(0.001, 0.02)
+    query = torch.randn(
+        num_requests * query_len,
+        num_query_heads,
+        head_size,
+        dtype=torch.float16,
+        device="cuda",
+    )
+    block_table = torch.tensor(
+        [[2 * request + 1, 2 * request] for request in range(num_requests)],
+        dtype=torch.int32,
+        device="cuda",
+    )
+    seq_lens = torch.arange(
+        24,
+        24 + num_requests,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    query_start_loc = torch.arange(
+        0,
+        num_requests * query_len + 1,
+        query_len,
+        dtype=torch.int32,
+        device="cuda",
+    )
+    output = torch.empty_like(query)
+    softmax_scale = 1.0 / math.sqrt(head_size)
+
+    def run_grouped_verify() -> None:
+        flash_attn_v100.flash_attn_grouped_verify_paged(
+            query,
+            key_cache,
+            value_cache,
+            block_table,
+            seq_lens,
+            softmax_scale=softmax_scale,
+            out=output,
+            kv_cache_dtype="int8_block32",
+            one_pass=True,
+            query_start_loc=query_start_loc,
+        )
+
+    def reference() -> torch.Tensor:
+        result = torch.empty_like(output, dtype=torch.float32)
+        key_scale_values = key_scales.repeat_interleave(32, dim=-1)
+        value_scale_values = value_scales.repeat_interleave(32, dim=-1)
+        for request in range(num_requests):
+            seq_len = int(seq_lens[request].item())
+            token_indices = torch.arange(seq_len, device="cuda")
+            pages = block_table[request, token_indices // block_size].long()
+            offsets = token_indices % block_size
+            keys = (
+                key_cache[pages, offsets, 0].float()
+                * key_scale_values[pages, 0].float()
+            ).half()
+            values = (
+                value_cache[pages, offsets, 0].float()
+                * value_scale_values[pages, 0].float()
+            ).half()
+            prefix_len = seq_len - query_len
+            for local_query in range(query_len):
+                query_idx = request * query_len + local_query
+                visible_len = prefix_len + local_query + 1
+                scores = torch.einsum(
+                    "hd,td->ht",
+                    query[query_idx].float(),
+                    keys[:visible_len].float(),
+                )
+                probabilities = torch.softmax(
+                    scores * softmax_scale,
+                    dim=-1,
+                )
+                result[query_idx] = torch.einsum(
+                    "ht,td->hd",
+                    probabilities,
+                    values[:visible_len].float(),
+                )
+        return result
+
+    assert flash_attn_v100.flash_attn_grouped_verify_max_requests() >= num_requests
+    run_grouped_verify()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), reference(), atol=3e-2, rtol=3e-2)
+
+    graph = torch.cuda.CUDAGraph()
+    with torch.cuda.graph(graph):
+        run_grouped_verify()
+    query.copy_(torch.randn_like(query))
+    graph.replay()
+    torch.cuda.synchronize()
+    torch.testing.assert_close(output.float(), reference(), atol=3e-2, rtol=3e-2)
+
+
 @pytest.mark.parametrize("num_queries", [8, 16])
 @pytest.mark.parametrize("block_size", [16, 1648])
 def test_int8_block32_expanded_metadata_cuda_graph_replay(

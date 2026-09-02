@@ -1,6 +1,6 @@
+// pi-lens-ignore: clang:fatal_too_many_errors
 #include <torch/extension.h>
 #include <ATen/ATen.h>
-#include <stdexcept>
 #include "fused_mha.h"
 
 #include <pybind11/pybind11.h>
@@ -28,6 +28,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("grouped_verify_max_query_tokens",
         &flash_attention_grouped_verify_max_query_tokens,
         "Maximum query length supported by grouped DFlash2 verification");
+  m.def("grouped_verify_max_requests",
+        &flash_attention_grouped_verify_max_requests,
+        "Maximum request count supported by grouped DFlash2 verification");
   m.def("grouped_sparse_page4_fwd", &flash_attention_grouped_sparse_page4,
         "Grouped exact QSA page4 attention over paged KV cache (Volta)");
   m.def("grouped_sparse_page4_plan_fwd",

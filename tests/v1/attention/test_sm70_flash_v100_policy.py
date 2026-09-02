@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# pyright: reportArgumentType=false, reportAssignmentType=false
+# pyright: reportAttributeAccessIssue=false
 """Regression tests for SM70 FlashAttention-V100 routing policy."""
 
 import sys
@@ -738,7 +740,10 @@ def test_sm70_splitd_d256_loader_requires_exact_ops(monkeypatch):
     assert flash_v100._get_sm70_splitd_d256_ops() == (dense, paged, splitkv3)
 
 
-def test_sm70_splitd_d256_loader_accepts_explicit_sidecar(monkeypatch):
+def test_sm70_splitd_d256_loader_accepts_explicit_sidecar(
+    monkeypatch,
+    tmp_path: Path,
+):
     import vllm.v1.attention.backends.flash_attn_v100 as flash_v100
 
     fake_interface = types.ModuleType("vllm.vllm_flash_attn.flash_attn_interface")
@@ -764,7 +769,8 @@ def test_sm70_splitd_d256_loader_accepts_explicit_sidecar(monkeypatch):
         load_library=load_library,
     )
     monkeypatch.setattr(flash_v100, "torch", SimpleNamespace(ops=fake_ops))
-    monkeypatch.setenv("VLLM_SM70_FA2_D256_LIBRARY", "/tmp/stable-fa2.so")
+    library_path = str(tmp_path / "stable-fa2.so")
+    monkeypatch.setenv("VLLM_SM70_FA2_D256_LIBRARY", library_path)
     monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops_checked", False)
     monkeypatch.setattr(flash_v100, "_sm70_splitd_d256_ops", None)
 
@@ -773,7 +779,7 @@ def test_sm70_splitd_d256_loader_accepts_explicit_sidecar(monkeypatch):
         "paged",
         None,
     )
-    assert loaded == ["/tmp/stable-fa2.so"]
+    assert loaded == [library_path]
 
 
 def test_sm70_d256_gqa_architecture_loader_is_optional(monkeypatch):
@@ -1789,6 +1795,290 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
     assert captured_seq_lens.data_ptr() == original_seq_lens.data_ptr()
     assert captured["one_pass"] is True
     assert torch.all(output == 1)
+
+
+def test_flash_v100_dflash2_int8_grouped_verify_batches_eight_requests():
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    impl = FlashAttnV100Impl(
+        num_heads=6,
+        head_size=256,
+        scale=1.0,
+        num_kv_heads=1,
+        alibi_slopes=None,
+        sliding_window=None,
+        kv_cache_dtype="int8_block32",
+    )
+    impl.use_dflash2_grouped_verify = True
+    impl.dflash2_grouped_verify_max_query_tokens = 16
+    impl.dflash2_grouped_verify_max_requests = 16
+    impl.int8_block32_paged_kv_to_fp16 = object()
+    captured: dict[str, object] = {}
+
+    def grouped_verify(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        **kwargs,
+    ):
+        captured["block_table"] = block_table
+        captured["seq_lens"] = seq_lens
+        captured["query_start_loc"] = kwargs["query_start_loc"]
+        kwargs["out"].fill_(1)
+
+    impl.flash_attn_grouped_verify_paged = grouped_verify
+    num_requests = 8
+    query_len = 8
+    num_query_tokens = num_requests * query_len
+    query_start_loc = torch.arange(
+        0,
+        num_query_tokens + 1,
+        query_len,
+        dtype=torch.int32,
+    )
+    block_table = torch.arange(
+        num_requests * 2,
+        dtype=torch.int32,
+    ).view(num_requests, 2)
+    seq_lens = torch.arange(
+        2049,
+        2049 + num_requests,
+        dtype=torch.int32,
+    )
+    attn_metadata = SimpleNamespace(
+        num_actual_tokens=num_query_tokens,
+        max_query_len=query_len,
+        causal=True,
+        is_dflash_selector_target=True,
+        max_model_len=32768,
+        query_start_loc=query_start_loc,
+        seq_lens=seq_lens,
+        block_table=block_table,
+    )
+    query = torch.zeros((num_query_tokens, 6, 256), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    key_cache = torch.zeros((16, 3296, 1, 256), dtype=torch.int8)
+    value_cache = torch.zeros_like(key_cache)
+
+    assert impl._dflash2_grouped_verify_allowed(
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        num_query_tokens=num_query_tokens,
+    )
+    impl._call_dflash2_int8_grouped_verify(
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        out=output,
+    )
+
+    captured_block_table = captured["block_table"]
+    captured_seq_lens = captured["seq_lens"]
+    captured_query_start_loc = captured["query_start_loc"]
+    assert isinstance(captured_block_table, torch.Tensor)
+    assert isinstance(captured_seq_lens, torch.Tensor)
+    assert isinstance(captured_query_start_loc, torch.Tensor)
+    assert captured_block_table.data_ptr() == block_table.data_ptr()
+    assert captured_seq_lens.data_ptr() == seq_lens.data_ptr()
+    assert captured_query_start_loc.data_ptr() == query_start_loc.data_ptr()
+    assert torch.all(output == 1)
+
+    impl.dflash2_grouped_verify_max_requests = 1
+    assert not impl._dflash2_grouped_verify_allowed(
+        query,
+        key_cache,
+        value_cache,
+        attn_metadata,
+        num_query_tokens=num_query_tokens,
+    )
+
+    impl.dflash2_grouped_verify_max_requests = 16
+    over_limit_requests = 17
+    over_limit_tokens = over_limit_requests * query_len
+    over_limit_metadata = SimpleNamespace(
+        num_actual_tokens=over_limit_tokens,
+        max_query_len=query_len,
+        causal=True,
+        is_dflash_selector_target=True,
+        max_model_len=32768,
+        query_start_loc=torch.arange(
+            0,
+            over_limit_tokens + 1,
+            query_len,
+            dtype=torch.int32,
+        ),
+        seq_lens=torch.full(
+            (over_limit_requests,),
+            2049,
+            dtype=torch.int32,
+        ),
+        block_table=torch.zeros(
+            (over_limit_requests, 2),
+            dtype=torch.int32,
+        ),
+    )
+    assert not impl._dflash2_grouped_verify_allowed(
+        torch.zeros((over_limit_tokens, 6, 256), dtype=torch.float16),
+        key_cache,
+        value_cache,
+        over_limit_metadata,
+        num_query_tokens=over_limit_tokens,
+    )
+
+
+def test_flash_v100_int8_multi_request_prefill_bridge_splits_mixed_batch(
+    monkeypatch,
+):
+    from vllm.v1.attention.backends import flash_attn_v100 as flash_mod
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    impl = object.__new__(FlashAttnV100Impl)
+    impl.scale = 1.0
+    impl.sliding_window = None
+    impl.use_flash_v100_prefill_paged = True
+    impl.use_dflash2_grouped_verify = True
+    impl.dflash2_grouped_verify_max_query_tokens = 16
+    impl.dflash2_grouped_verify_min_model_len = 32768
+    workspace_requests: list[int] = []
+    bridge_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+    grouped_calls: list[tuple[torch.Tensor, torch.Tensor]] = []
+
+    def get_workspace(key_cache, required_blocks):
+        workspace_requests.append(required_blocks)
+        return object(), object(), object()
+
+    def run_bridge(
+        query,
+        key_cache,
+        value_cache,
+        key_scales,
+        value_scales,
+        block_table,
+        seq_lens,
+        *,
+        seq_len,
+        out,
+    ):
+        bridge_calls.append((block_table, seq_lens))
+        assert seq_len == 4000
+        out.fill_(3)
+        return True
+
+    def grouped_verify(
+        query,
+        key_cache,
+        value_cache,
+        block_table,
+        seq_lens,
+        **kwargs,
+    ):
+        grouped_calls.append((block_table, seq_lens))
+        kwargs["out"].fill_(1)
+
+    impl._run_int8_block32_prefill_bridge = run_bridge
+    impl.flash_attn_grouped_verify_paged = grouped_verify
+    monkeypatch.setattr(flash_mod, "_get_fp8_prefill_bridge_workspace", get_workspace)
+    monkeypatch.setattr(flash_mod, "_route_counts", {})
+    monkeypatch.setattr(flash_mod, "_route_summary_registered", True)
+    monkeypatch.setenv("VLLM_FLASH_V100_ROUTE_SUMMARY", "1")
+
+    query = torch.zeros((72, 6, 256), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    key_cache = torch.zeros((4, 3296, 1, 256), dtype=torch.int8)
+    value_cache = torch.zeros_like(key_cache)
+    key_scales = torch.ones((4, 1, 8), dtype=torch.float16)
+    value_scales = torch.ones_like(key_scales)
+    block_table = torch.tensor([[3, 1], [2, 0]], dtype=torch.int32)
+    seq_lens = torch.tensor([4000, 3300], dtype=torch.int32)
+    attn_metadata = SimpleNamespace(
+        causal=True,
+        is_dflash_selector_target=True,
+        max_model_len=262144,
+        query_start_loc_cpu=torch.tensor([0, 64, 72], dtype=torch.int32),
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.clone(),
+        block_table=block_table,
+    )
+
+    assert impl._run_int8_block32_multi_request_prefill_bridge(
+        query,
+        key_cache,
+        value_cache,
+        key_scales,
+        value_scales,
+        attn_metadata,
+        out=output,
+    )
+    assert workspace_requests == [9]
+    assert len(bridge_calls) == 1
+    assert len(grouped_calls) == 1
+    assert torch.equal(bridge_calls[0][0], block_table[:1])
+    assert torch.equal(grouped_calls[0][0], block_table[1:2])
+    assert torch.all(output[:64] == 3)
+    assert torch.all(output[64:] == 1)
+    assert (
+        flash_mod._route_counts["prefill_prefix_int8_block32_bridge_fp16_multi_request"]
+        == 1
+    )
+
+
+def test_flash_v100_int8_multi_request_prefill_bridge_falls_back_on_oom(
+    monkeypatch,
+):
+    from vllm.v1.attention.backends import flash_attn_v100 as flash_mod
+    from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
+
+    impl = object.__new__(FlashAttnV100Impl)
+    impl.scale = 1.0
+    impl.sliding_window = None
+    impl.use_flash_v100_prefill_paged = True
+    impl.use_dflash2_grouped_verify = True
+    impl.dflash2_grouped_verify_max_query_tokens = 16
+    impl.dflash2_grouped_verify_min_model_len = 32768
+    impl.flash_attn_grouped_verify_paged = lambda *args, **kwargs: pytest.fail(
+        "workspace failure must occur before partial request execution"
+    )
+    impl._run_int8_block32_prefill_bridge = lambda *args, **kwargs: pytest.fail(
+        "workspace failure must preserve the exact outer fallback"
+    )
+    monkeypatch.setattr(
+        flash_mod,
+        "_get_fp8_prefill_bridge_workspace",
+        lambda *args, **kwargs: None,
+    )
+
+    query = torch.zeros((72, 6, 256), dtype=torch.float16)
+    output = torch.zeros_like(query)
+    key_cache = torch.zeros((4, 3296, 1, 256), dtype=torch.int8)
+    value_cache = torch.zeros_like(key_cache)
+    key_scales = torch.ones((4, 1, 8), dtype=torch.float16)
+    value_scales = torch.ones_like(key_scales)
+    seq_lens = torch.tensor([4000, 3300], dtype=torch.int32)
+    attn_metadata = SimpleNamespace(
+        causal=True,
+        is_dflash_selector_target=True,
+        max_model_len=262144,
+        query_start_loc_cpu=torch.tensor([0, 64, 72], dtype=torch.int32),
+        seq_lens=seq_lens,
+        seq_lens_cpu=seq_lens.clone(),
+        block_table=torch.tensor([[3, 1], [2, 0]], dtype=torch.int32),
+    )
+
+    assert not impl._run_int8_block32_multi_request_prefill_bridge(
+        query,
+        key_cache,
+        value_cache,
+        key_scales,
+        value_scales,
+        attn_metadata,
+        out=output,
+    )
+    assert torch.count_nonzero(output) == 0
 
 
 def test_flash_v100_dflash2_q16_falls_back_for_q8_native_binary():

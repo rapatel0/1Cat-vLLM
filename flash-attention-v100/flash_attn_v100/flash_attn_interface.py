@@ -503,26 +503,39 @@ def _get_prefill_splitkv3_workspace(
     return workspace
 
 
-def _get_grouped_verify_workspace(q: torch.Tensor) -> _GroupedVerifyWorkspace:
+def _get_grouped_verify_workspace(
+    q: torch.Tensor,
+    *,
+    num_requests: int,
+    max_query_tokens: int,
+) -> _GroupedVerifyWorkspace:
     device_index = q.device.index if q.device.index is not None else -1
     key = (
         q.device.type,
         device_index,
         _workspace_stream_id(q.device),
         q.dtype,
+        num_requests,
+        max_query_tokens,
     )
     workspace = (
         _grouped_verify_workspace_cache.get(key) if _can_cache_workspace(q) else None
     )
     if workspace is None:
+        grouped_splits = 640 // max_query_tokens
+        partial_out_shape = (grouped_splits, max_query_tokens, 6, 256)
+        partial_lse_shape = (grouped_splits, max_query_tokens, 6)
+        if num_requests > 1:
+            partial_out_shape = (num_requests, *partial_out_shape)
+            partial_lse_shape = (num_requests, *partial_lse_shape)
         workspace = _GroupedVerifyWorkspace(
             partial_out=torch.empty(
-                (80, 8, 6, 256),
+                partial_out_shape,
                 dtype=torch.float16,
                 device=q.device,
             ),
             partial_lse=torch.empty(
-                (80, 8, 6),
+                partial_lse_shape,
                 dtype=torch.float32,
                 device=q.device,
             ),
@@ -782,7 +795,7 @@ def flash_attn_func(
     k: torch.Tensor,
     v: torch.Tensor,
     dropout_p: float = 0.0,
-    softmax_scale: float = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
     window_size: tuple = (-1, -1),
     softcap: float = 0.0,
@@ -837,7 +850,7 @@ def flash_attn_bhmd_func(
     k: torch.Tensor,
     v: torch.Tensor,
     dropout_p: float = 0.0,
-    softmax_scale: float = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
     window_size: tuple = (-1, -1),
     softcap: float = 0.0,
@@ -847,7 +860,7 @@ def flash_attn_bhmd_func(
 ):
     """Forward-only Flash-V100 dense attention for [B, H, T, D] tensors."""
     if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** -0.5
+        softmax_scale = float(q.shape[-1] ** -0.5)
     if dropout_p != 0.0:
         raise NotImplementedError("dropout_p != 0.0 not supported")
     if softcap != 0.0:
@@ -1024,7 +1037,7 @@ def flash_attn_decode_paged_xqa_staged_available() -> bool:
 
 
 def flash_attn_grouped_verify_max_query_tokens() -> int:
-    """Return the native grouped-verifier query-length capability.
+    """Return the native grouped-verifier per-request query limit.
 
     Extensions built before q16 support do not expose the capability entry.
     Those binaries support q8, so keep source-overlay deployments safe by
@@ -1040,6 +1053,22 @@ def flash_attn_grouped_verify_max_query_tokens() -> int:
     return int(get_max_query_tokens())
 
 
+def flash_attn_grouped_verify_max_requests() -> int:
+    """Return the native grouped-verifier request-count capability.
+
+    Old binaries implement one request. This capability check prevents a
+    source overlay from sending a multi-request batch to that ABI.
+    """
+    get_max_requests = getattr(
+        flash_attn_v100_cuda,
+        "grouped_verify_max_requests",
+        None,
+    )
+    if get_max_requests is None:
+        return 1
+    return int(get_max_requests())
+
+
 def flash_attn_grouped_verify_paged(
     q: torch.Tensor,
     k_cache: torch.Tensor,
@@ -1052,42 +1081,60 @@ def flash_attn_grouped_verify_paged(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     one_pass: bool = False,
+    query_start_loc: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Exact grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
 
-    The native entry keeps all causal verifier rows together and reuses each
-    paged-KV scan across a packed GQA group. q8 uses one six-head group and q16
-    uses two three-head groups, retaining 48 rows per CTA and the same workspace
-    byte count. Workspaces are stream-local and CUDA-graph safe.
+    The native entry keeps each request's causal verifier rows together. It
+    reuses each paged-KV scan across the request's packed GQA group. q8 uses one
+    six-head group and q16 uses two three-head groups. Multi-request calls use
+    q8 groups. Workspaces are stream-local and CUDA-graph safe.
     """
     if softmax_scale is None:
-        softmax_scale = q.shape[-1] ** -0.5
+        softmax_scale = float(q.shape[-1] ** -0.5)
     q = maybe_contiguous(q)
     block_table = maybe_contiguous(block_table)
     seq_lens = maybe_contiguous(seq_lens)
+    query_start_loc = maybe_contiguous(query_start_loc)
     out = maybe_contiguous(out)
-    workspace = _get_grouped_verify_workspace(q)
-    if q.shape[0] > 8:
-        partial_out = workspace.partial_out.view(40, 16, 6, 256)
-        partial_lse = workspace.partial_lse.view(40, 16, 6)
-    else:
-        partial_out = workspace.partial_out
-        partial_lse = workspace.partial_lse
-    return flash_attn_v100_cuda.grouped_verify_paged_fwd(
+    num_requests = (
+        int(query_start_loc.numel()) - 1 if query_start_loc is not None else 1
+    )
+    if num_requests <= 0:
+        raise ValueError("grouped verify requires at least one request")
+    max_query_tokens = 16 if num_requests == 1 and q.shape[0] > 8 else 8
+    workspace = _get_grouped_verify_workspace(
+        q,
+        num_requests=num_requests,
+        max_query_tokens=max_query_tokens,
+    )
+    grouped_verify = flash_attn_v100_cuda.grouped_verify_paged_fwd
+    args = (
         q,
         k_cache,
         v_cache,
         out,
         block_table,
         seq_lens,
-        partial_out,
-        partial_lse,
+        workspace.partial_out,
+        workspace.partial_lse,
         float(softmax_scale),
         kv_cache_dtype,
         float(k_scale),
         float(v_scale),
         bool(one_pass),
     )
+    native_multi_request = hasattr(
+        flash_attn_v100_cuda,
+        "grouped_verify_max_requests",
+    )
+    if not native_multi_request:
+        if query_start_loc is not None:
+            raise RuntimeError(
+                "the installed grouped verifier does not support multiple requests"
+            )
+        return grouped_verify(*args)
+    return grouped_verify(*args, query_start_loc)
 
 
 def flash_attn_decode_paged_xqa(
