@@ -98,6 +98,22 @@ The user authorized route (b) after call 1 proved official FP8 unreachable on fo
 Call 2 resumes from controller head `0b421fdad07b37d50b6ea257fda8d5c3795815a8` on the same lane.
 <!-- iron-amendment:v2:A002:end -->
 
+<!-- iron-amendment:v2:A003:start -->
+### Scope correction: SM70 FP8 MoE under expert-parallel 8
+
+The user authorized repairing the call-2 blocking boundary inside this increment.
+
+- Keep `Qwen/Qwen3.8-Flash-Next-FP8` at revision `236dfdf285828023ca3bcd3f37366c58a3469b13`.
+- Keep signed `int8_block32` KV, native Qwen4Exp MTP4, and expert-parallel 8. Do not use expert tensor-parallel 8.
+- Call 3 resumes from controller work commit `94f6bfc06def4b009a6ee5d8b68fd92c0e7362a3`. Do not revert the QSA INT8 admission or QSA page-size commits.
+- The next frontier is the SM70 FP8 MoE single-token compact path at 64 experts per rank in `vllm/model_executor/layers/quantization/fp8_sm70_moe.py`.
+- Localize first with the cheapest matched reproducer: EP8, native MTP4, FP16 KV, `CUDA_LAUNCH_BLOCKING=1`. That arm already faults and does not need INT8 KV.
+- Repair only the proven fault. Do not change INT8 page representation, Mamba dtypes, or official checkpoint bytes.
+- After the FP16-KV MTP control generates, re-run INT8 KV plus MTP4 on the same EP8 layout and continue the original acceptance floors.
+- Exclusive eight V100s on `gpu-01` remain authorized, including scaling `llm/sglang-dflash2-fp16-tp4-final` to 0 for the call and restoring it at cleanup.
+- Hugging Face only. Localpool storage. Restore public `qwen38-flash-next` on every exit path.
+<!-- iron-amendment:v2:A003:end -->
+
 ## Outcome
 
 ## Continuity
