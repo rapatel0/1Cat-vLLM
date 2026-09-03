@@ -637,7 +637,7 @@ def _split_paged_kv_cache(
     )
 
 
-def _split_int8_block32_kv_cache(
+def split_int8_block32_kv_cache(
     kv_cache: torch.Tensor,
     *,
     num_kv_heads: int,
@@ -1855,6 +1855,16 @@ def _get_int8_block32_ops():
         _int8_block32_reshape_and_cache,
         _int8_block32_paged_kv_to_fp16,
     )
+
+
+def get_int8_block32_reshape_and_cache():
+    """Return the INT8 block32 cache writer, or None when it is unavailable.
+
+    Other INT8 block32 cache owners, such as the Qwen4Exp QSA attention layer,
+    reuse this single writer so that every route produces the same signed
+    payload and FP16 block-scale layout.
+    """
+    return _get_int8_block32_ops()[2]
 
 
 def _get_fp8_e5m2_paged_kv_bridge_op():
@@ -4725,7 +4735,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             key_scales,
             value_scales,
             page_owners,
-        ) = _split_int8_block32_kv_cache(
+        ) = split_int8_block32_kv_cache(
             kv_cache,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_size,
@@ -6844,7 +6854,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if self.int8_block32_decode_paged is None:
                 raise RuntimeError("FLASH_ATTN_V100 INT8 block decoder is unavailable")
             key_cache, value_cache, key_scales, value_scales, _ = (
-                _split_int8_block32_kv_cache(
+                split_int8_block32_kv_cache(
                     kv_cache,
                     num_kv_heads=self.num_kv_heads,
                     head_size=self.head_size,
@@ -7620,7 +7630,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             )
 
         key_cache, value_cache, key_scales, value_scales, _ = (
-            _split_int8_block32_kv_cache(
+            split_int8_block32_kv_cache(
                 kv_cache,
                 num_kv_heads=self.num_kv_heads,
                 head_size=self.head_size,

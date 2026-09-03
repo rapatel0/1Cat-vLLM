@@ -46,6 +46,10 @@ from vllm.v1.attention.backends.flash_attn import (
     FlashAttentionMetadata,
     FlashAttentionMetadataBuilder,
 )
+from vllm.v1.attention.backends.flash_attn_v100 import (
+    get_int8_block32_reshape_and_cache,
+    split_int8_block32_kv_cache,
+)
 from vllm.v1.kv_cache_interface import (
     FullAttentionSpec,
     KVCacheSpec,
@@ -54,6 +58,16 @@ from vllm.v1.kv_cache_interface import (
 
 from ..common.qsa_cache import QSAForwardMetadata
 from .indexer_qsa import QSAIndexer
+
+# Main KV cache dtypes the QSA owner admits. FP16/BF16 use the dense sparse
+# kernel. int8_block32 uses the dequantizing sparse kernel, which reads signed
+# int8 payloads with separate FP16 per-head, per-32-channel block scales.
+_QSA_SUPPORTED_KV_CACHE_DTYPES: tuple[str, ...] = (
+    "auto",
+    "float16",
+    "bfloat16",
+    "int8_block32",
+)
 
 
 class Qwen4ExpQSAMetadataBuilder(FlashAttentionMetadataBuilder):
@@ -73,6 +87,10 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         "auto",
         "float16",
         "bfloat16",
+        # Signed INT8 payloads with separate FP16 K/V block32 scales. The
+        # sparse read path dequantizes in registers, so cache bytes are never
+        # reinterpreted as FP16.
+        "int8_block32",
     ]
 
     @staticmethod
@@ -116,11 +134,49 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise NotImplementedError(
                 "Qwen4Exp QSA does not support decode context parallelism"
             )
-        if self.kv_cache_dtype not in ("auto", "float16", "bfloat16"):
+        if self.kv_cache_dtype not in _QSA_SUPPORTED_KV_CACHE_DTYPES:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires an FP16/BF16 main KV cache"
+                "Qwen4Exp QSA requires an FP16/BF16 or int8_block32 main KV cache"
             )
         self.supports_quant_query_input = False
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        """Write K/V into the paged cache, honoring the INT8 block32 layout."""
+        if self.kv_cache_dtype != "int8_block32":
+            super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+            return
+
+        reshape_and_cache = get_int8_block32_reshape_and_cache()
+        if reshape_and_cache is None:
+            raise RuntimeError("Qwen4Exp QSA INT8 block cache writer is unavailable")
+        (
+            key_cache,
+            value_cache,
+            key_scales,
+            value_scales,
+            page_owners,
+        ) = split_int8_block32_kv_cache(
+            kv_cache,
+            num_kv_heads=self.num_kv_heads,
+            head_size=self.head_size,
+        )
+        reshape_and_cache(
+            key,
+            value,
+            key_cache,
+            value_cache,
+            key_scales,
+            value_scales,
+            page_owners,
+            slot_mapping,
+        )
 
     def forward_qsa(
         self,
@@ -155,15 +211,42 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
             raise RuntimeError("QSA owner did not provide its top-k buffer")
         logical_indices = topk_buffer[:num_tokens]
         token_to_req = token_to_req[:num_tokens]
+        if query.dtype not in (torch.float16, torch.bfloat16):
+            raise NotImplementedError("Qwen4Exp QSA requires FP16/BF16 Q/K/V")
+
+        if self.kv_cache_dtype == "int8_block32":
+            from .ops.qsa import qsa_sparse_paged_attention_int8_block32
+
+            (
+                key_cache,
+                value_cache,
+                key_scales,
+                value_scales,
+                _page_owners,
+            ) = split_int8_block32_kv_cache(
+                kv_cache,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+            )
+            qsa_sparse_paged_attention_int8_block32(
+                query[:num_tokens],
+                key_cache,
+                value_cache,
+                key_scales,
+                value_scales,
+                logical_indices,
+                attn_metadata.block_table,
+                token_to_req,
+                output[:num_tokens],
+            )
+            return output
+
         # This tree's FlashAttention cache ABI keeps K/V on dimension 1:
         # [num_blocks, 2, block_size, num_kv_heads, head_size].
         key_cache, value_cache = kv_cache.unbind(1)
         key_cache = canonicalize_singleton_dim_strides(key_cache)
         value_cache = canonicalize_singleton_dim_strides(value_cache)
-        if key_cache.dtype != query.dtype or query.dtype not in (
-            torch.float16,
-            torch.bfloat16,
-        ):
+        if key_cache.dtype != query.dtype:
             raise NotImplementedError("Qwen4Exp QSA requires FP16/BF16 Q/K/V")
 
         from .ops.qsa import qsa_sparse_paged_attention
@@ -208,9 +291,9 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
             raise ValueError("Qwen4Exp QSA requires a paged KV cache")
         if model_config.dtype not in (torch.float16, torch.bfloat16):
             raise NotImplementedError("Qwen4Exp QSA requires FP16 or BF16")
-        if cache_config.cache_dtype not in ("auto", "float16", "bfloat16"):
+        if cache_config.cache_dtype not in _QSA_SUPPORTED_KV_CACHE_DTYPES:
             raise NotImplementedError(
-                "Qwen4Exp QSA requires an FP16/BF16 main KV cache"
+                "Qwen4Exp QSA requires an FP16/BF16 or int8_block32 main KV cache"
             )
         if getattr(quant_config, "kv_cache_scheme", None) is not None:
             raise NotImplementedError("Qwen4Exp QSA does not support KV quantization")
@@ -308,7 +391,14 @@ class Qwen4ExpQSAAttention(Qwen3NextAttention, AttentionLayerBase):
         self.kv_cache_torch_dtype = kv_cache_dtype_str_to_dtype(
             self.kv_cache_dtype, model_config
         )
-        if self.kv_cache_torch_dtype != model_config.dtype:
+        self.kv_quant_mode = get_kv_quant_mode(self.kv_cache_dtype)
+        # INT8 block32 stores signed payloads plus separate FP16 scales, so its
+        # storage dtype is deliberately narrower than the model dtype. Every
+        # other route must still match the model dtype exactly.
+        if (
+            not self.kv_quant_mode.is_int8_block32
+            and self.kv_cache_torch_dtype != model_config.dtype
+        ):
             raise NotImplementedError(
                 "Qwen4Exp QSA main cache dtype must match the model dtype"
             )

@@ -12,6 +12,7 @@ import torch
 from vllm.logger import init_logger
 from vllm.platforms import current_platform
 from vllm.triton_utils import HAS_TRITON, tl, triton
+from vllm.v1.kv_cache_interface import INT8_BLOCK32_CHANNEL_SIZE
 
 logger = init_logger(__name__)
 
@@ -564,6 +565,211 @@ def _qsa_sparse_paged_gqa_splitk_kernel(
         )
         scores = tl.dot(query, keys)
         # Scaling scores avoids re-quantizing a scaled query to BF16.
+        scores *= softmax_scale_log2
+        scores = tl.where(valid[None, :], scores, -1.0e20)
+        next_max = tl.maximum(max_value, tl.max(scores, axis=1))
+        alpha = tl.math.exp2(max_value - next_max)
+        probabilities = tl.where(
+            valid[None, :], tl.math.exp2(scores - next_max[:, None]), 0.0
+        )
+        accumulator = tl.dot(
+            probabilities.to(values.dtype),
+            values,
+            acc=accumulator * alpha[:, None],
+        )
+        normalizer = normalizer * alpha + tl.sum(probabilities, axis=1)
+        max_value = next_max
+
+    has_values = normalizer > 0
+    normalized_output = tl.where(
+        has_values[:, None],
+        accumulator / tl.maximum(normalizer[:, None], 1.0e-20),
+        0.0,
+    )
+    output_mask = head_offsets[:, None] < GROUP_SIZE
+    if NUM_SPLITS == 1:
+        tl.store(
+            output_ptr
+            + row * stride_output_row
+            + (first_head + head_offsets[:, None]) * stride_output_head
+            + dim_offsets[None, :],
+            normalized_output,
+            mask=output_mask,
+        )
+    else:
+        partial_lse = tl.where(
+            has_values,
+            max_value + tl.math.log2(tl.maximum(normalizer, 1.0e-20)),
+            -float("inf"),
+        )
+        tl.store(
+            partial_output_ptr
+            + (
+                (split_id * num_rows + row) * NUM_QUERY_HEADS
+                + first_head
+                + head_offsets[:, None]
+            )
+            * HEAD_DIM
+            + dim_offsets[None, :],
+            normalized_output,
+            mask=output_mask,
+        )
+        tl.store(
+            partial_lse_ptr
+            + (split_id * num_rows + row) * NUM_QUERY_HEADS
+            + first_head
+            + head_offsets,
+            partial_lse,
+            mask=head_offsets < GROUP_SIZE,
+        )
+
+
+@triton.jit
+def _qsa_sparse_paged_gqa_int8_block32_splitk_kernel(
+    q_ptr,
+    k_cache_ptr,
+    v_cache_ptr,
+    k_scale_ptr,
+    v_scale_ptr,
+    indices_ptr,
+    block_table_ptr,
+    token_to_req_ptr,
+    partial_output_ptr,
+    partial_lse_ptr,
+    output_ptr,
+    stride_q_row,
+    stride_q_head,
+    stride_k_block,
+    stride_k_token,
+    stride_k_head,
+    stride_v_block,
+    stride_v_token,
+    stride_v_head,
+    stride_k_scale_block,
+    stride_k_scale_head,
+    stride_v_scale_block,
+    stride_v_scale_head,
+    stride_indices_row,
+    stride_table_req,
+    stride_output_row,
+    stride_output_head,
+    num_rows,
+    num_cache_blocks,
+    num_requests,
+    TOPK: tl.constexpr,
+    PAGE_SIZE: tl.constexpr,
+    PAGE_TABLE_WIDTH: tl.constexpr,
+    GROUP_SIZE: tl.constexpr,
+    HEAD_DIM: tl.constexpr,
+    NUM_QUERY_HEADS: tl.constexpr,
+    NUM_SPLITS: tl.constexpr,
+    NUM_TILES: tl.constexpr,
+    BLOCK_M: tl.constexpr,
+    BLOCK_N: tl.constexpr,
+    CHANNEL_SIZE: tl.constexpr,
+) -> None:
+    """Sparse GQA over signed int8_block32 pages.
+
+    Mirrors ``_qsa_sparse_paged_gqa_splitk_kernel`` exactly, except that K and V
+    are stored as signed int8 with separate FP16 per-head, per-32-channel block
+    scales. Payloads are dequantized in registers before the dots, so the INT8
+    bytes are never reinterpreted as FP16.
+    """
+    row = tl.program_id(0)
+    kv_head = tl.program_id(1)
+    split_id = tl.program_id(2)
+    request = tl.load(token_to_req_ptr + row)
+    safe_request = tl.minimum(tl.maximum(request, 0), num_requests - 1)
+
+    head_offsets = tl.arange(0, BLOCK_M)
+    dim_offsets = tl.arange(0, HEAD_DIM)
+    column_offsets = tl.arange(0, BLOCK_N)
+    # Each 32-channel block shares one scale, so map channel -> scale index.
+    scale_offsets = dim_offsets // CHANNEL_SIZE
+    first_head = kv_head * GROUP_SIZE
+    query = tl.load(
+        q_ptr
+        + row * stride_q_row
+        + (first_head + head_offsets[:, None]) * stride_q_head
+        + dim_offsets[None, :],
+        mask=head_offsets[:, None] < GROUP_SIZE,
+        other=0.0,
+    )
+
+    max_value = tl.full((BLOCK_M,), -1.0e20, dtype=tl.float32)
+    normalizer = tl.zeros((BLOCK_M,), dtype=tl.float32)
+    accumulator = tl.zeros((BLOCK_M, HEAD_DIM), dtype=tl.float32)
+    softmax_scale_log2: tl.constexpr = (HEAD_DIM**-0.5) * 1.4426950408889634
+
+    split_tile_start = split_id * NUM_TILES // NUM_SPLITS
+    split_tile_end = (split_id + 1) * NUM_TILES // NUM_SPLITS
+    for tile in range(split_tile_start, split_tile_end):
+        columns = tile * BLOCK_N + column_offsets
+        logical_token = tl.load(
+            indices_ptr + row * stride_indices_row + columns,
+            mask=columns < TOPK,
+            other=-1,
+        )
+        safe_token = tl.maximum(logical_token, 0)
+        logical_page = safe_token // PAGE_SIZE
+        page_offset = safe_token % PAGE_SIZE
+        valid = (
+            (request >= 0)
+            & (request < num_requests)
+            & (logical_token >= 0)
+            & (logical_page < PAGE_TABLE_WIDTH)
+        )
+        physical_page = tl.load(
+            block_table_ptr
+            + safe_request * stride_table_req
+            + tl.minimum(logical_page, PAGE_TABLE_WIDTH - 1),
+            mask=valid,
+            other=-1,
+        )
+        valid &= (physical_page >= 0) & (physical_page < num_cache_blocks)
+        safe_page = tl.maximum(physical_page, 0).to(tl.int64)
+
+        key_payload = tl.load(
+            k_cache_ptr
+            + safe_page[None, :] * stride_k_block
+            + page_offset[None, :] * stride_k_token
+            + kv_head * stride_k_head
+            + dim_offsets[:, None],
+            mask=valid[None, :],
+            other=0,
+        )
+        key_scale = tl.load(
+            k_scale_ptr
+            + safe_page[None, :] * stride_k_scale_block
+            + kv_head * stride_k_scale_head
+            + scale_offsets[:, None],
+            mask=valid[None, :],
+            other=0.0,
+        )
+        keys = (key_payload.to(tl.float32) * key_scale.to(tl.float32)).to(query.dtype)
+
+        value_payload = tl.load(
+            v_cache_ptr
+            + safe_page[:, None] * stride_v_block
+            + page_offset[:, None] * stride_v_token
+            + kv_head * stride_v_head
+            + dim_offsets[None, :],
+            mask=valid[:, None],
+            other=0,
+        )
+        value_scale = tl.load(
+            v_scale_ptr
+            + safe_page[:, None] * stride_v_scale_block
+            + kv_head * stride_v_scale_head
+            + scale_offsets[None, :],
+            mask=valid[:, None],
+            other=0.0,
+        )
+        values = (value_payload.to(tl.float32) * value_scale.to(tl.float32)).to(
+            query.dtype
+        )
+
+        scores = tl.dot(query, keys)
         scores *= softmax_scale_log2
         scores = tl.where(valid[None, :], scores, -1.0e20)
         next_max = tl.maximum(max_value, tl.max(scores, axis=1))
@@ -1674,6 +1880,179 @@ def _qsa_sparse_paged_attention_sm70_xqa_page4(
         num_partitions,
     )
     return out
+
+
+def qsa_sparse_paged_attention_int8_block32(
+    q: torch.Tensor,
+    k_cache: torch.Tensor,
+    v_cache: torch.Tensor,
+    k_scales: torch.Tensor,
+    v_scales: torch.Tensor,
+    logical_indices: torch.Tensor,
+    block_table: torch.Tensor,
+    token_to_req: torch.Tensor,
+    out: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Run sparse GQA over signed ``int8_block32`` paged K/V caches.
+
+    ``k_cache`` and ``v_cache`` hold signed int8 payloads. ``k_scales`` and
+    ``v_scales`` hold the separate FP16 per-head, per-32-channel block scales.
+    Payloads are dequantized inside the kernel, so INT8 bytes are never
+    reinterpreted as FP16.
+
+    This entry point is deliberately separate from
+    :func:`qsa_sparse_paged_attention`. The FP16/BF16 route keeps its own
+    validation, its SM70 XQA fast path, and its launch profile unchanged.
+    """
+
+    if not q.is_cuda or not HAS_TRITON:
+        raise RuntimeError("paged QSA sparse attention requires CUDA and Triton")
+    if q.ndim != 3 or k_cache.ndim != 4 or v_cache.shape != k_cache.shape:
+        raise ValueError("QSA sparse attention received invalid Q/K/V shapes")
+    if k_cache.dtype != torch.int8 or v_cache.dtype != torch.int8:
+        raise ValueError("INT8 block32 QSA requires signed int8 K/V payloads")
+    if k_scales.dtype != torch.float16 or v_scales.dtype != torch.float16:
+        raise ValueError("INT8 block32 QSA requires FP16 K and V scales")
+    if logical_indices.ndim != 2 or logical_indices.shape[0] != q.shape[0]:
+        raise ValueError("QSA indices must have one row per query")
+    if token_to_req.shape != (q.shape[0],) or block_table.ndim != 2:
+        raise ValueError("QSA sparse attention metadata has invalid shapes")
+    if not all(k_cache.shape[:3]) or not all(block_table.shape):
+        raise ValueError("QSA sparse attention cache and block table must be nonempty")
+    if logical_indices.shape[1] <= 0:
+        raise ValueError("QSA sparse attention requires a positive selection width")
+    if q.shape[2] != k_cache.shape[3] or q.shape[1] % k_cache.shape[2]:
+        raise ValueError("QSA sparse attention requires valid grouped-query heads")
+
+    head_dim = q.shape[2]
+    num_kv_heads = k_cache.shape[2]
+    if head_dim % INT8_BLOCK32_CHANNEL_SIZE:
+        raise ValueError(
+            "INT8 block32 QSA requires a head size divisible by "
+            f"{INT8_BLOCK32_CHANNEL_SIZE}"
+        )
+    channel_blocks = head_dim // INT8_BLOCK32_CHANNEL_SIZE
+    expected_scale_shape = (k_cache.shape[0], num_kv_heads, channel_blocks)
+    if (
+        tuple(k_scales.shape) != expected_scale_shape
+        or tuple(v_scales.shape) != expected_scale_shape
+    ):
+        raise ValueError(
+            "INT8 block32 QSA scale shape does not match its payload: "
+            f"expected {expected_scale_shape}, got {tuple(k_scales.shape)} "
+            f"and {tuple(v_scales.shape)}"
+        )
+
+    assert head_dim >= 16 and (head_dim & (head_dim - 1)) == 0
+    assert q.dtype in (torch.float16, torch.bfloat16)
+    assert logical_indices.dtype == block_table.dtype == torch.int32
+    assert token_to_req.dtype == torch.int32
+    assert q.device == k_cache.device == v_cache.device
+    assert q.device == k_scales.device == v_scales.device
+    assert q.device == logical_indices.device == block_table.device
+    assert q.device == token_to_req.device
+    assert q.stride(2) == k_cache.stride(3) == v_cache.stride(3) == 1
+    assert k_scales.stride(2) == v_scales.stride(2) == 1
+    assert logical_indices.stride(1) == block_table.stride(1) == 1
+    assert token_to_req.stride(0) == 1
+
+    output = torch.empty_like(q) if out is None else out
+    if output.shape != q.shape:
+        raise ValueError("QSA sparse output must match its query")
+    assert output.dtype == q.dtype and output.device == q.device
+    assert output.stride(2) == 1
+    if not q.shape[0]:
+        return output
+
+    group_size = q.shape[1] // num_kv_heads
+    block_m = triton.next_power_of_2(group_size)
+    base_programs = q.shape[0] * num_kv_heads
+    block_n, target_splits, partial_warps = _qsa_sparse_launch_profile(
+        base_programs,
+        block_m,
+        current_platform.is_device_capability(70),
+    )
+
+    num_tiles = triton.cdiv(logical_indices.shape[1], block_n)
+    max_useful_splits = 1 << (num_tiles.bit_length() - 1)
+    num_splits = min(max_useful_splits, target_splits)
+
+    if num_splits == 1:
+        partial_output = output
+        partial_lse = output
+    else:
+        partial_output = torch.empty(
+            (num_splits, *q.shape), dtype=torch.float32, device=q.device
+        )
+        partial_lse = torch.empty(
+            (num_splits, q.shape[0], q.shape[1]),
+            dtype=torch.float32,
+            device=q.device,
+        )
+
+    partial_grid = (q.shape[0], num_kv_heads, num_splits)
+    _qsa_sparse_paged_gqa_int8_block32_splitk_kernel[partial_grid](
+        q,
+        k_cache,
+        v_cache,
+        k_scales,
+        v_scales,
+        logical_indices,
+        block_table,
+        token_to_req,
+        partial_output,
+        partial_lse,
+        output,
+        q.stride(0),
+        q.stride(1),
+        k_cache.stride(0),
+        k_cache.stride(1),
+        k_cache.stride(2),
+        v_cache.stride(0),
+        v_cache.stride(1),
+        v_cache.stride(2),
+        k_scales.stride(0),
+        k_scales.stride(1),
+        v_scales.stride(0),
+        v_scales.stride(1),
+        logical_indices.stride(0),
+        block_table.stride(0),
+        output.stride(0),
+        output.stride(1),
+        q.shape[0],
+        k_cache.shape[0],
+        block_table.shape[0],
+        TOPK=logical_indices.shape[1],
+        PAGE_SIZE=k_cache.shape[1],
+        PAGE_TABLE_WIDTH=block_table.shape[1],
+        GROUP_SIZE=group_size,
+        HEAD_DIM=head_dim,
+        NUM_QUERY_HEADS=q.shape[1],
+        NUM_SPLITS=num_splits,
+        NUM_TILES=num_tiles,
+        BLOCK_M=block_m,
+        BLOCK_N=block_n,
+        CHANNEL_SIZE=INT8_BLOCK32_CHANNEL_SIZE,
+        num_warps=partial_warps,
+        num_stages=2,
+    )
+    if num_splits == 1:
+        return output
+
+    _qsa_merge_splitk_kernel[(q.shape[0], q.shape[1])](
+        partial_output,
+        partial_lse,
+        output,
+        output.stride(0),
+        output.stride(1),
+        q.shape[0],
+        HEAD_DIM=head_dim,
+        NUM_QUERY_HEADS=q.shape[1],
+        NUM_SPLITS=num_splits,
+        BLOCK_SPLITS=triton.next_power_of_2(num_splits),
+        num_warps=4,
+    )
+    return output
 
 
 def qsa_sparse_paged_attention(
