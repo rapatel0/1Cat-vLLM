@@ -1,3 +1,5 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 """Numerical and contract tests for QSA over signed int8_block32 KV pages.
 
 Source under test:

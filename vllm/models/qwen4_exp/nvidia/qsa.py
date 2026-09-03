@@ -38,6 +38,7 @@ from vllm.v1.attention.backend import (
     AttentionBackend,
     AttentionCGSupport,
     AttentionType,
+    MultipleOf,
 )
 from vllm.v1.attention.backends.fa_utils import is_flash_attn_varlen_func_available
 from vllm.v1.attention.backends.flash_attn import (
@@ -92,6 +93,28 @@ class Qwen4ExpQSAFlashAttentionBackend(FlashAttentionBackend):
         # reinterpreted as FP16.
         "int8_block32",
     ]
+
+    @staticmethod
+    def get_supported_kernel_block_sizes() -> list[int | MultipleOf]:
+        """Report the kernel page sizes the QSA owner can actually execute.
+
+        FlashAttentionBackend narrows this to [16, 32, 64] for hybrid models
+        that keep Mamba state in float32, because those are the page sizes free
+        of a known FlashAttention NaN propagation bug. That restriction belongs
+        to the FlashAttention kernels. The QSA owner never launches them: it
+        runs its own Triton sparse kernels over the paged cache, so the bug
+        cannot reach this path.
+
+        Inheriting the narrowed list is actively harmful here. Qwen4Exp aligns
+        its attention page to the Mamba page, which produces a large page such
+        as 816 tokens. Of [16, 32, 64] only 16 divides it, so the kernel page
+        would become 16 and one scheduler page would be virtual-split into many
+        kernel blocks. A signed ``int8_block32`` page cannot be split: it holds
+        per-page FP16 K and V block scales and an int32 publication owner, which
+        the split would orphan. Reporting MultipleOf(16) keeps the scheduler
+        page, kernel page, scales, and publication owner one to one.
+        """
+        return [MultipleOf(16)]
 
     @staticmethod
     def get_name() -> str:
