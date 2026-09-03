@@ -61,6 +61,25 @@ The controller owns diagnosis, internal architecture, kernel and Python organiza
 
 ## Amendments and decisions
 
+<!-- iron-amendment:v2:A001:start -->
+### Model-weight correction: official block-scaled FP8
+
+The user replaced the NVFP4 checkpoint target before controller dispatch.
+
+- Supersede `RadixArk/Qwen3.8-Flash-Next-NVFP4` with the official Hugging Face checkpoint `Qwen/Qwen3.8-Flash-Next-FP8`.
+- Pin the current inspected Hugging Face revision `236dfdf285828023ca3bcd3f37366c58a3469b13` unless Hugging Face proves that this immutable revision is unavailable.
+- Preserve the official checkpoint bytes. Do not convert the model to INT8, NVFP4, AWQ, or another weight format.
+- The inspected official configuration declares FP8 quantization, dynamic activations, and `weight_block_size=[128,128]`.
+- Exercise the exact SM70 TurboMind block-FP8 W8A16 path. On V100, the accepted claim is FP8 weight storage and scale handling with FP16 HMMA Tensor Core computation. Do not claim native FP8 or INT8 Tensor Core execution.
+- Verify that eligible dense and MoE weights retain the intended block-scaled FP8 route. Identify every full-precision exclusion from the official checkpoint configuration.
+- Keep the confirmed signed `int8_block32` KV cache and native Qwen4Exp MTP4 requirements unchanged.
+- Start with matched performance characterization of official FP8 weights. Compare against the safest same-checkpoint control that changes only the SM70 weight backend when memory permits.
+- Record weight-route logs, prepared weight/scaling metadata, GPU memory, model-load time, MTP acceptance, verifier round latency, pure decode throughput, whole-request throughput, and prefill separately.
+- Use Hugging Face only. Place the model, Hugging Face cache, source workspace, build cache, and results on localpool.
+
+The controller retains authority to tune the existing TurboMind FP8 block-scaled route within the confirmed acceptance contract. Renew user approval before adding a new INT8 model-weight implementation or changing the official checkpoint bytes.
+<!-- iron-amendment:v2:A001:end -->
+
 ## Outcome
 
 ## Continuity
