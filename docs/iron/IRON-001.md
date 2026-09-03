@@ -41,4 +41,13 @@ The controller owns internal architecture, kernel organization, test design, ben
 
 ## Outcome
 
+Delivered the merge-ready SM70/V100 `int8_block32` KV-cache repair for Qwen3.8 with DFlash2. The grouped INT8 verifier preserves signed K/V payloads, separate FP16 block32 scales, batch-final scale selection, historical page re-quantization, page reset and reuse, arbitrary paging, storage offsets, prefix caching, Mamba alignment, CUDA Graph replay, exact fallbacks, non-INT8 formats, and Flash-Next behavior.
+
+Matched TP4 V100 evidence passed the sealed latency and capacity gates at batch sizes one and eight. The 261,632-token run, focused correctness suites, bounded GSM8K comparison, reproducible package probes, independent red team, and distinct adequate assessment passed. No blocking semantic residual remains.
+
 ## Continuity
+
+The `int8_block32` route remains explicit and non-default. The accepted evidence covers TP4 on four V100 GPUs and a fixed 16-case visible GSM8K comparison. SGLang integration, TP8 claims, Flash-Next INT8 KV support, default INT8 enablement, and image or deployment promotion remain excluded.
+
+Future changes to representation semantics, latency or capacity thresholds, hardware scope, default enablement, or promoted artifacts require separate authorization and fresh evidence. The two reusable probe filenames retain their `call2-` prefix; their call-3 executions and hashes remain current.
+
