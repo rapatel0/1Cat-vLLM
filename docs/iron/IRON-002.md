@@ -80,6 +80,24 @@ The user replaced the NVFP4 checkpoint target before controller dispatch.
 The controller retains authority to tune the existing TurboMind FP8 block-scaled route within the confirmed acceptance contract. Renew user approval before adding a new INT8 model-weight implementation or changing the official checkpoint bytes.
 <!-- iron-amendment:v2:A001:end -->
 
+<!-- iron-amendment:v2:A002:start -->
+### Hardware and topology correction: official FP8 on eight V100s
+
+The user authorized route (b) after call 1 proved official FP8 unreachable on four V100s at TP4.
+
+- Keep `Qwen/Qwen3.8-Flash-Next-FP8` at Hugging Face revision `236dfdf285828023ca3bcd3f37366c58a3469b13`.
+- Keep signed `int8_block32` KV cache and native Qwen4Exp MTP4.
+- Lift the previous exclusion of TP8 claims. Authorize eight NVIDIA V100-SXM2-32GB GPUs on `gpu-01`.
+- Do not use expert tensor-parallel 8. Call 1 verified `moe_intermediate_size=640` and `weight_block_size=[128,128]`. Expert TP8 yields `640/8=80` and `80 % 128 != 0`, which is arithmetically invalid.
+- The required 8-GPU plan is expert-parallel 8, so each rank keeps intermediate size 640 and `640 % 128 == 0`. Dense layers may use additional parallelism only when that split also respects the 128-block grid and measured memory.
+- Re-verify both call-1 boundaries on the 8-GPU layout before implementation: block-FP8 scale geometry and per-rank device-memory headroom including INT8 KV, QSA/GDN state, graphs, and NCCL.
+- Take exclusive owner-scoped use of the eight GPUs. Do not share `gpu-01` with unrelated TP4 pods.
+- Continue Hugging Face-only downloads and localpool storage. Do not convert the official FP8 checkpoint to another weight format.
+- On V100, TurboMind remains FP8 block-scaled storage with FP16 HMMA compute. Do not claim native FP8 or INT8 Tensor Cores.
+
+Call 2 resumes from controller head `0b421fdad07b37d50b6ea257fda8d5c3795815a8` on the same lane.
+<!-- iron-amendment:v2:A002:end -->
+
 ## Outcome
 
 ## Continuity

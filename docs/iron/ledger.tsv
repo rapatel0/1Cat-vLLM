@@ -1,4 +1,4 @@
 # iron-state-v5
 iron_id	title	kind	cadence	parent	status	updated_at	work_commit
 001	Repair SM70 INT8 block32 performance and capacity	initial	implement,verify,redteam	-	completed	2026-09-03T01:35:34Z	0b421fdad07b37d50b6ea257fda8d5c3795815a8
-002	Enable Qwen Flash Next INT8 KV with MTP4	increment	search,spike,decide,implement,verify,redteam	001	blocked	2026-09-03T16:47:00Z	-
+002	Enable Qwen Flash Next INT8 KV with MTP4	increment	search,spike,decide,implement,verify,redteam	001	blocked	2026-09-03T16:50:56Z	-
