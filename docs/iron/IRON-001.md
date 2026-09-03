@@ -39,6 +39,25 @@ The controller owns internal architecture, kernel organization, test design, ben
 
 ## Amendments and decisions
 
+<!-- iron-post-land-review:v1:R001:start -->
+### Post-land review R001
+
+- Identity: `IRON-001` / `6d92c8c52789e70b1da3cf34665e6c3e` / `R001`
+- Disposition: `accepted-as-landed`
+- Correction: Accepted the landed SM70 INT8 repair unchanged after bounded post-land inspection and deterministic identity and corpus checks.
+- Product: `0b421fdad07b37d50b6ea257fda8d5c3795815a8` → `0b421fdad07b37d50b6ea257fda8d5c3795815a8`
+- Changed paths: none
+- Validation: landed-identity=passed, corpus-integrity=passed
+- Limitations: Quality evidence covers 16 fixed visible GSM8K cases and one seed.; Hardware evidence covers one TP4 V100-SXM2-32GB validation pod.; TP8, SGLang, Flash-Next INT8 KV, default enablement, and deployment promotion remain excluded.; Two reusable probe filenames retain a call2 prefix but their call-3 hashes bind the landed candidate.; Agent and route identities are declared rather than provider-authenticated.
+- Ceremony: `post-review-ceremony` via `openai-codex/gpt-5.6-terra/high` (`Batch`); guidance: known-empty; operations: verify-review-intent, verify-base-diff-scope-target, validate-targeted-result-bindings, fast-forward-product-target, verify-product-target, publish-linked-review-report, record-review-landing, check-state, cleanup-exact-review-worktree, seal-review-closeout-last
+- Cleanup: `cleaned`; review-6d92c8c52789e70b1da3cf34665e6c3e/remove-review-worktree-and-branch@f07bb654f7a0c1dba01d40d529ed5c516282bba28d93fdff8d9c830e43d541a5
+- Recorded: `2026-09-03T01:33:49Z`; closed: `2026-09-03T01:35:34Z`
+- Report receipt: `852f57d0bc077024ec7cd115deb9dc0d5e7a6a93c71323697d058d5d4f7f154e`
+- Report evidence commit: `7f66b0cf1da3d36362869b8d046d12489d7e68af`
+- Closeout receipt: `0bdc5ed1475af4dfd355caf4327bde3053702dc8ddd409559a64dccc51f926ec`
+- Closeout evidence commit: `11642b33d4e531abb7336d59262056f8335d4501`
+<!-- iron-post-land-review:v1:R001:end -->
+
 ## Outcome
 
 Delivered the merge-ready SM70/V100 `int8_block32` KV-cache repair for Qwen3.8 with DFlash2. The grouped INT8 verifier preserves signed K/V payloads, separate FP16 block32 scales, batch-final scale selection, historical page re-quantization, page reset and reuse, arbitrary paging, storage offsets, prefix caching, Mamba alignment, CUDA Graph replay, exact fallbacks, non-INT8 formats, and Flash-Next behavior.
