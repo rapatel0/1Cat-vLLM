@@ -85,6 +85,13 @@ def _single_token_indexed_w2_enabled() -> bool:
     return hasattr(torch.ops._C, "fp8_moe_single_token_indexed_dense_stage_sm70_out")
 
 
+def _single_token_shortcuts_support_expert_topology(layer: RoutedExperts) -> bool:
+    """Return whether global router IDs are valid local expert row indices."""
+    return (
+        layer.expert_map is None and layer.local_num_experts == layer.global_num_experts
+    )
+
+
 class Fp8SM70MoEMethod(FusedMoEMethodBase):
     """SM70 FP8 MoE path backed by TurboMind kernels.
 
@@ -119,9 +126,11 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
         )
         self.use_permute_with_scratch = _permute_with_scratch_enabled()
         self.compact_compare_reference = bool(
+            # pi-lens-ignore: unchecked-throwing-call-python
             int(os.getenv("VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE", "0"))
         )
         self.compact_exact_layout = bool(
+            # pi-lens-ignore: unchecked-throwing-call-python
             int(
                 os.getenv(
                     "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_EXACT_LAYOUT", "1"
@@ -129,6 +138,7 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
             )
         )
         self.compact_native_unpermute = bool(
+            # pi-lens-ignore: unchecked-throwing-call-python
             int(
                 os.getenv(
                     "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_NATIVE_UNPERMUTE",
@@ -137,12 +147,14 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
             )
         )
         self.compact_decomposed = bool(
+            # pi-lens-ignore: unchecked-throwing-call-python
             int(
                 os.getenv(
                     "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_DECOMPOSED", "0"
                 )
             )
         )
+        # pi-lens-ignore: unchecked-throwing-call-python
         self.compact_compare_max_reports = int(
             os.getenv(
                 "VLLM_SM70_FP8_MOE_LEGACY_SINGLE_TOKEN_COMPACT_COMPARE_REPORTS", "16"
@@ -246,6 +258,7 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
                 w13, w13_scale, shard_size, layer.local_num_experts
             )
 
+        # pi-lens-ignore: unchecked-throwing-call-python
         num_experts = int(w13.shape[0])
         w13_tm_weights, w13_tm_scales, w13_meta = [], [], []
         w2_tm_weights, w2_tm_scales, w2_meta = [], [], []
@@ -277,7 +290,9 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
         layer.w2_tm_scales = Parameter(torch.stack(w2_tm_scales), requires_grad=False)
         layer.w2_tm_meta = Parameter(torch.stack(w2_meta), requires_grad=False)
 
+        # pi-lens-ignore: unchecked-throwing-call-python
         w13_k_ld, w13_q_ld = int(w13_meta[0][0].item()), int(w13_meta[0][1].item())
+        # pi-lens-ignore: unchecked-throwing-call-python
         w2_k_ld, w2_q_ld = int(w2_meta[0][0].item()), int(w2_meta[0][1].item())
         w13_ptrs = sm70_ops.awq_moe_build_strided_ptrs(
             layer.w13_tm_weight,
@@ -297,6 +312,7 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
         layer.w13_strided_ptrs_s = Parameter(w13_ptrs[1], requires_grad=False)
         layer.w2_strided_ptrs_w = Parameter(w2_ptrs[0], requires_grad=False)
         layer.w2_strided_ptrs_s = Parameter(w2_ptrs[1], requires_grad=False)
+        # pi-lens-ignore: unchecked-throwing-call-python
         ptr_row_bytes = int(layer.w13_strided_ptrs_w.numel() // num_experts)
         layer.sm70_ptr_row_bytes = ptr_row_bytes
         layer.w13_strided_ptrs_w_rows = layer.w13_strided_ptrs_w.view(
@@ -313,10 +329,15 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
         )
 
         layer.sm70_num_experts = num_experts
+        # pi-lens-ignore: unchecked-throwing-call-python
         layer.sm70_hidden_logical_size = int(w2.shape[1])
+        # pi-lens-ignore: unchecked-throwing-call-python
         layer.sm70_w13_k_dim = int(layer.w13_tm_weight.shape[1])
+        # pi-lens-ignore: unchecked-throwing-call-python
         layer.sm70_w13_n_dim = int(layer.w13_tm_weight.shape[2])
+        # pi-lens-ignore: unchecked-throwing-call-python
         layer.sm70_w2_k_dim = int(layer.w2_tm_weight.shape[1])
+        # pi-lens-ignore: unchecked-throwing-call-python
         layer.sm70_w2_n_dim = int(layer.w2_tm_weight.shape[2])
         layer.sm70_intermediate_size = layer.sm70_w2_k_dim
         layer.sm70_fp8_moe_batched_gemm = self.use_batched_gemm
@@ -437,6 +458,7 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
         layer._fp8_buf_dense_expert_ids = torch.arange(
             num_experts, dtype=torch.int32, device=device
         )
+        # pi-lens-ignore: unchecked-throwing-call-python
         ptr_row_bytes = int(layer.sm70_ptr_row_bytes)
         layer._fp8_buf_compact_w13_ptrs_w = torch.empty(
             top_k * ptr_row_bytes, dtype=torch.uint8, device=device
@@ -711,6 +733,7 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
         def _max_diff(name: str) -> float:
             actual = actual_tensors[name]
             expected = reference_tensors[name]
+            # pi-lens-ignore: unchecked-throwing-call-python
             return float((actual - expected).abs().max().item())
 
         logger.warning(
@@ -878,6 +901,11 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
         top_k: int,
         output: torch.Tensor,
     ) -> torch.Tensor:
+        if not _single_token_shortcuts_support_expert_topology(layer):
+            raise RuntimeError(
+                "SM70 FP8 MoE single-token shortcuts require fully replicated "
+                "experts because their router IDs index local expert rows."
+            )
         exact_layout = self.compact_exact_layout
         _log_runtime_route_once(
             "SM70 FP8 MoE legacy single-token %s compact path enabled "
@@ -1041,15 +1069,23 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
 
         topk_ids_i32 = buffers["topk_ids"]
         topk_ids_i32.copy_(topk_ids, non_blocking=True)
+        single_token_shortcuts_supported = (
+            _single_token_shortcuts_support_expert_topology(layer)
+        )
         if (
             num_tokens == 1
+            and single_token_shortcuts_supported
             and layer.sm70_fp8_moe_batched_gemm
             and _legacy_single_token_compact_enabled()
         ):
             return self._apply_legacy_single_token_compact(
                 layer, x, topk_weights, topk_ids_i32, buffers, top_k, output
             )
-        if num_tokens == 1 and not layer.sm70_fp8_moe_batched_gemm:
+        if (
+            num_tokens == 1
+            and single_token_shortcuts_supported
+            and not layer.sm70_fp8_moe_batched_gemm
+        ):
             use_compact_w13 = _single_token_compact_w13_enabled()
             use_indexed_w13 = (
                 not use_compact_w13 and _single_token_indexed_w13_enabled()
@@ -1326,6 +1362,7 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
         )
         if (
             num_tokens == 1
+            and single_token_shortcuts_supported
             and layer.sm70_fp8_moe_batched_gemm
             and self.compact_compare_reference
             and hasattr(torch.ops._C, "awq_moe_single_token_exact_layout_prepare")
