@@ -1112,6 +1112,12 @@ bool nvfp4_moe_grouped_prefill_enabled() {
   return raw == nullptr || std::atoi(raw) != 0;
 }
 
+bool nvfp4_moe_extended_compact_decode_enabled() {
+  const char* raw =
+      std::getenv("VLLM_SM70_NVFP4_MOE_EXTENDED_COMPACT_DECODE");
+  return raw != nullptr && std::atoi(raw) != 0;
+}
+
 bool nvfp4_qwen38_tp4_m1_fast_selector_enabled() {
   const char* raw = std::getenv("VLLM_SM70_NVFP4_QWEN38_TP4_M1_FAST_SELECTOR");
   return raw == nullptr || std::atoi(raw) != 0;
@@ -8964,15 +8970,25 @@ void nvfp4_moe_dense_stage_sm70_out(torch::Tensor out, torch::Tensor input,
       logged_nvfp4_dense_stage,
       "SM70 NVFP4 MoE CUDA-graph-safe TurboMind path enabled C++ op reached",
       input, input.size(0), num_experts);
-  constexpr int kNvfp4LegacyCompactGroups = 8 * 8;
-  // Cover the validated top-k8 B10 verifier bound. Duplicate expert selections
-  // remain separate one-row groups, so this is a routed-slot bound rather
-  // than an active-expert bound. Keep the dense-grouped cutoff independent:
-  // a disabled compact route above 64 rows must not fall back per expert.
-  constexpr int kNvfp4MaxCompactGroups = 10 * 8;
+  constexpr int kNvfp4LegacyCompactGroups = 10 * 8;
+  constexpr int kNvfp4ExtendedCompactGroups = 10 * 20;
+  // Duplicate expert selections remain separate one-row groups, so these are
+  // routed-slot bounds rather than active-expert bounds. Keep B9-B20 behind an
+  // explicit experiment gate after numerical, graph, and throughput validation.
+  const int compact_group_limit =
+      vllm::awq_sm70::nvfp4_moe_extended_compact_decode_enabled()
+          ? kNvfp4ExtendedCompactGroups
+          : kNvfp4LegacyCompactGroups;
   const bool compact_decode_shape =
-      input.size(0) == num_experts && num_experts <= kNvfp4MaxCompactGroups;
+      input.size(0) == num_experts && num_experts <= compact_group_limit;
   if (compact_decode_shape) {
+    if (num_experts > kNvfp4LegacyCompactGroups) {
+      static std::atomic<unsigned> logged_nvfp4_extended_compact{0u};
+      maybe_log_sm70_moe_route_once(
+          logged_nvfp4_extended_compact,
+          "SM70 NVFP4 extended compact decode path enabled C++ op reached",
+          input, input.size(0), num_experts);
+    }
     nvfp4_moe_gemm_sm70_out_impl(out, input, expert_offsets, ptrs_w, ptrs_s,
                                  num_experts, k, n, group_size,
                                  dense_expert_ids, true);

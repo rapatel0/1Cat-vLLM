@@ -19,8 +19,10 @@ from vllm.model_executor.layers.quantization.modelopt import (
 )
 from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
     ModelOptNvFp4SM70MoEMethod,
+    _is_qwen38_qpn_m1_contract,
     _prepare_compact_slot_groups,
     _prepare_single_token_slots,
+    _resolve_qwen38_qpn_m1,
     _single_token_weighted_reduce,
     _use_qwen38_indexed_prefill,
     _use_qwen38_qpn_m1_decode,
@@ -142,6 +144,26 @@ def test_nvfp4_moe_contract_accepts_qwen4_exp_tp4_and_tp8(tp_size, local_interme
     )
 
 
+def test_qwen38_qpn_m1_dependency_is_scoped_and_fails_closed(monkeypatch):
+    tp4 = _qwen4_moe_contract()
+    tp8 = _qwen4_moe_contract(tp_size=8, intermediate_size_per_partition=80)
+    unrelated = _moe_contract()
+
+    assert _is_qwen38_qpn_m1_contract(tp4)
+    assert _is_qwen38_qpn_m1_contract(tp8)
+    assert not _is_qwen38_qpn_m1_contract(unrelated)
+
+    monkeypatch.delenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", raising=False)
+    assert not _resolve_qwen38_qpn_m1(tp4, op_available=False)
+    assert not _resolve_qwen38_qpn_m1(unrelated, op_available=False)
+    assert _resolve_qwen38_qpn_m1(tp8, op_available=True)
+
+    monkeypatch.setenv("VLLM_SM70_NVFP4_QWEN38_MOE_QPN_M1_DECODE", "1")
+    with pytest.raises(RuntimeError, match="Explicit Qwen3.8 QPN-M1 decode"):
+        _resolve_qwen38_qpn_m1(tp4, op_available=False)
+    assert not _resolve_qwen38_qpn_m1(unrelated, op_available=False)
+
+
 def test_qwen38_qpn_m1_decode_is_default_on_and_exact_shape_only(monkeypatch):
     layer: Any = SimpleNamespace(
         moe_config=_qwen4_moe_contract(),
@@ -168,6 +190,8 @@ def test_qwen38_qpn_m1_decode_is_default_on_and_exact_shape_only(monkeypatch):
     assert not _use_qwen38_qpn_m1_decode(layer, x, topk_ids)
     layer.moe_config.tp_size = 8
     layer.sm70_nvfp4_intermediate_size = 80
+    assert _use_qwen38_qpn_m1_decode(layer, x, topk_ids)
+    layer.sm70_nvfp4_intermediate_size = 81
     assert not _use_qwen38_qpn_m1_decode(layer, x, topk_ids)
 
 

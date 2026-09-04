@@ -380,16 +380,22 @@ void nvfp4_moe_qpn_m1_sm70_out(torch::Tensor out, torch::Tensor input,
   TORCH_CHECK(split_k > 0 && split_k <= 32 && groups_k16 % split_k == 0,
               "nvfp4_moe_qpn_m1_sm70_out: split_k must divide K/16");
   if (broadcast_input) {
-    TORCH_CHECK(input.sizes() == torch::IntArrayRef({1, 2560}) &&
-                    out.sizes() == torch::IntArrayRef({10, 320}) &&
-                    weights.sizes() == torch::IntArrayRef({512, 2560, 40}) &&
-                    scales.sizes() == torch::IntArrayRef({512, 160, 320}),
+    const bool tp4 = out.sizes() == torch::IntArrayRef({10, 320}) &&
+                     weights.sizes() == torch::IntArrayRef({512, 2560, 40}) &&
+                     scales.sizes() == torch::IntArrayRef({512, 160, 320});
+    const bool tp8 = out.sizes() == torch::IntArrayRef({10, 160}) &&
+                     weights.sizes() == torch::IntArrayRef({512, 2560, 20}) &&
+                     scales.sizes() == torch::IntArrayRef({512, 160, 160});
+    TORCH_CHECK(input.sizes() == torch::IntArrayRef({1, 2560}) && (tp4 || tp8),
                 "nvfp4_moe_qpn_m1_sm70_out: W13 tensor contract mismatch");
   } else {
-    TORCH_CHECK(input.sizes() == torch::IntArrayRef({10, 160}) &&
-                    out.sizes() == torch::IntArrayRef({10, 2560}) &&
-                    weights.sizes() == torch::IntArrayRef({512, 160, 320}) &&
-                    scales.sizes() == torch::IntArrayRef({512, 10, 2560}),
+    const bool tp4 = input.sizes() == torch::IntArrayRef({10, 160}) &&
+                     weights.sizes() == torch::IntArrayRef({512, 160, 320}) &&
+                     scales.sizes() == torch::IntArrayRef({512, 10, 2560});
+    const bool tp8 = input.sizes() == torch::IntArrayRef({10, 80}) &&
+                     weights.sizes() == torch::IntArrayRef({512, 80, 320}) &&
+                     scales.sizes() == torch::IntArrayRef({512, 5, 2560});
+    TORCH_CHECK(out.sizes() == torch::IntArrayRef({10, 2560}) && (tp4 || tp8),
                 "nvfp4_moe_qpn_m1_sm70_out: W2 tensor contract mismatch");
   }
   dispatch_nvfp4_qpn_m1(out, input, weights, scales, expert_ids,
