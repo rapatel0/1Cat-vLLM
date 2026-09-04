@@ -49,8 +49,8 @@ _SUPPORTED_CONTRACTS: Final = {
 }
 _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
 _QWEN38_SUPPORTED_TP_SIZES: Final = (*_SUPPORTED_TP_SIZES, 8)
-_GRAPH_SAFE_MAX_TOKENS: Final = 18
-_COMPACT_GROUPED_MAX_TOKENS: Final = 10
+_GRAPH_SAFE_MAX_TOKENS: Final = 20
+_COMPACT_GROUPED_MAX_TOKENS: Final = 20
 _MAX_SUPPORTED_TOP_K: Final = max(contract[3] for contract in _SUPPORTED_CONTRACTS)
 _QWEN38_QPN_M1_W13_SPLIT_K: Final = 8
 _QWEN38_QPN_M1_W2_SPLIT_K: Final = 1
@@ -138,7 +138,7 @@ def _prepare_single_token_slots(
         raise ValueError("SM70 NVFP4 direct routing buffer shape mismatch.")
     if active_expert_ids.numel() != top_k:
         raise ValueError("SM70 NVFP4 direct expert-ID buffer shape mismatch.")
-    _prepare_single_token_slots_kernel[(top_k,)](
+    _prepare_single_token_slots_kernel[(top_k,)](  # type: ignore[index]
         x,
         topk_ids,
         expanded_input,
@@ -181,7 +181,9 @@ def _single_token_weighted_reduce(
     if tuple(topk_weights.shape) != (1, top_k) or tuple(output.shape) != (1, hidden):
         raise ValueError("SM70 NVFP4 direct weighted-reduce shape mismatch.")
     block = 256
-    _single_token_weighted_reduce_kernel[(triton.cdiv(hidden, block),)](
+    _single_token_weighted_reduce_kernel[(  # type: ignore[index]
+        triton.cdiv(hidden, block),
+    )](
         expert_output,
         topk_weights,
         output,
@@ -233,7 +235,7 @@ def _prepare_compact_slot_groups(
     # routed slot independent even when adjacent slots select the same expert;
     # coalescing duplicate expert IDs would make the forced one-row scheduler
     # silently skip or miscompute the additional rows.
-    _prepare_compact_slot_groups_kernel[(1,)](
+    _prepare_compact_slot_groups_kernel[(1,)](  # type: ignore[index]
         sorted_expert_ids,
         compact_offsets,
         active_expert_ids,
@@ -850,6 +852,9 @@ class ModelOptNvFp4SM70MoEMethod(ModelOptNvFp4FusedMoE):
         output = buffers["output"]
         slots = num_tokens * top_k
         direct_single_token = num_tokens == 1
+        stage_offsets = buffers["compact_offsets"]
+        stage_expert_ids = buffers["active_expert_ids"]
+        stage_experts = 0
         if _use_qwen38_qpn_m1_decode(layer, x, topk_ids):
             logger.info_once(
                 "SM70 Qwen3.8 NVFP4 direct QPN-M1 expert path enabled "

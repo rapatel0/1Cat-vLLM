@@ -3,6 +3,7 @@
 """Narrow SM70 admission and shape gates for ModelOpt mixed NVFP4."""
 
 from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
@@ -48,7 +49,7 @@ def _mixed_config() -> ModelOptMixedPrecisionConfig:
     )
 
 
-def _moe_contract(**overrides):
+def _moe_contract(**overrides) -> Any:
     values = {
         "num_experts": 256,
         "experts_per_token": 8,
@@ -61,7 +62,7 @@ def _moe_contract(**overrides):
     return SimpleNamespace(**values)
 
 
-def _qwen4_moe_contract(**overrides):
+def _qwen4_moe_contract(**overrides) -> Any:
     values = {
         "num_experts": 512,
         "experts_per_token": 10,
@@ -142,7 +143,7 @@ def test_nvfp4_moe_contract_accepts_qwen4_exp_tp4_and_tp8(tp_size, local_interme
 
 
 def test_qwen38_qpn_m1_decode_is_default_on_and_exact_shape_only(monkeypatch):
-    layer = SimpleNamespace(
+    layer: Any = SimpleNamespace(
         moe_config=_qwen4_moe_contract(),
         sm70_nvfp4_num_experts=512,
         sm70_nvfp4_hidden_size=2560,
@@ -171,7 +172,7 @@ def test_qwen38_qpn_m1_decode_is_default_on_and_exact_shape_only(monkeypatch):
 
 
 def test_qwen38_indexed_prefill_is_default_on_and_exact_shape_only(monkeypatch):
-    layer = SimpleNamespace(
+    layer: Any = SimpleNamespace(
         moe_config=_qwen4_moe_contract(),
         sm70_nvfp4_num_experts=512,
         sm70_nvfp4_hidden_size=2560,
@@ -206,7 +207,7 @@ def test_nvfp4_moe_contract_rejects_shape_consistent_unvalidated_tp8():
         )
 
 
-def _meta_layer() -> SimpleNamespace:
+def _meta_layer() -> Any:
     experts, hidden, intermediate = 256, 2048, 128
     return SimpleNamespace(
         local_num_experts=experts,
@@ -261,7 +262,7 @@ def test_nvfp4_sm70_moe_owns_routing_without_generic_modular_wrapper():
     not torch.cuda.is_available() or torch.cuda.get_device_capability() != (7, 0),
     reason="requires an exact SM70 CUDA device",
 )
-@pytest.mark.parametrize("total_slots", (8, 72, 80, 100))
+@pytest.mark.parametrize("total_slots", (8, 72, 80, 100, 200))
 def test_nvfp4_compact_groups_keep_duplicate_expert_slots_independent(total_slots):
     sorted_expert_ids = (
         torch.arange(total_slots, dtype=torch.int32, device="cuda") // 3
