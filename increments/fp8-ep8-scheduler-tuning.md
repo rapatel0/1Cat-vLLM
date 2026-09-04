@@ -138,3 +138,19 @@ Production traffic can add variance. The report will expose repeat dispersion an
 The initial frontier is baseline capture and benchmark-client construction.
 
 ## Current checkpoint
+
+## Completion
+
+The experiment completed all 27 planned measurements. The 2,048-token baseline remains the only measured configuration that preserves four 262K slots.
+
+At B4, the median aggregate decode rates were 297.899 tok/s at 2K, 297.942 tok/s at 4K, and 296.604 tok/s at 8K.
+
+The 4K candidate reduced KV capacity from 1,061,418 to 973,030 tokens. The 8K candidate reduced it to 803,807 tokens.
+
+The public deployment was restored to its exact frozen command. Health, text, tools, image, and video checks passed after restoration.
+
+The integrated evaluation report is `.pi/benchmarks/results/fp8-ep8-batch-20260904T231226Z/REPORT.md` from the parent workspace. The evidence set contains 27 raw results and 73 verified checksums.
+
+Independent Fusion validation reported no included findings. It confirmed the measurements, calculations, capacity decisions, restoration evidence, interface evidence, and recommendation.
+
+Residual limits remain explicit. The experiment did not measure long-prefill or mixed-prefill behavior, and three repeats do not establish formal statistical significance.
