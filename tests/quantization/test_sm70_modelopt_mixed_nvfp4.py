@@ -131,8 +131,14 @@ def test_nvfp4_moe_contract_rejects_unvalidated_shapes(field, value):
         validate_nvfp4_sm70_moe_contract(_moe_contract(**{field: value}))
 
 
-def test_nvfp4_moe_contract_accepts_qwen4_exp_tp4():
-    validate_nvfp4_sm70_moe_contract(_qwen4_moe_contract())
+@pytest.mark.parametrize(("tp_size", "local_intermediate"), ((4, 160), (8, 80)))
+def test_nvfp4_moe_contract_accepts_qwen4_exp_tp4_and_tp8(tp_size, local_intermediate):
+    validate_nvfp4_sm70_moe_contract(
+        _qwen4_moe_contract(
+            tp_size=tp_size,
+            intermediate_size_per_partition=local_intermediate,
+        )
+    )
 
 
 def test_qwen38_qpn_m1_decode_is_default_on_and_exact_shape_only(monkeypatch):
@@ -159,6 +165,9 @@ def test_qwen38_qpn_m1_decode_is_default_on_and_exact_shape_only(monkeypatch):
 
     layer.moe_config.tp_size = 2
     assert not _use_qwen38_qpn_m1_decode(layer, x, topk_ids)
+    layer.moe_config.tp_size = 8
+    layer.sm70_nvfp4_intermediate_size = 80
+    assert not _use_qwen38_qpn_m1_decode(layer, x, topk_ids)
 
 
 def test_qwen38_indexed_prefill_is_default_on_and_exact_shape_only(monkeypatch):
@@ -184,6 +193,9 @@ def test_qwen38_indexed_prefill_is_default_on_and_exact_shape_only(monkeypatch):
     assert not _use_qwen38_indexed_prefill(layer, x, topk_ids[:, :9])
 
     layer.moe_config.tp_size = 2
+    assert not _use_qwen38_indexed_prefill(layer, x, topk_ids)
+    layer.moe_config.tp_size = 8
+    layer.sm70_nvfp4_intermediate_size = 80
     assert not _use_qwen38_indexed_prefill(layer, x, topk_ids)
 
 

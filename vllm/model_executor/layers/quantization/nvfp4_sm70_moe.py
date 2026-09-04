@@ -40,13 +40,15 @@ from vllm.triton_utils import tl, triton
 
 logger = init_logger(__name__)
 
+_QWEN38_CONTRACT: Final = (2560, 640, 512, 10)
 _SUPPORTED_CONTRACTS: Final = {
     # (hidden size, global expert intermediate size, experts, top-k)
     (2048, 512, 256, 8),  # Qwen3.6-35B-A3B
-    (2560, 640, 512, 10),  # Qwen3.8-Flash-Next
+    _QWEN38_CONTRACT,  # Qwen3.8-Flash-Next
     (4096, 2048, 288, 8),  # GLM-5.3-Flash
 }
 _SUPPORTED_TP_SIZES: Final = (1, 2, 4)
+_QWEN38_SUPPORTED_TP_SIZES: Final = (*_SUPPORTED_TP_SIZES, 8)
 _GRAPH_SAFE_MAX_TOKENS: Final = 18
 _COMPACT_GROUPED_MAX_TOKENS: Final = 10
 _MAX_SUPPORTED_TOP_K: Final = max(contract[3] for contract in _SUPPORTED_CONTRACTS)
@@ -243,11 +245,6 @@ def _prepare_compact_slot_groups(
 
 def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
     """Reject every topology outside the validated SM70 NVFP4 contract."""
-    if moe.tp_size not in _SUPPORTED_TP_SIZES:
-        raise NotImplementedError(
-            "SM70 TurboMind NVFP4 MoE currently supports tensor parallel "
-            f"sizes {_SUPPORTED_TP_SIZES}, got {moe.tp_size}."
-        )
     local_intermediate = moe.intermediate_size_per_partition
     if local_intermediate <= 0 or local_intermediate % NVFP4_GROUP_SIZE:
         raise NotImplementedError(
@@ -261,6 +258,17 @@ def validate_nvfp4_sm70_moe_contract(moe: FusedMoEConfig) -> None:
         moe.num_experts,
         moe.experts_per_token,
     )
+    supported_tp_sizes = (
+        _QWEN38_SUPPORTED_TP_SIZES
+        if contract == _QWEN38_CONTRACT
+        else _SUPPORTED_TP_SIZES
+    )
+    if moe.tp_size not in supported_tp_sizes:
+        raise NotImplementedError(
+            "SM70 TurboMind NVFP4 MoE does not support tensor parallel "
+            f"size {moe.tp_size} for shape {contract}; supported sizes are "
+            f"{supported_tp_sizes}."
+        )
     if contract not in _SUPPORTED_CONTRACTS:
         raise NotImplementedError(
             "SM70 TurboMind NVFP4 MoE shape is not validated: "
