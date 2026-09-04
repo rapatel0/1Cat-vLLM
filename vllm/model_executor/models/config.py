@@ -1,5 +1,6 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from typing import TYPE_CHECKING
 
 from vllm.logger import init_logger
@@ -608,13 +609,17 @@ class Qwen4ExpForConditionalGenerationConfig(Qwen3_5ForConditionalGenerationConf
         model_config = vllm_config.model_config
         multimodal_config = model_config.multimodal_config
         if multimodal_config is not None:
-            if not multimodal_config.language_model_only:
+            if multimodal_config.language_model_only:
+                _strip_qwen4_exp_mrope(model_config)
+            elif os.getenv("VLLM_SM70_QWEN4_EXP_MULTIMODAL", "0") != "1":
                 raise NotImplementedError(
-                    "Qwen4Exp multimodal inference is not enabled in the initial "
-                    "SM70 route; pass --language-model-only while the vision "
-                    "tower remains outside the TP4 memory and quality gates"
+                    "Qwen4Exp multimodal inference on SM70 requires the explicit "
+                    "VLLM_SM70_QWEN4_EXP_MULTIMODAL=1 validation gate."
                 )
-            _strip_qwen4_exp_mrope(model_config)
+            else:
+                logger.warning_once(
+                    "Qwen4Exp SM70 multimodal validation route enabled."
+                )
 
         spec_config = vllm_config.speculative_config
         if spec_config is not None and spec_config.method not in {

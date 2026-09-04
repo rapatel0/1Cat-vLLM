@@ -56,6 +56,7 @@ def test_sm70_v2_route_accepts_prefix_caching(
 def test_initial_sm70_route_rejects_multimodal_tower(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    monkeypatch.delenv("VLLM_SM70_QWEN4_EXP_MULTIMODAL", raising=False)
     monkeypatch.setattr(
         Qwen3_5ForConditionalGenerationConfig,
         "verify_and_update_config",
@@ -79,8 +80,43 @@ def test_initial_sm70_route_rejects_multimodal_tower(
         speculative_config=None,
     )
 
-    with pytest.raises(NotImplementedError, match="--language-model-only"):
+    with pytest.raises(NotImplementedError, match="validation gate"):
         Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+
+def test_sm70_multimodal_opt_in_preserves_mrope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setenv("VLLM_SM70_QWEN4_EXP_MULTIMODAL", "1")
+    monkeypatch.setattr(
+        Qwen3_5ForConditionalGenerationConfig,
+        "verify_and_update_config",
+        lambda _config: None,
+    )
+    text_config = SimpleNamespace(
+        hc_count=4,
+        ple_layer_ids=[2],
+        indexer_n_heads=4,
+        rope_parameters={"mrope_section": [11, 11, 10]},
+    )
+    hf_config = SimpleNamespace(
+        rope_parameters={"mrope_interleaved": True},
+    )
+    vllm_config = SimpleNamespace(
+        model_config=SimpleNamespace(
+            hf_config=hf_config,
+            hf_text_config=text_config,
+            multimodal_config=SimpleNamespace(language_model_only=False),
+        ),
+        cache_config=SimpleNamespace(enable_prefix_caching=False),
+        parallel_config=SimpleNamespace(enable_dbo=False, ubatch_size=1),
+        speculative_config=None,
+    )
+
+    Qwen4ExpForConditionalGenerationConfig.verify_and_update_config(vllm_config)
+
+    assert text_config.rope_parameters["mrope_section"] == [11, 11, 10]
+    assert hf_config.rope_parameters["mrope_interleaved"] is True
 
 
 @pytest.mark.parametrize(
