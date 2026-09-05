@@ -139,3 +139,19 @@ Server histogram buckets provide an upper bound for P99 rather than an exact per
 The initial frontier is benchmark-client construction and a 64K prompt probe.
 
 ## Current checkpoint
+
+## Completion
+
+The experiment completed all 24 measured runs and all eight matching warmups.
+
+The 1K candidate retained four full contexts with 1,102,213 KV tokens, but it did not improve the mixed 64K-prefill workload. At D3+P1, median decode throughput changed from 41.884 to 42.181 tok/s, inside overlapping repeat ranges. Its P99 inter-token histogram bound remained 750 ms, and decode TTFT rose from 1.042 to 1.115 seconds.
+
+At decode-only D1, the 1K candidate reduced median throughput from 103.163 to 94.426 tok/s and raised mean TPOT from 9.693 to 10.590 ms.
+
+The public service was restored to the exact frozen 2K command. Direct health and a fresh LiteLLM text check passed. The stored restoration set also contains successful text, tool, image, and video checks.
+
+The integrated report is `.pi/benchmarks/results/fp8-ep8-mixed-20260905T010204Z/REPORT.md` from the parent workspace. The evidence set contains 24 raw measurements and 81 verified checksums.
+
+Independent Fusion validation reported no included findings. It confirmed the measured contracts, 64K prompt counts, calculations, capacity decisions, restoration evidence, and conclusion.
+
+Residual limits remain explicit: the synthetic long prompt, histogram upper bounds rather than exact P99, three-repeat uncertainty, and possible concurrent production traffic.
