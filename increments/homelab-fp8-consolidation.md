@@ -72,7 +72,51 @@ None.
 
 ## Current orchestration
 
-Pending controller alignment.
+### Lead lens and contract fields
+
+Operations is the lead lens.
+
+- Target and intended state: public FP8 EP8 serving remains the Hermes default; the 4090 is released from EXL3 and runs Steam Headless with LAN-only Sunshine; confirmed orphan zero-scale objects are absent; a clean homelab branch contains matching desired state.
+- Authority and allowed effects: the sealed contract authorizes route/ref replacement, EXL scale-down, gaming scale-up, targeted orphan-object deletion, feature-branch push, and direct live verification. It excludes destructive storage/history cleanup and broad dormant-profile deletion.
+- Known-good state: `sglang-dflash2-fp16-tp4-final` and gateway are 1/1; `qwen38-flash-next` is the live Hermes default and works publicly; EXL3 4090 is 1/1; Steam Headless is 0/0; orphan candidates are already zero with no endpoints.
+- Rollback criteria: any failure of public FP8 or Hermes post-change check restores the saved live Hermes config and gateway ConfigMap; gaming start failure scales Steam back to zero and EXL3 to one. No orphan resource is restored unless a post-delete reference is found.
+- Health and user signals: public LiteLLM model-list/chat checks, Hermes configuration inspection, backend health, endpoints, GPU ownership, Steam readiness, Sunshine listeners, and KasmVNC Tailnet probe.
+- Stop condition and handoff owner: stop before unapproved destructive deletion or network exposure. The user owns later decisions about historical jobs/PVCs/other dormant models.
+
+### Active constraint lenses and required checks
+
+Production readiness: preserve known-good snapshots before modifying live ConfigMaps/Deployments; test the user-facing LiteLLM and gaming access surfaces; ensure rollback follows a failure.
+
+Compatibility: remove all live and desired-state EXL3 references before decommissioning it; preserve `qwen38-flash-next` alias and backend `qwen` model mapping.
+
+### Cadence and evidence policy
+
+Execute → validate. Use direct live observations as runtime evidence and isolated source-branch diffs/server-side dry runs as source evidence. Avoid broad applies and never apply an unreconciled user worktree.
+
+### Validation requirements
+
+- Save live target manifests/config before effectful changes.
+- Validate config changes against the API server before apply; validate the source branch with focused text/reference checks.
+- Check public FP8 health/model list/chat after route/ref updates.
+- Check absence of EXL3 model listing/provider references and absence of EXL pod/endpoints.
+- Check Steam readiness, `nvidia-smi`, Sunshine listening ports, and Tailnet KasmVNC route after start.
+- Verify targeted orphan objects are absent and named shared storage/config resources persist.
+- Push only the clean feature branch based on current `origin/main`.
+- Obtain fresh independent review before completion.
+
+### Current approach and material invalidated approaches
+
+The FP8 deployment is already the live Hermes default, so no default-model promotion is needed. Replace EXL3 fallback/vision dependencies with FP8, remove the EXL3 public route, then release the GPU and start Steam. Delete only the four manifest-free confirmed orphan deployment/service groups and the orphan Gemma Service. Create a clean feature branch from updated `origin/main`, selectively carry the desired FP8 routing/service manifests, add source cleanup, and leave the dirty local `main` unchanged.
+
+Invalidated approaches: applying the existing mixed staged index; deleting all zero-scale deployments; deleting EXL storage or historical jobs; adding a Sunshine Service/UDP Tailnet exposure; or treating a LiteLLM alias as a global gateway default.
+
+### Open material defects and repair evidence
+
+None. The local homelab `main` is behind remote and has mixed staged/unstaged work; a separate clean branch avoids data loss and non-fast-forward push risk.
+
+### Explicit assumptions and non-blocking unknowns
+
+Steam credentials and the existing image are valid. Sunshine is expected to remain LAN-only at host `192.168.102.6`; direct remote/UDP validation is not available. The 4090 is single-GPU, so EXL3 must fully release before Steam starts.
 
 ## Current checkpoint
 
