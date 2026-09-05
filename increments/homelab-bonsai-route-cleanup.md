@@ -62,7 +62,33 @@ None.
 
 ## Current orchestration
 
-Pending controller alignment.
+### Lead lens and contract fields
+
+Operations is the lead lens. The target state contains only the FP8 public route and provider. The known-good state is the current FP8 public route, which returned HTTP 200. The Bonsai route is stale because its model Deployment is zero-scale and its Hermes provider has no remaining consumer. The allowed effect is targeted removal of the live and desired-state route/provider. A public FP8 request or missing FP8 route triggers restoration from saved config. The dirty original worktree remains read-only.
+
+### Active constraint lenses and required checks
+
+Production readiness requires a pre-change config snapshot, ConfigMap API dry run, rollout checks, and public FP8 route validation. Cleanup requires direct checks that no active Bonsai route/provider remains and requires retention of Bonsai resources/history.
+
+### Cadence and evidence policy
+
+Execute → validate. Use the clean feature branch for source changes and do not modify the original worktree.
+
+### Validation requirements
+
+Check live LiteLLM models, public FP8 request, live Hermes config, source YAML parsing, ConfigMap server dry run, no active source route/provider references, and pushed feature-branch status. The dirty-file audit needs path/status/reference evidence only.
+
+### Current approach and material invalidated approaches
+
+Remove the exact Bonsai `model_list` item in LiteLLM and the exact Hermes provider item. Do not delete the zero-scale Bonsai workload, service, storage, ConfigMaps, jobs, or history. Remove the stale README topology entry. Do not stage, reset, or change original worktree files.
+
+### Open material defects and repair evidence
+
+None.
+
+### Explicit assumptions and non-blocking unknowns
+
+External clients that explicitly request `bonsai-27b` will receive an unsupported-model response after cleanup. No current Hermes path uses it.
 
 ## Current checkpoint
 
