@@ -121,3 +121,42 @@ Steam credentials and the existing image are valid. Sunshine is expected to rema
 ## Current checkpoint
 
 None.
+
+## Completion
+
+### Delivered artifact
+
+The public homelab now uses Qwen3.8 Flash-Next FP8 EP8 as the Hermes default, fallback, vision, and public LiteLLM route. EXL3 4090 serving is decommissioned; Steam Headless owns the RTX 4090 and runs Sunshine. The KasmVNC Tailnet endpoint was migrated from the broken legacy Service proxy to a Tailscale Ingress and is reachable at `https://steam-vnc.tail7cd5.ts.net/`.
+
+The clean source branch is `feat/fp8-default-4090-gaming`, pushed at `a1cb01c` after `5252382`. It is based on `origin/main` at `4a608bd`. It contains Hermes/gateway default cleanup and the Steam Tailnet Ingress migration. It excludes the dirty original worktree, agent state, DCP work, experimental manifests, and reports.
+
+Nine confirmed orphan zero-scale objects were removed: the DeepSeek and Forge baseline Deployments/Services, Gemma A and B Deployments/Services, and the orphan `gemma4-12b-awq` Service. Shared storage, ConfigMaps, Jobs, benchmark evidence, and ambiguous dormant profiles were retained.
+
+### Acceptance evidence and criterion status
+
+- Full — Public `https://llm.tail7cd5.ts.net/v1` returned HTTP 200 for `qwen38-flash-next` and `PUBLIC-FP8`, with the FP8 EP8 fingerprint. The EXL route is absent from models.
+- Full — Live Hermes config has Flash as default, fallback, and vision with no EXL provider/reference.
+- Full — EXL3 4090 Deployment and Service are absent. `qwen38-exl3-4090-config` and `qwen38-exl3-4090-workspace` PVC remain, and pre-change deployment/service/config YAML was saved in `homelab/artifacts/fp8-consolidation-20260905T104952Z`.
+- Full — `steam-headless-0` is ready on GPU-02 and sees the RTX 4090. Sunshine is running, TCP 47990/48010 listen, and its authenticated web UI responds. KasmVNC returns HTTP 200 in-pod, through the Service, and through the repaired external Tailnet endpoint.
+- Full — The named orphan cleanup passed zero-replica/no-endpoint guards before deletion, and all nine objects were absent afterward.
+- Full — Source YAML parsing, API-server dry runs, direct serving-reference search, `git diff --check`, LSP checks, and a fresh focused independent review passed.
+
+### Preserved behavior evidence
+
+The active FP8 Deployment, service, model revision/runtime shape, gateway, cache, ingress, Lift OCR artifacts, Steam credentials/data, EXL ConfigMap/PVC, and other dormant profile/storage/history objects remain. No Tailnet UDP exposure was added.
+
+### Reproduction or run commands
+
+- `curl -k https://llm.tail7cd5.ts.net/v1/models`
+- `curl -k https://steam-vnc.tail7cd5.ts.net/`
+- `kubectl -n gaming get statefulset steam-headless`
+- `kubectl -n gaming exec steam-headless-0 -- nvidia-smi`
+- `kubectl -n llm get deploy,svc`
+
+### Material residuals
+
+`bonsai-27b` remains a gateway-advertised, dormant 4090 route because it was outside the confirmed safe-delete set. Its deployment, model storage, and related history were not deleted.
+
+### Unverified behavior
+
+A Moonlight streaming session was not paired, so Sunshine media UDP behavior under an active session remains untested. The FPS/gaming application path was not exercised. Other retained dormant LLM profiles, completed Jobs, ConfigMaps, PVCs, and historical benchmark/doc material still need separate authority and reference review before deletion.
