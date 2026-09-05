@@ -93,3 +93,46 @@ External clients that explicitly request `bonsai-27b` will receive an unsupporte
 ## Current checkpoint
 
 None.
+
+## Completion
+
+### Delivered artifact
+
+The stale `bonsai-27b` public LiteLLM route and unused Hermes provider were removed from the live cluster and from `feat/fp8-default-4090-gaming`. Source commit `09216a0` is pushed after the FP8 consolidation commits.
+
+A read-only audit classified the original dirty homelab worktree without changing its contents or staging state.
+
+### Acceptance evidence and criterion status
+
+- Full — Public `https://llm.tail7cd5.ts.net/v1/models` listed only `qwen38-flash-next`; a public FP8 completion returned HTTP 200 with `FP8-CLEAN` and the FP8 EP8 fingerprint.
+- Full — Live Hermes configuration and LiteLLM payload contain no `bonsai-27b`; the FP8 Deployment is ready 1/1.
+- Full — Clean source Hermes/gateway manifests contain no active Bonsai provider or model route. YAML parsing, ConfigMap server dry run, diff check, and LSP diagnostics passed.
+- Full — Independent review reported no blocker and confirmed the clean source branch matches pushed `09216a0`.
+- Full — The original worktree stayed read-only during audit.
+
+### Preserved behavior evidence
+
+Bonsai Deployment/Service, manifests, model storage, ConfigMaps, Jobs, benchmarks, and history were not changed. The public FP8 route remains available.
+
+### Reproduction or run commands
+
+- `curl -k https://llm.tail7cd5.ts.net/v1/models`
+- `git -C /Users/ravi/repos/homelab-fp8-consolidation log --oneline -3`
+- `git -C /Users/ravi/repos/homelab status --short`
+
+### Material residuals
+
+The original worktree retains a mixed stale staged index, DCP experiments, and research notes. It must not be blindly committed or applied.
+
+### Unverified behavior
+
+The repository baseline cannot prevent future Hermes PVC runtime drift; current live configuration was verified.
+
+### Dirty-worktree audit
+
+- Already represented on the clean branch: the active FP8 `sglang-v100-dflash2` Deployment, Service, and README. Their staged index contains older NVFP4/SGLang content, so retain the clean worktree version and do not commit the index.
+- Active FP8 candidates not represented: `18-tp4-pp2-fp8-130.yaml` and `19-tp8-fp8-130.yaml`. They are isolated eight-GPU candidate manifests with no live deployment/gateway route; retain pending separate qualification.
+- DCP experiments: the attention patch, DCP2 manifest, test, patch README, and old SGLang staging Job. Decode-LSE correctness remains incomplete; do not deploy or merge.
+- Research documentation: DCP investigation/implementation reports and parked integration plans. Retain as notes and reconcile claims before publication.
+- Stale alternate routing: original dirty Hermes/gateway changes would reintroduce the retired EXL3 4090 route. Do not merge them. Live routing no longer has that EXL route.
+- `.pi/` consists of local agent state and must not be committed.
