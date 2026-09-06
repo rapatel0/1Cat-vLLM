@@ -58,7 +58,33 @@ None.
 
 ## Current orchestration
 
-Pending controller alignment.
+### Lead lens and contract fields
+
+Migration is the lead lens. The old state is fork main `94f64714263e3af4399bbc0dd78069e5ce3a84b9`, two commits ahead and 246 commits behind upstream main. The target is a normal merge with upstream main `24ff99d157bd8fc34755fd5d44849ab434010473` as an ancestor and fork work retained. Mapping invariants are both parent ancestries, no unmerged files, and no public-history rewrite. The consumer is the fork main branch; no deployment consumer is part of this increment. Rollback is `git merge --abort` before commit or normal revert after push.
+
+### Active constraint lenses and required checks
+
+Compatibility requires focused inspection of every conflict and preservation of fork-only INT8 KV cache behavior. Production readiness applies only to the public Git push: use a clean clone, no force push, verify ancestry, and confirm remote ref.
+
+### Cadence and evidence policy
+
+Execute → validate. Merge upstream main with `--no-commit`; resolve only actual conflicts after inspecting both sides; validate affected source and run focused checks before a normal merge commit.
+
+### Validation requirements
+
+Record fork/upstream starting commits and divergence. Verify no conflict markers or unmerged index entries. Verify both starting commits are ancestors of the result. Run the nearest available focused checks for conflict files and the repository's relevant source checks. Confirm pushed `origin/main` equals the merge commit.
+
+### Current approach and material invalidated approaches
+
+Use `/Users/ravi/repos/1cat-vllm-upstream-sync`, a fresh clone. The fork-only commits are `6833b8529` and its merge commit `94f647142`. A direct fast-forward is invalid because the fork diverges; use a normal merge and retain both histories.
+
+### Open material defects and repair evidence
+
+None before the merge.
+
+### Explicit assumptions and non-blocking unknowns
+
+Upstream main is the intended source at fetch time. A large upstream delta can create source conflicts or broad test cost; focused checks will cover the resolved surface and any unrun scope will be stated.
 
 ## Current checkpoint
 
