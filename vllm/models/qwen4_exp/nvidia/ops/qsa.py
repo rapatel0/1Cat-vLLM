@@ -2287,6 +2287,7 @@ def qsa_sparse_paged_attention_int8_block32(
     block_table: torch.Tensor,
     token_to_req: torch.Tensor,
     out: torch.Tensor | None = None,
+    output_gate: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Run sparse GQA over signed ``int8_block32`` paged K/V caches.
 
@@ -2356,6 +2357,15 @@ def qsa_sparse_paged_attention_int8_block32(
         raise ValueError("QSA sparse output must match its query")
     assert output.dtype == q.dtype and output.device == q.device
     assert output.stride(2) == 1
+    output_gate_view = None
+    if output_gate is not None:
+        if output_gate.numel() != q.numel():
+            raise ValueError("QSA output gate must match its query shape")
+        output_gate_view = output_gate.view_as(q)
+        if output_gate_view.dtype != q.dtype or output_gate_view.device != q.device:
+            raise ValueError("QSA output gate must match the query dtype and device")
+        if output_gate_view.stride(2) != 1:
+            raise ValueError("QSA output gate must be contiguous in head dimension")
     if not q.shape[0]:
         return output
 
@@ -2432,19 +2442,26 @@ def qsa_sparse_paged_attention_int8_block32(
         num_stages=2,
     )
     if num_splits == 1:
+        if output_gate_view is not None:
+            _qsa_output_gate(output, output_gate_view)
         return output
 
     _qsa_merge_splitk_kernel[(q.shape[0], q.shape[1])](
         partial_output,
         partial_lse,
         output,
+        output_gate_view,
         output.stride(0),
         output.stride(1),
+        output_gate_view.stride(0) if output_gate_view is not None else 0,
+        output_gate_view.stride(1) if output_gate_view is not None else 0,
         q.shape[0],
+        1.0,
         HEAD_DIM=head_dim,
         NUM_QUERY_HEADS=q.shape[1],
         NUM_SPLITS=num_splits,
         BLOCK_SPLITS=triton.next_power_of_2(num_splits),
+        KV_E4M3=False,
         num_warps=4,
     )
     return output
