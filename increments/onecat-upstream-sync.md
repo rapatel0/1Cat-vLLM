@@ -89,3 +89,35 @@ Upstream main is the intended source at fetch time. A large upstream delta can c
 ## Current checkpoint
 
 None.
+
+## Completion
+
+### Delivered artifact
+
+Fork `main` was updated and pushed at merge commit `682e36873674c6bdab1f73f1fd7e13c24b5d00e6`.
+
+### Acceptance evidence and criterion status
+
+- Full — The result retains pre-merge fork main `94f64714263e3af4399bbc0dd78069e5ce3a84b9` and upstream main `24ff99d157bd8fc34755fd5d44849ab434010473` as ancestors.
+- Full — The merge was a normal non-fast-forward merge; the fork’s two commits were retained and no force push was used.
+- Full — Git reported no textual conflicts. No unmerged index entries, conflict markers, or whitespace errors remained.
+- Full — Focused independent review verified the automatic merge preserves the fork’s `int8_block32` paths alongside upstream sparse/compressed-cache changes in all five overlapping source files.
+- Full — Python syntax compilation passed for the fork INT8 Python/test surface. The clean clone and `origin/main` both point at the merge commit.
+
+### Preserved behavior evidence
+
+The fork-only INT8 KV cache commit `6833b8529` remains in history and its declarations, bindings, backend routes, validations, and raw page views remain present after merge.
+
+### Reproduction or run commands
+
+- `git -C /Users/ravi/repos/1cat-vllm-upstream-sync log --oneline --decorate -4`
+- `git -C /Users/ravi/repos/1cat-vllm-upstream-sync merge-base --is-ancestor 94f647142 HEAD`
+- `git -C /Users/ravi/repos/1cat-vllm-upstream-sync merge-base --is-ancestor 24ff99d15 HEAD`
+
+### Material residuals
+
+GPU/runtime integration tests were not run from the laptop because this sync did not build or deploy an image. Upstream changes are substantial and must be separately qualified before replacing the active V100 production overlay.
+
+### Unverified behavior
+
+No cluster runtime behavior was changed or revalidated as part of the Git source sync.
