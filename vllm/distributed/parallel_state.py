@@ -510,6 +510,8 @@ class GroupCoordinator:
         assert self_cpu_group is not None
         assert self_device_group is not None
 
+        self.group_ranks = group_ranks
+        self.torch_distributed_backend = torch_distributed_backend
         self.cpu_group = self_cpu_group
         self.device_group = self_device_group
 
@@ -556,6 +558,20 @@ class GroupCoordinator:
             and self.device_communicator
             and getattr(self.device_communicator, "supports_tensor_dict", False)
         )
+
+    def make_sibling_device_group(self, group_desc: str | None = None) -> ProcessGroup:
+        """Create a distinct device communicator with identical membership."""
+        sibling: ProcessGroup | None = None
+        for ranks in self.group_ranks:
+            group = torch.distributed.new_group(
+                ranks,
+                backend=self.torch_distributed_backend,
+                group_desc=group_desc,
+            )
+            if self.rank in ranks:
+                sibling = group
+        assert sibling is not None
+        return sibling
 
     def create_mq_broadcaster(
         self, writer_rank=0, external_writer_handle=None, blocking=True
@@ -2440,6 +2456,26 @@ def is_global_first_rank() -> bool:
     except Exception:
         # If anything goes wrong, assume this is the first rank
         return True
+
+
+def is_last_pp_first_tp_rank() -> bool:
+    """
+    Check if the current process is the first tensor-parallel rank of the
+    last pipeline-parallel stage.
+
+    Sampling and speculative decoding only run on the last PP stage, so
+    per-step reports about them have to be emitted from that stage; the
+    global first rank (see `is_global_first_rank`) is never on it when
+    PP > 1.
+
+    Returns:
+        bool: True on the first TP rank of the last PP stage. Returns True
+              if the model-parallel groups are not initialized
+              (single process).
+    """
+    if _PP is None or _TP is None:
+        return True
+    return _PP.is_last_rank and _TP.rank_in_group == 0
 
 
 def is_local_first_rank() -> bool:

@@ -32,15 +32,32 @@ def _use_sm70_topk_topp_8_warps(
         device.type != "cuda"
         or not current_platform.is_cuda()
         or not current_platform.is_device_capability((7, 0))
-        or vocab_size != 248_320
-        or not topk_enabled
-        or not topp_enabled
     ):
         return False
 
-    if batch_size in (8, 16) and envs.VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS:
+    if (
+        envs.VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS
+        and vocab_size == 154_880
+        and batch_size == 8
+        and not topk_enabled
+        and topp_enabled
+    ):
         return True
-    return envs.VLLM_SM70_TOPK_TOPP_8_WARPS and batch_size in (5, 10, 20, 40, 60, 80)
+    if (
+        envs.VLLM_SM70_TOPK_TOPP_B8_B16_8_WARPS
+        and vocab_size == 248_320
+        and batch_size in (8, 16)
+        and topk_enabled
+        and topp_enabled
+    ):
+        return True
+    return (
+        vocab_size == 248_320
+        and topk_enabled
+        and topp_enabled
+        and envs.VLLM_SM70_TOPK_TOPP_8_WARPS
+        and batch_size in (5, 10, 20, 40, 60, 80)
+    )
 
 
 # fmt: off
@@ -131,6 +148,7 @@ def _topk_topp_kernel(
     BLOCK_SIZE_TRUNC: tl.constexpr,
     TOPK_ENABLED: tl.constexpr,
     TOPP_ENABLED: tl.constexpr,
+    REFERENCE_ROWS=None,
 ):
     NUM_TILES: tl.constexpr = (VOCAB_SIZE + BLOCK_SIZE - 1) // BLOCK_SIZE
     pid = tl.program_id(0)
@@ -144,6 +162,7 @@ def _topk_topp_kernel(
         num_duplicate_logit = tl.zeros((), dtype=tl.uint32)
         num_keep = tl.zeros((), dtype=tl.uint32)
         num_kept = tl.zeros((), dtype=tl.uint32)
+        needs_reference = tl.full((), False, tl.int1)
 
         max_logit = -float("inf")
         min_logit = float("inf")
@@ -389,6 +408,7 @@ def _topk_topp_kernel(
                 duplicate_logit = min_larger
                 num_duplicate_logit = num_min_larger
                 num_keep = num_duplicate_logit - (k_pivots_num - k)
+                needs_reference = num_keep < num_duplicate_logit
                 num_kept = tl.zeros((), dtype=tl.uint32)
 
                 # Top-k only path.  If there are fewer finite values
@@ -956,6 +976,14 @@ def _topk_topp_kernel(
                 # Top-p only path
                 final_pivot = tl.log(p_pivot * sum_exp_logits) + max_sample
 
+        # Pivot-space duplicate selection does not preserve the reference's
+        # token tie order, and log/exp reconstruction can miss the cutoff.
+        # Mark only these ambiguous rows for exact reference masking.
+        needs_reference = needs_reference | (num_keep < num_duplicate_logit)
+        needs_reference = needs_reference | ~(final_pivot < max_logit)
+        if REFERENCE_ROWS is not None:
+            tl.store(REFERENCE_ROWS + row_id, needs_reference)
+
         # Sixth pass: Apply mask and store final output.
         # If the pivot >= max logit (or is NaN), no token would
         # survive the strict `>` keep_mask.  Skip masking.
@@ -1021,6 +1049,16 @@ def apply_top_k_top_p_triton(
     if batch_size == 0 or not (topk_enabled or topp_enabled):
         return logits
 
+    # Sampling normally runs outside the model graphs. Keep direct graph
+    # callers correct without introducing a device-to-host fence in capture.
+    if logits.is_cuda and torch.cuda.is_current_stream_capturing():
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+        reference_logits = apply_top_k_top_p_pytorch(logits, k, p)
+        if mask_value != float("-inf"):
+            reference_logits.masked_fill_(torch.isneginf(reference_logits), mask_value)
+        return reference_logits
+
     # The Triton kernel supports arbitrary row strides, but it still assumes
     # the vocab dimension is laid out contiguously within each row.
     if logits.stride(1) != 1:
@@ -1082,6 +1120,8 @@ def apply_top_k_top_p_triton(
         # rows are default-on; the measured MTP verifier rows remain opt-in.
         launch_kwargs["num_warps"] = 8
 
+    original_logits = logits.clone()
+    reference_rows = torch.empty(batch_size, dtype=torch.bool, device=logits.device)
     _topk_topp_kernel[(NUM_PROGRAMS,)](
         logits,
         logits.stride(0),
@@ -1097,9 +1137,21 @@ def apply_top_k_top_p_triton(
         BLOCK_SIZE_TRUNC=block_size_trunc,
         TOPK_ENABLED=topk_enabled,
         TOPP_ENABLED=topp_enabled,
+        REFERENCE_ROWS=reference_rows,
         **launch_kwargs,
     )
 
+    if reference_rows.any():
+        from vllm.v1.sample.ops.topk_topp_sampler import apply_top_k_top_p_pytorch
+
+        reference_logits = apply_top_k_top_p_pytorch(
+            original_logits[reference_rows],
+            k[reference_rows] if k is not None else None,
+            p[reference_rows] if p is not None else None,
+        )
+        if mask_value != float("-inf"):
+            reference_logits.masked_fill_(torch.isneginf(reference_logits), mask_value)
+        logits[reference_rows] = reference_logits
     return logits
 
 

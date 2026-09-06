@@ -1,6 +1,6 @@
+// pi-lens-ignore: clang:fatal_too_many_errors
 #include <torch/extension.h>
 #include <ATen/ATen.h>
-#include <stdexcept>
 #include "fused_mha.h"
 
 #include <pybind11/pybind11.h>
@@ -25,11 +25,18 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
         "Staged FlashAttention XQA decode over paged KV cache (Volta)");
   m.def("grouped_verify_paged_fwd", &flash_attention_grouped_verify_paged,
         "Exact grouped DFlash2 verification over paged KV cache (Volta)");
+  m.attr("grouped_verify_e4m3") = true;
   m.def("grouped_verify_max_query_tokens",
         &flash_attention_grouped_verify_max_query_tokens,
         "Maximum query length supported by grouped DFlash2 verification");
+  m.def("grouped_verify_max_requests",
+        &flash_attention_grouped_verify_max_requests,
+        "Maximum request count supported by grouped DFlash2 verification");
   m.def("grouped_sparse_page4_fwd", &flash_attention_grouped_sparse_page4,
         "Grouped exact QSA page4 attention over paged KV cache (Volta)");
+  m.def("grouped_sparse_page4_abi_version",
+        &flash_attention_grouped_sparse_page4_abi_version,
+        "Grouped sparse page4 forward ABI version");
   m.def("grouped_sparse_page4_plan_fwd",
         &flash_attention_grouped_sparse_page4_plan,
         "Build grouped exact QSA page4 tables over paged KV cache (Volta)");
@@ -58,6 +65,9 @@ PYBIND11_MODULE(TORCH_EXTENSION_NAME, m) {
   m.def("int8_block32_reshape_and_cache",
         &flash_attention_int8_block32_reshape_and_cache,
         "Quantize FP16 K/V into an INT8 cache with adaptive page block scales");
+  m.def("int8_block32_paged_kv_to_fp16",
+        &flash_attention_int8_block32_paged_kv_to_fp16,
+        "Expand paged block-scaled INT8 K/V into an FP16 workspace");
   m.def("int8_block32_decode_paged", &flash_attention_int8_block32_decode_paged,
         "Decode paged block-scaled INT8 K/V with in-register dequantization");
   m.def("int8_block32_prefill_paged",

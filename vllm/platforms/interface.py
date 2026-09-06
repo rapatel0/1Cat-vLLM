@@ -6,6 +6,7 @@ import os
 import platform
 import sys
 from datetime import timedelta
+from math import inf
 from typing import TYPE_CHECKING, Any, NamedTuple
 
 import torch
@@ -234,7 +235,13 @@ class Platform:
         ):
             device_ids = os.environ[cls.device_control_env_var].split(",")
             physical_device_id = device_ids[device_id]
-            return int(physical_device_id)
+            try:
+                return int(physical_device_id)
+            except ValueError as error:
+                raise ValueError(
+                    "The physical device ID must be an integer, got "
+                    f"{physical_device_id!r}."
+                ) from error
         else:
             return device_id
 
@@ -430,7 +437,7 @@ class Platform:
         For example, the out-of-tree quantization config can be imported and
         registered here dynamically.
         """
-        pass
+        return None
 
     @classmethod
     def apply_config_platform_defaults(cls, vllm_config: "VllmConfig") -> None:
@@ -444,7 +451,7 @@ class Platform:
 
         The config is passed by reference, so it can be modified in place.
         """
-        pass
+        return None
 
     @classmethod
     def check_and_update_config(cls, vllm_config: "VllmConfig") -> None:
@@ -457,7 +464,7 @@ class Platform:
 
         The config is passed by reference, so it can be modified in place.
         """
-        pass
+        return None
 
     @classmethod
     def _find_non_ssm_backend(
@@ -564,7 +571,10 @@ class Platform:
 
         kv_quant_mode = get_kv_quant_mode(cache_config.cache_dtype)
 
-        # Compute attention page size for 1 token
+        # Compute the attention payload size for one token. Most cache layouts
+        # scale linearly with block size. INT8 block32 also stores fixed page
+        # metadata, which must be added once after block-size alignment.
+        attn_fixed_page_size = 0
         if model_config.use_mla:
             attn_page_size_1_token = MLAAttentionSpec(
                 block_size=1,
@@ -611,13 +621,20 @@ class Platform:
             else:
                 attn_page_size_1_token = tq_page
         else:
-            attn_page_size_1_token = FullAttentionSpec(
+            attention_spec = FullAttentionSpec(
                 block_size=1,
                 num_kv_heads=model_config.get_num_kv_heads(parallel_config),
                 head_size=model_config.get_head_size(),
                 dtype=kv_cache_dtype,
                 kv_quant_mode=kv_quant_mode,
-            ).page_size_bytes
+            )
+            if kv_quant_mode.is_int8_block32:
+                attn_page_size_1_token = attention_spec.real_page_size_bytes
+                attn_fixed_page_size = (
+                    attention_spec.page_size_bytes - attn_page_size_1_token
+                )
+            else:
+                attn_page_size_1_token = attention_spec.page_size_bytes
 
         # Compute mamba page size
         model_cls, _ = ModelRegistry.resolve_model_cls(
@@ -663,15 +680,26 @@ class Platform:
             # mamba2 kernels.
             base_chunk_size = mamba_block_size or model_config.get_mamba_chunk_size()
             assert base_chunk_size is not None
-            attn_tokens_per_mamba_state = cdiv(mamba_page_size, attn_page_size_1_token)
+            scalable_mamba_page_size = max(
+                mamba_page_size - attn_fixed_page_size,
+                1,
+            )
+            attn_tokens_per_mamba_state = cdiv(
+                scalable_mamba_page_size,
+                attn_page_size_1_token,
+            )
             chunk_size = lcm(base_chunk_size, kernel_block_alignment_size)
             attn_block_size = chunk_size * cdiv(attn_tokens_per_mamba_state, chunk_size)
             cache_config.mamba_block_size = attn_block_size
         else:
             # Without prefix caching, use minimum block size that satisfies
             # both backend alignment and mamba page size compatibility
+            scalable_mamba_page_size = max(
+                mamba_page_size - attn_fixed_page_size,
+                1,
+            )
             attn_block_size = kernel_block_alignment_size * cdiv(
-                mamba_page_size,
+                scalable_mamba_page_size,
                 kernel_block_alignment_size * attn_page_size_1_token,
             )
             indexer_align = cls._get_indexer_block_alignment(vllm_config)
@@ -689,8 +717,10 @@ class Platform:
         if cache_config.mamba_cache_mode == "align":
             cache_config.mamba_block_size = cache_config.block_size
 
-        # Pad mamba page size to exactly match attention page size
-        attn_page_size = cache_config.block_size * attn_page_size_1_token
+        # Pad mamba page size to exactly match attention page size.
+        attn_page_size = (
+            cache_config.block_size * attn_page_size_1_token + attn_fixed_page_size
+        )
         assert attn_page_size >= mamba_page_size
 
         if attn_page_size == mamba_page_size:
@@ -721,7 +751,7 @@ class Platform:
         the current platform.
         - By default all models are considered supported.
         """
-        pass
+        return None
 
     @classmethod
     def verify_quantization(cls, quant: str) -> None:
@@ -743,7 +773,7 @@ class Platform:
 
         if machine in ("x86_64", "amd64", "i386", "i686"):
             return CpuArchEnum.X86
-        elif machine.startswith("arm") or machine.startswith("aarch"):
+        elif machine.startswith(("arm", "aarch")):
             return CpuArchEnum.ARM
         elif machine.startswith("ppc"):
             return CpuArchEnum.POWERPC
@@ -788,7 +818,7 @@ class Platform:
         """
         Return the platform specific values for (-inf, inf)
         """
-        return float("-inf"), float("inf")
+        return -inf, inf
 
     @classmethod
     def can_update_inplace(cls) -> bool:
@@ -917,7 +947,12 @@ class Platform:
         """
         cls = self.__class__
         if cls._global_graph_pool is None:
-            cls._global_graph_pool = self.graph_pool_handle()
+            graph_pool_handle = getattr(self, "graph_pool_handle", None)
+            if not callable(graph_pool_handle):
+                raise RuntimeError(
+                    f"Platform {cls.__name__} does not provide graph_pool_handle."
+                )
+            cls._global_graph_pool = graph_pool_handle()
         return cls._global_graph_pool
 
     @classmethod

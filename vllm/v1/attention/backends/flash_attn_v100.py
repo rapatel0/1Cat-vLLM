@@ -1,5 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+# pyright: reportArgumentType=false, reportAttributeAccessIssue=false
+# pyright: reportGeneralTypeIssues=false, reportIncompatibleMethodOverride=false
+# pyright: reportIndexIssue=false, reportOptionalCall=false
+# pyright: reportOptionalMemberAccess=false, reportOptionalSubscript=false
 """Flash Attention V100 backend for SM70.
 
 Selecting this backend keeps both prefill and decode on Flash-V100 by default.
@@ -503,6 +507,7 @@ _flash_attn_decode_paged_xqa = None
 _flash_attn_decode_paged_wmma = None
 _flash_attn_grouped_verify_paged = None
 _flash_attn_grouped_verify_max_query_tokens = 8
+_flash_attn_grouped_verify_max_requests = 1
 _flash_attn_grouped_verify_checked = False
 _flash_attn_prefill_paged = None
 _flash_attn_prefill_paged_bhmd = None
@@ -520,6 +525,7 @@ _fp8_e5m2_paged_kv_to_fp16_checked = False
 _int8_block32_decode_paged = None
 _int8_block32_prefill_paged = None
 _int8_block32_reshape_and_cache = None
+_int8_block32_paged_kv_to_fp16 = None
 _int8_block32_ops_checked = False
 _flash_attn_turboquant_decode_paged = None
 _flash_attn_turboquant_decode_checked = False
@@ -560,6 +566,7 @@ _logged_prefill_ddtree_dense = False
 _logged_prefill_ddtree_triton = False
 _logged_prefill_ddtree_triton_fallback = False
 _logged_kv_dtype_contracts: set[str] = set()
+_logged_dflash_attention_contracts: set[tuple[object, ...]] = set()
 _route_summary_registered = False
 _route_counts: dict[str, int] = {}
 _decode_active_trace_signatures: set[tuple[object, ...]] = set()
@@ -631,7 +638,7 @@ def _split_paged_kv_cache(
     )
 
 
-def _split_int8_block32_kv_cache(
+def split_int8_block32_kv_cache(
     kv_cache: torch.Tensor,
     *,
     num_kv_heads: int,
@@ -652,13 +659,26 @@ def _split_int8_block32_kv_cache(
     elements_per_token = 2 * num_kv_heads * head_size
     block_size, remainder = divmod(payload_bytes, elements_per_token)
     if block_size <= 0 or remainder:
-        raise ValueError("INT8 block cache page size does not match its head shape")
+        raise ValueError(
+            "INT8 block cache page size does not match its head shape: "
+            f"shape={tuple(kv_cache.shape)}, stride={kv_cache.stride()}, "
+            f"num_kv_heads={num_kv_heads}, head_size={head_size}, "
+            f"payload_bytes={payload_bytes}, remainder={remainder}"
+        )
+    page_stride_bytes = kv_cache.stride(0)
+    raw_cache = torch.empty(0, dtype=torch.int8, device=kv_cache.device).set_(
+        kv_cache.untyped_storage(),
+        kv_cache.storage_offset(),
+        (kv_cache.shape[0] * page_stride_bytes,),
+        (1,),
+    )
     return make_int8_block32_kv_cache_views(
-        kv_cache.reshape(-1),
+        raw_cache,
         num_blocks=kv_cache.shape[0],
         block_size=block_size,
         num_kv_heads=num_kv_heads,
         head_size=head_size,
+        page_stride_bytes=page_stride_bytes,
     )
 
 
@@ -824,10 +844,10 @@ def _log_kv_dtype_contract(kv_cache_dtype: str) -> None:
             "dtype is independent of model weight quantization."
         )
     elif kv_cache_dtype == "fp8_e4m3":
-        logger.warning(
+        logger.info(
             "SM70 Flash-V100 is using explicitly requested E4M3 KV cache. "
-            "The optimized V100 quantized-KV route uses E5M2. KV-cache dtype "
-            "is independent of model weight quantization."
+            "The decode route depends on the native extension and tensor "
+            "layout. KV-cache dtype is independent of model weight quantization."
         )
     elif kv_cache_dtype == "fp8_e5m2":
         logger.info(
@@ -1300,10 +1320,38 @@ def _get_flash_ops():
     )
 
 
+def _grouped_verify_query_partition_is_valid(
+    query_start_loc_cpu: torch.Tensor | None,
+    *,
+    num_requests: int,
+    num_query_tokens: int,
+    max_query_tokens: int,
+) -> bool:
+    if (
+        num_requests <= 0
+        or num_query_tokens <= 0
+        or max_query_tokens <= 0
+        or query_start_loc_cpu is None
+        or query_start_loc_cpu.device.type != "cpu"
+        or query_start_loc_cpu.dtype != torch.int32
+        or query_start_loc_cpu.ndim != 1
+        or query_start_loc_cpu.numel() != num_requests + 1
+    ):
+        return False
+    offsets: list[int] = query_start_loc_cpu.tolist()
+    if offsets[0] != 0 or offsets[-1] != num_query_tokens:
+        return False
+    return all(
+        0 < query_end - query_start <= max_query_tokens
+        for query_start, query_end in zip(offsets, offsets[1:], strict=False)
+    )
+
+
 def _get_flash_grouped_verify_op():
     """Load the optional exact SM70 DFlash2 grouped verifier."""
     global _flash_attn_grouped_verify_paged
     global _flash_attn_grouped_verify_max_query_tokens
+    global _flash_attn_grouped_verify_max_requests
     global _flash_attn_grouped_verify_checked
     if _flash_attn_grouped_verify_checked:
         return _flash_attn_grouped_verify_paged
@@ -1316,13 +1364,18 @@ def _get_flash_grouped_verify_op():
         try:
             from flash_attn_v100 import (
                 flash_attn_grouped_verify_max_query_tokens,
+                flash_attn_grouped_verify_max_requests,
             )
 
             _flash_attn_grouped_verify_max_query_tokens = int(
                 flash_attn_grouped_verify_max_query_tokens()
             )
+            _flash_attn_grouped_verify_max_requests = int(
+                flash_attn_grouped_verify_max_requests()
+            )
         except (ImportError, RuntimeError, TypeError, ValueError):
             _flash_attn_grouped_verify_max_query_tokens = 8
+            _flash_attn_grouped_verify_max_requests = 1
     except ImportError:
         _flash_attn_grouped_verify_paged = None
     return _flash_attn_grouped_verify_paged
@@ -1771,24 +1824,48 @@ def _try_sm70_fa2_d256_prefill(
 
 def _get_int8_block32_ops():
     global _int8_block32_decode_paged, _int8_block32_prefill_paged
-    global _int8_block32_reshape_and_cache
+    global _int8_block32_reshape_and_cache, _int8_block32_paged_kv_to_fp16
     global _int8_block32_ops_checked
     if not _int8_block32_ops_checked:
         _int8_block32_ops_checked = True
         try:
-            extension = importlib.import_module("flash_attn_v100_cuda")
+            try:
+                extension = importlib.import_module(
+                    "flash_attn_v100.flash_attn_v100_cuda"
+                )
+            except ImportError:
+                # Keep source-tree/development installs working when the extension
+                # is exposed only as a top-level module.
+                extension = importlib.import_module("flash_attn_v100_cuda")
             _int8_block32_decode_paged = extension.int8_block32_decode_paged
             _int8_block32_prefill_paged = extension.int8_block32_prefill_paged
             _int8_block32_reshape_and_cache = extension.int8_block32_reshape_and_cache
+            _int8_block32_paged_kv_to_fp16 = getattr(
+                extension,
+                "int8_block32_paged_kv_to_fp16",
+                None,
+            )
         except (ImportError, AttributeError):
             _int8_block32_decode_paged = None
             _int8_block32_prefill_paged = None
             _int8_block32_reshape_and_cache = None
+            _int8_block32_paged_kv_to_fp16 = None
     return (
         _int8_block32_decode_paged,
         _int8_block32_prefill_paged,
         _int8_block32_reshape_and_cache,
+        _int8_block32_paged_kv_to_fp16,
     )
+
+
+def get_int8_block32_reshape_and_cache():
+    """Return the INT8 block32 cache writer, or None when it is unavailable.
+
+    Other INT8 block32 cache owners, such as the Qwen4Exp QSA attention layer,
+    reuse this single writer so that every route produces the same signed
+    payload and FP16 block-scale layout.
+    """
+    return _get_int8_block32_ops()[2]
 
 
 def _get_fp8_e5m2_paged_kv_bridge_op():
@@ -3576,19 +3653,36 @@ class FlashAttnV100MetadataBuilder(TritonAttentionMetadataBuilder):
         assert self._draft_seq_lens is not None
         assert self._draft_query_start_loc is not None
 
-        self._draft_block_table[:num_reqs].copy_(block_table, non_blocking=True)
-        self._draft_seq_lens[:num_reqs].copy_(
+        self.copy_dflash_graph_metadata(
+            block_table,
             attn_metadata.seq_lens[:num_reqs],
-            non_blocking=True,
-        )
-        self._draft_query_start_loc[: num_reqs + 1].copy_(
             attn_metadata.query_start_loc[: num_reqs + 1],
-            non_blocking=True,
         )
 
         attn_metadata.block_table = self._draft_block_table[:num_reqs]
         attn_metadata.seq_lens = self._draft_seq_lens[:num_reqs]
         attn_metadata.query_start_loc = self._draft_query_start_loc[: num_reqs + 1]
+
+    def copy_dflash_graph_metadata(
+        self,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        query_start_loc: torch.Tensor,
+    ) -> None:
+        """Refresh the three persistent inputs of a non-causal DFlash graph."""
+        num_reqs = seq_lens.numel()
+        assert self._draft_block_table is not None
+        assert self._draft_seq_lens is not None
+        assert self._draft_query_start_loc is not None
+        self._draft_block_table[:num_reqs].copy_(block_table, non_blocking=True)
+        self._draft_seq_lens[:num_reqs].copy_(
+            seq_lens,
+            non_blocking=True,
+        )
+        self._draft_query_start_loc[: num_reqs + 1].copy_(
+            query_start_loc,
+            non_blocking=True,
+        )
 
     def _configured_smallq_max_query_len(self) -> int:
         return int(os.getenv("VLLM_FLASH_V100_SMALLQ_DECODE_MAX_Q", "16"))
@@ -4430,11 +4524,15 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         self.dflash2_grouped_verify_max_query_tokens = (
             _flash_attn_grouped_verify_max_query_tokens
         )
+        self.dflash2_grouped_verify_max_requests = (
+            _flash_attn_grouped_verify_max_requests
+        )
         self.fp8_e5m2_paged_kv_to_fp16 = _get_fp8_e5m2_paged_kv_bridge_op()
         (
             self.int8_block32_decode_paged,
             self.int8_block32_prefill_paged,
             self.int8_block32_reshape_and_cache,
+            self.int8_block32_paged_kv_to_fp16,
         ) = _get_int8_block32_ops()
         # V100 FA2 kernels consume fp16 Q. FP8 KV cache support is implemented
         # as storage compression only, with K/V dequantized inside FA2 kernels.
@@ -4655,7 +4753,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             key_scales,
             value_scales,
             page_owners,
-        ) = _split_int8_block32_kv_cache(
+        ) = split_int8_block32_kv_cache(
             kv_cache,
             num_kv_heads=self.num_kv_heads,
             head_size=self.head_size,
@@ -5233,6 +5331,61 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             right = left
         return (left, right)
 
+    def _validate_dflash_attention_contract(
+        self,
+        layer: torch.nn.Module,
+        attn_metadata: TritonAttentionMetadata,
+    ) -> None:
+        if not getattr(layer, "is_dflash_draft_attn", False):
+            return
+
+        actual_causal = bool(getattr(attn_metadata, "causal", True))
+        expected_causal = getattr(layer, "dflash_expected_causal", None)
+        if expected_causal is None:
+            raise RuntimeError(
+                "FLASH_ATTN_V100 DFlash attention is missing its declared "
+                "causality contract."
+            )
+        expected_causal = bool(expected_causal)
+        if actual_causal != expected_causal:
+            raise RuntimeError(
+                "FLASH_ATTN_V100 DFlash causality mismatch: "
+                f"model={expected_causal} metadata={actual_causal}."
+            )
+
+        declared_window = getattr(layer, "dflash_expected_sliding_window", None)
+        expected_window = (
+            (-1, -1)
+            if declared_window is None
+            else (
+                int(declared_window) - 1,
+                0 if expected_causal else int(declared_window) - 1,
+            )
+        )
+        actual_window = self._flash_v100_window_size(actual_causal)
+        if actual_window != expected_window:
+            raise RuntimeError(
+                "FLASH_ATTN_V100 DFlash sliding-window mismatch: "
+                f"model={expected_window} backend={actual_window}."
+            )
+
+        signature = (
+            getattr(layer, "layer_name", None),
+            actual_causal,
+            actual_window,
+            getattr(layer, "dflash_rope_is_neox_style", None),
+        )
+        if signature not in _logged_dflash_attention_contracts:
+            _logged_dflash_attention_contracts.add(signature)
+            logger.info(
+                "FLASH_ATTN_V100 DFlash attention contract: layer=%s "
+                "causal=%s window=%s rope_neox=%s.",
+                signature[0],
+                actual_causal,
+                actual_window,
+                signature[3],
+            )
+
     def _call_flash_attn_decode_paged(
         self,
         query: torch.Tensor,
@@ -5308,16 +5461,63 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         global _logged_prefill_smallq_grouped_verify_gate
         block_table = getattr(attn_metadata, "block_table", None)
         seq_lens = getattr(attn_metadata, "seq_lens", None)
+        query_start_loc = getattr(attn_metadata, "query_start_loc", None)
+        num_requests = (
+            int(query_start_loc.numel()) - 1 if query_start_loc is not None else 0
+        )
+        query_start_loc_cpu = getattr(
+            attn_metadata,
+            "query_start_loc_cpu",
+            None,
+        )
+        if (
+            query_start_loc_cpu is None
+            and query_start_loc is not None
+            and query_start_loc.device.type == "cpu"
+        ):
+            query_start_loc_cpu = query_start_loc
+        max_query_len = int(getattr(attn_metadata, "max_query_len", 0))
+        partition_max_query_tokens = (
+            16 if num_requests == 1 and num_query_tokens > 8 else 8
+        )
+        query_partition_valid = _grouped_verify_query_partition_is_valid(
+            query_start_loc_cpu,
+            num_requests=num_requests,
+            num_query_tokens=num_query_tokens,
+            max_query_tokens=partition_max_query_tokens,
+        )
+        fp8_source = bool(
+            self.kv_cache_dtype == "fp8_e5m2"
+            and key_cache.dtype == torch.uint8
+            and value_cache.dtype == torch.uint8
+        )
+        int8_block32_source = bool(
+            self.kv_cache_dtype == "int8_block32"
+            and key_cache.dtype == torch.int8
+            and value_cache.dtype == torch.int8
+            and self.int8_block32_paged_kv_to_fp16 is not None
+        )
+        single_request_shape = bool(
+            num_requests == 1
+            and num_query_tokens in (8, 16)
+            and num_query_tokens <= self.dflash2_grouped_verify_max_query_tokens
+        )
+        multi_request_shape = bool(
+            int8_block32_source
+            and 1 < num_requests <= self.dflash2_grouped_verify_max_requests
+            and max_query_len == 8
+            and num_query_tokens == num_requests * 8
+        )
         allowed = bool(
             self.use_dflash2_grouped_verify
             and self.flash_attn_grouped_verify_paged is not None
+            and (fp8_source or int8_block32_source)
             and getattr(attn_metadata, "is_dflash_selector_target", False)
             and getattr(attn_metadata, "max_model_len", 0)
             >= self.dflash2_grouped_verify_min_model_len
             and getattr(attn_metadata, "causal", True)
             and self._flash_v100_window_size(causal=True) == (-1, -1)
-            and num_query_tokens in (8, 16)
-            and num_query_tokens <= self.dflash2_grouped_verify_max_query_tokens
+            and (single_request_shape or multi_request_shape)
             and tuple(query.shape) == (num_query_tokens, 6, 256)
             and query.dtype == torch.float16
             and query.is_contiguous()
@@ -5331,23 +5531,40 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and key_cache.shape[1] in (1648, 1728, 3296, 3456)
             and tuple(key_cache.shape[2:]) == (1, 256)
             and tuple(value_cache.shape) == tuple(key_cache.shape)
-            and key_cache.dtype == torch.uint8
-            and value_cache.dtype == torch.uint8
             and key_cache.stride(-1) == 1
             and value_cache.stride(-1) == 1
-            and self.kv_cache_dtype == "fp8_e5m2"
+            and (
+                self.kv_cache_dtype in ("fp8_e5m2", "int8_block32")
+                or (
+                    self.kv_cache_dtype == "fp8_e4m3"
+                    and num_query_tokens == 8
+                    and key_cache.stride(0) % 16 == 0
+                    and key_cache.stride(1) % 16 == 0
+                    and value_cache.stride(0) % 16 == 0
+                    and value_cache.stride(1) % 16 == 0
+                    and getattr(
+                        self.flash_attn_grouped_verify_paged, "supports_e4m3", False
+                    )
+                )
+            )
             and block_table is not None
             and block_table.ndim == 2
-            and block_table.shape[0] == 1
+            and block_table.shape[0] >= num_requests
             and block_table.device == query.device
             and block_table.dtype == torch.int32
             and block_table.is_contiguous()
             and seq_lens is not None
             and seq_lens.ndim == 1
-            and seq_lens.shape[0] == 1
+            and seq_lens.shape[0] >= num_requests
             and seq_lens.device == query.device
             and seq_lens.dtype == torch.int32
             and seq_lens.is_contiguous()
+            and query_start_loc is not None
+            and query_start_loc.ndim == 1
+            and query_start_loc.device == query.device
+            and query_start_loc.dtype == torch.int32
+            and query_start_loc.is_contiguous()
+            and query_partition_valid
         )
         if (
             self.use_dflash2_grouped_verify
@@ -5357,7 +5574,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 grouped verifier gate rejected: "
                 "op=%s marker=%s max_model_len=%s min_model_len=%s "
-                "causal=%s window=%s actual=%d native_max_q=%d q=%s/%s "
+                "causal=%s window=%s actual=%d max_query=%d "
+                "native_max_q=%d requests=%d native_max_requests=%d q=%s/%s "
                 "k=%s/%s v=%s/%s kv_dtype=%s block_table=%s/%s "
                 "seq_lens=%s/%s.",
                 self.flash_attn_grouped_verify_paged is not None,
@@ -5367,7 +5585,10 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 getattr(attn_metadata, "causal", True),
                 self._flash_v100_window_size(causal=True),
                 num_query_tokens,
+                max_query_len,
                 self.dflash2_grouped_verify_max_query_tokens,
+                num_requests,
+                self.dflash2_grouped_verify_max_requests,
                 tuple(query.shape),
                 query.dtype,
                 tuple(key_cache.shape),
@@ -5397,8 +5618,9 @@ class FlashAttnV100Impl(TritonAttentionImpl):
         if not _logged_prefill_smallq_grouped_verify:
             logger.info(
                 "FLASH_ATTN_V100 DFlash2 exact grouped verifier active "
-                "(q%d/H6/Hkv1/D256, FP8 E5M2 KV, one-pass).",
+                "(q%d/H6/Hkv1/D256, %s KV, one-pass).",
                 query.shape[0],
+                self.kv_cache_dtype,
             )
             _logged_prefill_smallq_grouped_verify = True
         self.flash_attn_grouped_verify_paged(
@@ -5652,6 +5874,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             _record_route("metadata_none_zero_output")
             return output.fill_(0)
 
+        self._validate_dflash_attention_contract(layer, attn_metadata)
+
         if not self._supports_flash_v100_path():
             layer_info = self._layer_debug_info(layer)
             is_dflash_draft_attn = bool(layer_info.get("is_dflash_draft_attn"))
@@ -5759,9 +5983,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
 
         if is_prefill:
             if self.kv_cache_dtype == "int8_block32" and is_capturing:
-                raise RuntimeError(
-                    "FLASH_ATTN_V100 INT8 block cache does not support "
-                    "small-query prefill graph capture"
+                return self._flash_v100_int8_small_query_prefill_as_decode(
+                    query,
+                    kv_cache,
+                    attn_metadata,
+                    output,
                 )
             available_query_tokens = min(
                 int(query.shape[0]),
@@ -5893,38 +6119,17 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if has_prefix_context and self.kv_cache_dtype == "int8_block32":
                 causal = bool(getattr(attn_metadata, "causal", True))
                 window_size = self._flash_v100_window_size(causal)
-                if (
-                    metadata_live_token_mismatch
-                    or not causal
-                    or window_size != (-1, -1)
-                    or self.int8_block32_prefill_paged is None
-                ):
+                if not causal or window_size != (-1, -1):
                     raise RuntimeError(
                         "FLASH_ATTN_V100 INT8 block cache prefix prefill "
-                        "requires causal full attention and live query metadata"
+                        "requires causal full attention"
                     )
-                key_cache, value_cache, key_scales, value_scales, _ = (
-                    _split_int8_block32_kv_cache(
-                        kv_cache,
-                        num_kv_heads=self.num_kv_heads,
-                        head_size=self.head_size,
-                    )
+                return self._flash_v100_int8_small_query_prefill_as_decode(
+                    query,
+                    kv_cache,
+                    attn_metadata,
+                    output,
                 )
-                num_actual_tokens = int(attn_metadata.num_actual_tokens)
-                self.int8_block32_prefill_paged(
-                    query[:num_actual_tokens],
-                    key_cache,
-                    value_cache,
-                    key_scales,
-                    value_scales,
-                    attn_metadata.block_table,
-                    attn_metadata.seq_lens,
-                    attn_metadata.query_start_loc,
-                    output[:num_actual_tokens],
-                    self.scale,
-                )
-                _record_route("prefill_prefix_int8_block32_register")
-                return output
             if has_prefix_context:
                 if _draft_graph_debug_enabled():
                     _draft_graph_debug_log(
@@ -6739,7 +6944,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             if self.int8_block32_decode_paged is None:
                 raise RuntimeError("FLASH_ATTN_V100 INT8 block decoder is unavailable")
             key_cache, value_cache, key_scales, value_scales, _ = (
-                _split_int8_block32_kv_cache(
+                split_int8_block32_kv_cache(
                     kv_cache,
                     num_kv_heads=self.num_kv_heads,
                     head_size=self.head_size,
@@ -7220,6 +7425,421 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 int(key_cache.shape[3]),
             )
 
+        return output
+
+    def _bridge_int8_block32_cache(
+        self,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        key_scales: torch.Tensor,
+        value_scales: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        capacity_hint: int | None,
+    ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor] | None:
+        """Expand active signed INT8 pages into a graph-stable FP16 workspace."""
+        if (
+            self.int8_block32_paged_kv_to_fp16 is None
+            or block_table.ndim != 2
+            or block_table.shape[0] != 1
+            or seq_lens.ndim != 1
+            or seq_lens.shape[0] != 1
+        ):
+            return None
+
+        input_block_size = int(key_cache.shape[1])
+        input_capacity = int(block_table.shape[1]) * input_block_size
+        if capacity_hint is None or capacity_hint <= 0:
+            if torch.cuda.is_current_stream_capturing():
+                return None
+            capacity_hint = int(seq_lens.max().item())
+        active_capacity = min(input_capacity, max(1, capacity_hint))
+        active_input_blocks = min(
+            int(block_table.shape[1]),
+            _cdiv_int(active_capacity, input_block_size),
+        )
+        if active_input_blocks <= 0:
+            return None
+        active_block_table = block_table[:, :active_input_blocks]
+        required_blocks = _cdiv_int(
+            active_input_blocks * input_block_size,
+            _FP8_PREFILL_BRIDGE_PAGE_SIZE,
+        )
+        workspace = _get_fp8_prefill_bridge_workspace(
+            key_cache,
+            required_blocks,
+        )
+        if workspace is None:
+            return None
+        key_out, value_out, output_block_table = workspace
+        self.int8_block32_paged_kv_to_fp16(
+            key_cache,
+            value_cache,
+            key_scales,
+            value_scales,
+            active_block_table,
+            seq_lens,
+            key_out,
+            value_out,
+        )
+        return key_out, value_out, output_block_table
+
+    def _run_int8_block32_multi_request_prefill_bridge(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        key_scales: torch.Tensor,
+        value_scales: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        *,
+        out: torch.Tensor,
+    ) -> bool:
+        """Split mixed bulk-prefill batches into bounded exact request routes."""
+        query_start_loc_cpu = getattr(
+            attn_metadata,
+            "query_start_loc_cpu",
+            None,
+        )
+        seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+        block_table = attn_metadata.block_table
+        if (
+            query_start_loc_cpu is None
+            or seq_lens_cpu is None
+            or query_start_loc_cpu.ndim != 1
+            or seq_lens_cpu.ndim != 1
+            or block_table.ndim != 2
+        ):
+            return False
+
+        query_starts = [int(value) for value in query_start_loc_cpu.tolist()]
+        sequence_lengths = [int(value) for value in seq_lens_cpu.tolist()]
+        num_requests = len(query_starts) - 1
+        if (
+            num_requests <= 1
+            or num_requests > int(block_table.shape[0])
+            or num_requests > len(sequence_lengths)
+            or query_starts[0] != 0
+            or query_starts[-1] != int(query.shape[0])
+        ):
+            return False
+
+        input_block_size = int(key_cache.shape[1])
+        max_num_blocks = int(block_table.shape[1])
+        routes: list[str] = []
+        max_required_blocks = 0
+        for request_idx in range(num_requests):
+            query_start = query_starts[request_idx]
+            query_end = query_starts[request_idx + 1]
+            query_len = query_end - query_start
+            seq_len = sequence_lengths[request_idx]
+            if query_start < 0 or query_len <= 0 or seq_len < query_len:
+                return False
+            if query_len >= 32:
+                active_input_blocks = min(
+                    max_num_blocks,
+                    _cdiv_int(seq_len, input_block_size),
+                )
+                required_blocks = _cdiv_int(
+                    active_input_blocks * input_block_size,
+                    _FP8_PREFILL_BRIDGE_PAGE_SIZE,
+                )
+                if required_blocks <= 0:
+                    return False
+                max_required_blocks = max(max_required_blocks, required_blocks)
+                routes.append("bridge")
+                continue
+            if (
+                query_len in (8, 16)
+                and query_len <= self.dflash2_grouped_verify_max_query_tokens
+                and self.use_dflash2_grouped_verify
+                and self.flash_attn_grouped_verify_paged is not None
+                and getattr(attn_metadata, "is_dflash_selector_target", False)
+                and getattr(attn_metadata, "max_model_len", 0)
+                >= self.dflash2_grouped_verify_min_model_len
+                and getattr(attn_metadata, "causal", True)
+                and self._flash_v100_window_size(causal=True) == (-1, -1)
+            ):
+                routes.append("grouped_verify")
+                continue
+            return False
+
+        if max_required_blocks <= 0:
+            return False
+        if (
+            _get_fp8_prefill_bridge_workspace(
+                key_cache,
+                max_required_blocks,
+            )
+            is None
+        ):
+            return False
+
+        for request_idx, route in enumerate(routes):
+            query_start = query_starts[request_idx]
+            query_end = query_starts[request_idx + 1]
+            query_view = query[query_start:query_end]
+            out_view = out[query_start:query_end]
+            request_block_table = block_table[request_idx : request_idx + 1]
+            request_seq_lens = attn_metadata.seq_lens[request_idx : request_idx + 1]
+            if route == "bridge":
+                if not self._run_int8_block32_prefill_bridge(
+                    query_view,
+                    key_cache,
+                    value_cache,
+                    key_scales,
+                    value_scales,
+                    request_block_table,
+                    request_seq_lens,
+                    seq_len=sequence_lengths[request_idx],
+                    out=out_view,
+                ):
+                    return False
+                continue
+            self.flash_attn_grouped_verify_paged(
+                query_view,
+                key_cache,
+                value_cache,
+                request_block_table,
+                request_seq_lens,
+                softmax_scale=self.scale,
+                out=out_view,
+                kv_cache_dtype="int8_block32",
+                k_scale=1.0,
+                v_scale=1.0,
+                one_pass=True,
+            )
+            _record_route("prefill_smallq_dflash2_int8_block32_grouped_verify")
+
+        _record_route("prefill_prefix_int8_block32_bridge_fp16_multi_request")
+        return True
+
+    def _call_dflash2_int8_grouped_verify(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        *,
+        out: torch.Tensor,
+    ) -> None:
+        query_start_loc = attn_metadata.query_start_loc
+        num_requests = int(query_start_loc.numel()) - 1
+        logger.info_once(
+            "FLASH_ATTN_V100 DFlash2 direct signed INT8 grouped verifier active "
+            "for up to %d requests.",
+            self.dflash2_grouped_verify_max_requests,
+        )
+        self.flash_attn_grouped_verify_paged(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata.block_table[:num_requests],
+            attn_metadata.seq_lens[:num_requests],
+            softmax_scale=self.scale,
+            out=out,
+            kv_cache_dtype="int8_block32",
+            k_scale=1.0,
+            v_scale=1.0,
+            one_pass=True,
+            query_start_loc=(
+                query_start_loc[: num_requests + 1] if num_requests > 1 else None
+            ),
+            _query_partition_validated=True,
+        )
+        _record_route("prefill_smallq_dflash2_int8_block32_grouped_verify")
+
+    def _run_int8_block32_prefill_bridge(
+        self,
+        query: torch.Tensor,
+        key_cache: torch.Tensor,
+        value_cache: torch.Tensor,
+        key_scales: torch.Tensor,
+        value_scales: torch.Tensor,
+        block_table: torch.Tensor,
+        seq_lens: torch.Tensor,
+        *,
+        seq_len: int,
+        out: torch.Tensor,
+    ) -> bool:
+        if not self.use_flash_v100_prefill_paged or query.shape[0] < 32:
+            return False
+        bridged = self._bridge_int8_block32_cache(
+            key_cache,
+            value_cache,
+            key_scales,
+            value_scales,
+            block_table,
+            seq_lens,
+            capacity_hint=seq_len,
+        )
+        if bridged is None:
+            return False
+        key_out, value_out, output_block_table = bridged
+        query_batched = query.unsqueeze(0)
+        out_batched = out.unsqueeze(0)
+        result = self.flash_attn_prefill_paged(
+            query_batched,
+            key_out,
+            value_out,
+            output_block_table,
+            seq_lens,
+            softmax_scale=self.scale,
+            out=out_batched,
+            kv_cache_dtype="auto",
+            k_scale=1.0,
+            v_scale=1.0,
+            causal=True,
+            window_size=(-1, -1),
+        )
+        if result.data_ptr() != out_batched.data_ptr():
+            out_batched.copy_(result)
+        _record_route("prefill_prefix_int8_block32_bridge_fp16")
+        return True
+
+    def _flash_v100_int8_small_query_prefill_as_decode(
+        self,
+        query: torch.Tensor,
+        kv_cache: torch.Tensor,
+        attn_metadata: TritonAttentionMetadata,
+        output: torch.Tensor,
+    ) -> torch.Tensor:
+        """Run small causal prefix queries over the block-scaled INT8 cache."""
+        if not bool(getattr(attn_metadata, "causal", True)):
+            raise RuntimeError(
+                "FLASH_ATTN_V100 INT8 block cache small-query prefill "
+                "requires causal attention"
+            )
+        if (
+            self.int8_block32_decode_paged is None
+            or self.int8_block32_prefill_paged is None
+        ):
+            raise RuntimeError(
+                "FLASH_ATTN_V100 INT8 block cache attention ops are unavailable"
+            )
+
+        key_cache, value_cache, key_scales, value_scales, _ = (
+            split_int8_block32_kv_cache(
+                kv_cache,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+            )
+        )
+        num_query_tokens = min(
+            int(attn_metadata.num_actual_tokens),
+            int(query.shape[0]),
+            int(output.shape[0]),
+        )
+        query = query[:num_query_tokens]
+        out_view = output[:num_query_tokens]
+        if self._dflash2_grouped_verify_allowed(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            num_query_tokens=num_query_tokens,
+        ):
+            self._call_dflash2_int8_grouped_verify(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                out=out_view,
+            )
+            return output
+
+        if num_query_tokens >= 32 and not torch.cuda.is_current_stream_capturing():
+            if attn_metadata.block_table.shape[0] == 1:
+                seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
+                seq_len = (
+                    int(seq_lens_cpu[0].item())
+                    if seq_lens_cpu is not None
+                    else int(attn_metadata.seq_lens[0].item())
+                )
+                if self._run_int8_block32_prefill_bridge(
+                    query,
+                    key_cache,
+                    value_cache,
+                    key_scales,
+                    value_scales,
+                    attn_metadata.block_table[:1],
+                    attn_metadata.seq_lens[:1],
+                    seq_len=seq_len,
+                    out=out_view,
+                ):
+                    return output
+            elif self._run_int8_block32_multi_request_prefill_bridge(
+                query,
+                key_cache,
+                value_cache,
+                key_scales,
+                value_scales,
+                attn_metadata,
+                out=out_view,
+            ):
+                return output
+
+        persistent_block_table = getattr(
+            attn_metadata,
+            "smallq_decode_block_table",
+            None,
+        )
+        persistent_seq_lens = getattr(
+            attn_metadata,
+            "smallq_decode_seq_lens",
+            None,
+        )
+        if (
+            persistent_block_table is not None
+            and persistent_seq_lens is not None
+            and int(persistent_block_table.shape[0]) >= num_query_tokens
+            and int(persistent_seq_lens.shape[0]) >= num_query_tokens
+            and not _metadata_expects_more_query_tokens_than_available(
+                attn_metadata,
+                num_query_tokens,
+            )
+        ):
+            self.int8_block32_decode_paged(
+                query,
+                key_cache,
+                value_cache,
+                key_scales,
+                value_scales,
+                persistent_block_table[:num_query_tokens],
+                persistent_seq_lens[:num_query_tokens],
+                out_view,
+                self.scale,
+            )
+            _record_route("prefill_smallq_int8_block32_register")
+            return output
+
+        if _is_cuda_graph_capturing(query):
+            raise RuntimeError(
+                "FLASH_ATTN_V100 INT8 small-query prefill entered CUDA graph "
+                "capture without persistent decode metadata"
+            )
+
+        query_start_loc = _normalize_query_start_loc_for_available_tokens(
+            attn_metadata.query_start_loc,
+            num_query_tokens,
+        ).to(
+            device=attn_metadata.seq_lens.device,
+            dtype=attn_metadata.query_start_loc.dtype,
+        )
+        self.int8_block32_prefill_paged(
+            query,
+            key_cache,
+            value_cache,
+            key_scales,
+            value_scales,
+            attn_metadata.block_table,
+            attn_metadata.seq_lens,
+            query_start_loc,
+            out_view,
+            self.scale,
+        )
+        _record_route("prefill_prefix_int8_block32_register")
         return output
 
     def _flash_v100_small_query_prefill_as_decode(

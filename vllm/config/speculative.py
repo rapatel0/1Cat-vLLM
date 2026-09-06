@@ -1048,11 +1048,11 @@ class SpeculativeConfig:
                     SpeculativeConfig.create_draft_parallel_config(
                         self.target_parallel_config,
                         self.draft_tensor_parallel_size,
-                        # The runner constructs the complete DSpark drafter on
-                        # the target model's final PP rank. It is local to that
+                        # MRV2 constructs complete DFlash/DSpark drafters on the
+                        # target model's final PP rank. They are local to that
                         # stage rather than partitioned across target PP ranks.
                         speculative_draft_pipeline_parallel_size=(
-                            1 if self.use_dspark() else None
+                            1 if self.use_dspark() or self.use_dflash() else None
                         ),
                     )
                 )
@@ -1364,6 +1364,19 @@ class SpeculativeConfig:
             # Since we do not slice the draft tokens
             slots_per_req += 1
         return slots_per_req
+
+    @property
+    def max_num_new_target_slots_for_drafting(self) -> int:
+        """Return extra slots inserted into the target runner's input batch.
+
+        MRV2 DFlash builds its K+1 query batch in a separate ``InputBuffers``
+        instance. Its K draft slots therefore consume draft-runner capacity,
+        not the target scheduler's prefill budget. Other proposers retain the
+        existing shared-batch accounting.
+        """
+        if self.use_dflash():
+            return 0
+        return self.max_num_new_slots_for_drafting
 
     def use_gemma4_mtp(self) -> bool:
         return (

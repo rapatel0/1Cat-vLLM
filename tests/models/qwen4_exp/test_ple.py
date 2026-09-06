@@ -1,9 +1,11 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+from concurrent.futures import ThreadPoolExecutor
 from types import SimpleNamespace
 
 import pytest
+import regex as re
 import torch
 from torch import nn
 from torch.nn import functional as F
@@ -162,6 +164,50 @@ def test_ngram_embedding_accepts_checkpoint_seed_none(
     assert layer.ngram_embedding.weight.is_meta
 
 
+def test_ngram_embedding_disk_offload_allocates_only_meta_table(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(embedding_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        embedding_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(parameter_module, "get_tensor_model_parallel_rank", lambda: 0)
+    monkeypatch.setattr(
+        parameter_module, "get_tensor_model_parallel_world_size", lambda: 1
+    )
+    monkeypatch.setattr(ple_module.envs, "VLLM_PLE_DISK_OFFLOAD", True)
+    monkeypatch.setattr(ple_module.envs, "VLLM_PLE_DISK_OFFLOAD_NUM_THREADS", 0)
+    monkeypatch.setattr(ple_module, "is_offload_process", lambda: True)
+    config = SimpleNamespace(
+        ngram_size=3,
+        heads_per_ngram=8,
+        eos_token_id=2,
+        vocab_size=64,
+        split_ngram_parts=2,
+        seed=None,
+        ngram_vocab_size_base=101,
+        make_ngram_vocab_size_divisible_by=128,
+        ple_embedding_dtype="float8_e4m3fn",
+        ple_offload_embedding=False,
+    )
+
+    layer = Qwen4ExpNGramEmbedding(
+        config,
+        embedding_dim=256,
+        ple_dense_layer_id=0,
+        max_total_tokens=8,
+        max_num_reqs=2,
+        prefix="model.layers.2.ple.ple_embedding",
+        layer_name="model.layers.2.ple",
+        params_dtype=torch.float16,
+    )
+
+    assert layer._disk_offload
+    assert len(layer._disk_shards) == 2
+    assert layer.ngram_embedding.weight.is_meta
+    assert layer.positions_buffer.device.type == "cpu"
+
+
 def _make_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
     module = Qwen4ExpNGramEmbedding.__new__(Qwen4ExpNGramEmbedding)
     nn.Module.__init__(module)
@@ -202,6 +248,17 @@ def _make_fp8_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
         nn.Parameter(torch.zeros(1, dtype=torch.bfloat16), requires_grad=False),
     )
     module.ngram_embedding = embedding
+    return module
+
+
+def _make_disk_ngram_embedding_for_load_test() -> Qwen4ExpNGramEmbedding:
+    module = _make_fp8_ngram_embedding_for_load_test()
+    module._disk_offload = True
+    module._disk_shards = [None, None]
+    module._disk_mapped_paths = set()
+    module._disk_shard_size = 4
+    module._disk_shard_boundaries = torch.tensor([4], dtype=torch.int64)
+    module.head_dim = 2
     return module
 
 
@@ -294,6 +351,61 @@ def test_ngram_embedding_loads_fp8_shards_and_global_scale() -> None:
     )
     assert torch.equal(module.ngram_embedding.weight_scale, weight_scale)
     assert module.get_offload_output_dtype(torch.bfloat16) == torch.uint8
+
+
+def test_ngram_embedding_retains_and_gathers_disk_shards(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _make_disk_ngram_embedding_for_load_test()
+    shard_0 = torch.arange(8, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
+    shard_1 = (
+        torch.arange(8, 16, dtype=torch.float32).reshape(4, 2).to(torch.float8_e4m3fn)
+    )
+    monkeypatch.setattr(
+        ple_module,
+        "_advise_random_file_access",
+        lambda _: "/tmp/test-ple.safetensors",
+    )
+
+    loaded = module.load_weights(
+        [
+            ("ngram_embedding.shard_0.weight", shard_0),
+            ("ngram_embedding.shard_1.weight", shard_1),
+            ("ngram_embedding.weight_scale", torch.tensor([0.25])),
+        ]
+    )
+    output = torch.empty(4, 2, dtype=torch.uint8)
+    ngram_ids = torch.tensor([[7], [0], [7], [2]], dtype=torch.int64)
+    with ThreadPoolExecutor(max_workers=2) as executor:
+        module._disk_executor = executor
+        module._disk_embedding_lookup(ngram_ids, output)
+
+    assert loaded == {"ngram_embedding.weight", "ngram_embedding.weight_scale"}
+    assert module._disk_shards[0] is shard_0
+    assert module._disk_shards[1] is shard_1
+    expected = torch.cat((shard_0, shard_1))[ngram_ids.reshape(-1)]
+    assert torch.equal(output, expected.view(torch.uint8))
+
+
+def test_ngram_embedding_disk_offload_rejects_missing_shard(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    module = _make_disk_ngram_embedding_for_load_test()
+    monkeypatch.setattr(
+        ple_module,
+        "_advise_random_file_access",
+        lambda _: "/tmp/test-ple.safetensors",
+    )
+
+    with pytest.raises(RuntimeError, match=r"did not load shards: \[1\]"):
+        module.load_weights(
+            [
+                (
+                    "ngram_embedding.shard_0.weight",
+                    torch.zeros(4, 2).to(torch.float8_e4m3fn),
+                )
+            ]
+        )
 
 
 def test_ngram_gpu_offload_retains_only_fp8_global_scale(monkeypatch) -> None:
@@ -660,3 +772,60 @@ def test_ple_state_shape_reserves_speculative_tokens() -> None:
     module.num_spec_tokens = 3
 
     assert module.get_state_shape()[0] in ((32, 12), (12, 32))
+
+
+# ---------------------------------------------------------------------------
+# PP gate: the pipeline partition decides, not the pipeline size (#479)
+# ---------------------------------------------------------------------------
+
+
+def _text_config(ple_layer_ids, num_hidden_layers=48):
+    return SimpleNamespace(
+        ple_layer_ids=ple_layer_ids, num_hidden_layers=num_hidden_layers
+    )
+
+
+@pytest.mark.parametrize(
+    ("ple_layer_ids", "pp_size", "partition"),
+    [
+        pytest.param([2], 1, None, id="pp1"),
+        pytest.param([2], 2, None, id="pp2-even-split"),
+        pytest.param([2], 2, "2,46", id="pp2-custom-split-rank0-holds-layer1"),
+        pytest.param([2, 24], 2, None, id="pp2-two-ple-layers-on-rank0"),
+    ],
+)
+def test_ple_pp_gate_accepts_ple_layers_on_first_rank(
+    monkeypatch: pytest.MonkeyPatch, ple_layer_ids, pp_size, partition
+):
+    from vllm.models.qwen4_exp.common.ple import check_ple_layers_on_first_pp_rank
+
+    if partition is None:
+        monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+
+    check_ple_layers_on_first_pp_rank(_text_config(ple_layer_ids), pp_size)
+
+
+@pytest.mark.parametrize(
+    ("ple_layer_ids", "pp_size", "partition", "misplaced"),
+    [
+        pytest.param([2, 30], 2, None, "[29]", id="pp2-even-split"),
+        # ple_layer_ids are 1-based: id 2 is decoder layer 1, which a 1,47
+        # split puts on the second stage.
+        pytest.param([2], 2, "1,47", "[1]", id="pp2-custom-split-off-by-one"),
+        pytest.param([2, 20, 40], 4, None, "[19, 39]", id="pp4-two-misplaced"),
+    ],
+)
+def test_ple_pp_gate_rejects_ple_layers_beyond_first_rank(
+    monkeypatch: pytest.MonkeyPatch, ple_layer_ids, pp_size, partition, misplaced
+):
+    from vllm.models.qwen4_exp.common.ple import check_ple_layers_on_first_pp_rank
+
+    if partition is None:
+        monkeypatch.delenv("VLLM_PP_LAYER_PARTITION", raising=False)
+    else:
+        monkeypatch.setenv("VLLM_PP_LAYER_PARTITION", partition)
+
+    with pytest.raises(RuntimeError, match=re.escape(f"decoder layers {misplaced}")):
+        check_ple_layers_on_first_pp_rank(_text_config(ple_layer_ids), pp_size)

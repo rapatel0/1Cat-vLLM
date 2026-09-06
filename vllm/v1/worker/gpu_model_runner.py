@@ -52,6 +52,7 @@ from vllm.distributed.parallel_state import (
     get_tp_group,
     graph_capture,
     is_global_first_rank,
+    is_last_pp_first_tp_rank,
     prepare_communication_buffer_for_model,
 )
 from vllm.forward_context import (
@@ -1262,7 +1263,9 @@ class GPUModelRunner(
 
         if calls != 1 and calls % _sm70_mtp_profile_interval() != 0:
             return
-        if not is_global_first_rank():
+        # The events come from the sampling path, which only the last PP
+        # stage runs; the global first rank never sees them when PP > 1.
+        if not is_last_pp_first_tp_rank():
             return
 
         preferred = [
@@ -1405,8 +1408,14 @@ class GPUModelRunner(
             self.ngram_eos_token_id = 0
         if self.uses_ngram_embedding and self.ngram_context_len <= 0:
             raise ValueError("N-gram embedding requires context length >= 1")
-        if self.uses_ngram_embedding and parallel_config.pipeline_parallel_size > 1:
-            raise RuntimeError("N-gram PLE embedding requires pipeline_parallel_size=1")
+        if self.uses_ngram_embedding:
+            from vllm.models.qwen4_exp.common.ple import (
+                check_ple_layers_on_first_pp_rank,
+            )
+
+            check_ple_layers_on_first_pp_rank(
+                model_config.hf_text_config, parallel_config.pipeline_parallel_size
+            )
         self._ple_offload_connector: Any | None = None
 
         self.cascade_attn_enabled = not self.model_config.disable_cascade_attn
@@ -1534,6 +1543,7 @@ class GPUModelRunner(
                 | Gemma4Proposer
                 | Step3p5MTPProposer
                 | Qwen4ExpMTPProposer
+                | None
             )
             if self.speculative_config.method == "custom_class":
                 self.drafter = create_custom_proposer(  # type: ignore[assignment]
@@ -1607,6 +1617,15 @@ class GPUModelRunner(
                 self.sampler, self.speculative_config, self.device
             )
 
+        elif self.speculative_config:
+            # Non-last PP ranks never build a drafter (the entire draft
+            # model lives on the last rank, see the note above), but code
+            # that runs on every rank probes the attribute -- the
+            # attention-metadata builder does so during memory profiling,
+            # long before any request arrives. Bind it so those
+            # isinstance() checks fall through instead of raising
+            # AttributeError.
+            self.drafter = None
         self.valid_sampled_token_count_gpu: torch.Tensor | None = None
         if self.speculative_config:
             draft_config = self.speculative_config.draft_model_config
@@ -7655,10 +7674,11 @@ class GPUModelRunner(
             draft_confidence_logits=draft_confidence_logits,
         )
         target_candidate_ids = self.rejection_sampler.take_last_target_candidate_ids()
-        if target_candidate_ids is not None and hasattr(
-            self.drafter, "update_dynamic_draft_vocab"
-        ):
-            self.drafter.update_dynamic_draft_vocab(
+        update_dynamic_draft_vocab = getattr(
+            getattr(self, "drafter", None), "update_dynamic_draft_vocab", None
+        )
+        if target_candidate_ids is not None and update_dynamic_draft_vocab is not None:
+            update_dynamic_draft_vocab(
                 target_candidate_ids,
                 sampler_output.sampled_token_ids,
             )
@@ -8134,6 +8154,44 @@ class GPUModelRunner(
             else force_uniform_decode
         )
 
+    def _compute_force_uniform_decode(
+        self,
+        scheduler_output: "SchedulerOutput",
+    ) -> bool | None:
+        """Reject uniform-decode dispatch for hybrid-model prefills.
+
+        A prefill can have the same shape as a uniform decode batch, notably
+        when its scheduled token count equals ``1 + num_speculative_tokens``.
+        Hybrid backends keep recurrent state and must run that row through the
+        prefill path. Derive the phase from this iteration's scheduler output
+        rather than ``input_batch`` so the early PP+SP caller observes the
+        current step as well.
+
+        ``None`` preserves the normal shape heuristic. ``False`` is only
+        returned when a hybrid batch contains an unfinished prompt.
+        """
+        if not self.model_config.is_hybrid:
+            return None
+
+        for new_req in scheduler_output.scheduled_new_reqs:
+            num_prompt_tokens = length_from_prompt_token_ids_or_embeds(
+                new_req.prompt_token_ids,
+                new_req.prompt_embeds,
+            )
+            if new_req.num_computed_tokens < num_prompt_tokens:
+                return False
+
+        cached_reqs = scheduler_output.scheduled_cached_reqs
+        for req_id, num_computed_tokens in zip(
+            cached_reqs.req_ids,
+            cached_reqs.num_computed_tokens,
+            strict=True,
+        ):
+            if num_computed_tokens < self.requests[req_id].num_prompt_tokens:
+                return False
+
+        return None
+
     def _determine_batch_execution_and_padding(
         self,
         num_tokens: int,
@@ -8576,6 +8634,9 @@ class GPUModelRunner(
                 num_scheduled_tokens_np=num_scheduled_tokens_np,
                 max_num_scheduled_tokens=max_num_scheduled_tokens,
                 use_cascade_attn=cascade_attn_prefix_lens is not None,
+                force_uniform_decode=self._compute_force_uniform_decode(
+                    scheduler_output
+                ),
                 num_encoder_reqs=len(scheduler_output.scheduled_encoder_inputs),
             )
             if trace_log:
@@ -10174,13 +10235,13 @@ class GPUModelRunner(
                     self.model = self.load_lora_model(
                         self.model, self.vllm_config, self.device
                     )
-                if hasattr(self, "drafter"):
+                if (drafter := getattr(self, "drafter", None)) is not None:
                     logger.info_once("Loading drafter model...")
-                    if hasattr(self.drafter, "load_model"):
-                        self.drafter.load_model(self.model)
+                    if hasattr(drafter, "load_model"):
+                        drafter.load_model(self.model)
                     if (
-                        hasattr(self.drafter, "model")
-                        and is_mixture_of_experts(self.drafter.model)
+                        hasattr(drafter, "model")
+                        and is_mixture_of_experts(drafter.model)
                         and self.parallel_config.enable_eplb
                     ):
                         assert not self.parallel_config.enable_elastic_ep, (
@@ -10198,7 +10259,7 @@ class GPUModelRunner(
                                 self.parallel_config, self.device
                             )
                         self.eplb_state.add_model(
-                            self.drafter.model,
+                            drafter.model,
                             spec_config.draft_model_config,
                         )
                         eplb_models += 1
@@ -11120,10 +11181,14 @@ class GPUModelRunner(
                     hidden_states
                 )
 
-            if self.speculative_config and (
-                self.speculative_config.use_eagle()
-                or self.speculative_config.uses_draft_model()
-                or self.speculative_config.uses_extract_hidden_states()
+            if (
+                self.speculative_config
+                and get_pp_group().is_last_rank
+                and (
+                    self.speculative_config.use_eagle()
+                    or self.speculative_config.uses_draft_model()
+                    or self.speculative_config.uses_extract_hidden_states()
+                )
             ):
                 assert isinstance(
                     self.drafter,
@@ -12118,9 +12183,13 @@ class GPUModelRunner(
         self.calculate_reorder_batch_threshold()
 
         # Initialize drafter attention backend
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_draft_model()
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_draft_model()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -12171,9 +12240,13 @@ class GPUModelRunner(
         )
 
         # Initialize drafter's cudagraph dispatcher if using spec decode.
-        if self.speculative_config and (
-            self.speculative_config.use_eagle()
-            or self.speculative_config.uses_extract_hidden_states()
+        if (
+            self.speculative_config
+            and get_pp_group().is_last_rank
+            and (
+                self.speculative_config.use_eagle()
+                or self.speculative_config.uses_extract_hidden_states()
+            )
         ):
             assert isinstance(
                 self.drafter,
@@ -12436,8 +12509,15 @@ class GPUModelRunner(
                                 "INT8 block cache requires the scheduler and kernel "
                                 "page sizes to match"
                             )
-                        kv_caches[layer_name] = kv_cache_raw_tensors[layer_name].view(
-                            kernel_num_blocks, kv_cache_spec.page_size_bytes
+                        raw_tensor = kv_cache_raw_tensors[layer_name].view(torch.int8)
+                        real_page_size = replace(
+                            kv_cache_spec, page_size_padded=None
+                        ).page_size_bytes
+                        page_stride = kv_cache_spec.page_size_bytes
+                        kv_caches[layer_name] = torch.as_strided(
+                            raw_tensor,
+                            size=(kernel_num_blocks, real_page_size),
+                            stride=(page_stride, 1),
                         )
                         continue
 
@@ -12470,7 +12550,9 @@ class GPUModelRunner(
                     raw_tensor = kv_cache_raw_tensors[layer_name]
                     state_tensors = []
                     storage_offset_bytes = 0
-                    for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+                    for shape, dtype in zip(
+                        kv_cache_spec.shapes, kv_cache_spec.dtypes, strict=True
+                    ):
                         dtype_size = get_dtype_size(dtype)
                         num_element_per_page = (
                             kv_cache_spec.page_size_bytes // dtype_size
@@ -12656,6 +12738,7 @@ class GPUModelRunner(
         if (
             self.speculative_config
             and self.speculative_config.uses_extract_hidden_states()
+            and get_pp_group().is_last_rank
         ):
             assert isinstance(self.drafter, ExtractHiddenStatesProposer)
             # validate all draft model layers belong to the same kv cache

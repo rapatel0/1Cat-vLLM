@@ -1581,11 +1581,11 @@ def test_sm70_nomtp_cudagraph_capture_sizes_cover_concurrency(
     [
         (1, [5]),
         (2, [5, 10]),
-        (4, [5, 10, 20]),
-        (6, [5, 10, 20, 30]),
-        (12, [5, 10, 20, 30, 40, 60]),
-        (16, [5, 10, 20, 30, 40, 60, 80]),
-        (32, [5, 10, 20, 30, 40, 60, 80]),
+        (4, [5, 10, 15, 20]),
+        (6, [5, 10, 15, 20, 30]),
+        (12, [5, 10, 15, 20, 30, 40, 60]),
+        (16, [5, 10, 15, 20, 30, 40, 60, 80]),
+        (32, [5, 10, 15, 20, 30, 40, 60, 80]),
     ],
 )
 def test_sm70_mtp_cudagraph_capture_sizes_cover_production_concurrency(
@@ -1595,6 +1595,24 @@ def test_sm70_mtp_cudagraph_capture_sizes_cover_production_concurrency(
     from vllm.config.vllm import _sm70_mtp_cudagraph_capture_sizes
 
     assert _sm70_mtp_cudagraph_capture_sizes(max_num_seqs, 5) == expected
+
+
+def test_sm70_speculative_cudagraph_shapes_are_tp_independent_and_bounded():
+    from vllm.config.vllm import _sm70_speculative_cudagraph_capture_sizes
+
+    assert _sm70_speculative_cudagraph_capture_sizes(4, 5) == [
+        1,
+        2,
+        4,
+        5,
+        8,
+        9,
+        10,
+        15,
+        18,
+        20,
+    ]
+    assert _sm70_speculative_cudagraph_capture_sizes(256, 5)[-1] == 80
 
 
 def test_flash_v100_decode_query_does_not_attach_smallq_metadata(
@@ -1705,8 +1723,9 @@ def test_flash_v100_smallq_forward_prefers_persistent_decode_metadata():
 
 @pytest.mark.parametrize("query_len", [8, 16])
 @pytest.mark.parametrize("page_size", [3296, 3456])
+@pytest.mark.parametrize("kv_dtype", ["fp8_e5m2", "fp8_e4m3"])
 def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
-    query_len: int, page_size: int
+    query_len: int, page_size: int, kv_dtype: str
 ):
     from vllm.v1.attention.backends.flash_attn_v100 import FlashAttnV100Impl
 
@@ -1717,7 +1736,7 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
         num_kv_heads=1,
         alibi_slopes=None,
         sliding_window=None,
-        kv_cache_dtype="fp8_e5m2",
+        kv_cache_dtype=kv_dtype,
     )
     impl.use_dflash2_grouped_verify = True
     impl.dflash2_grouped_verify_max_query_tokens = 16
@@ -1769,6 +1788,24 @@ def test_flash_v100_dflash2_grouped_verify_uses_original_request_metadata(
         num_query_tokens=query_len,
     )
     attn_metadata.max_model_len = 32768
+    if kv_dtype == "fp8_e4m3":
+        assert not impl._dflash2_grouped_verify_allowed(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            num_query_tokens=query_len,
+        )
+        grouped_verify.supports_e4m3 = True  # type: ignore[attr-defined]
+        if query_len == 16:
+            assert not impl._dflash2_grouped_verify_allowed(
+                query,
+                key_cache,
+                value_cache,
+                attn_metadata,
+                num_query_tokens=query_len,
+            )
+            return
     result = impl._flash_v100_small_query_prefill_as_decode(
         layer,
         query,

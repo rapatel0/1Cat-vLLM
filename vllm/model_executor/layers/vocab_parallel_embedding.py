@@ -65,6 +65,14 @@ def _sm70_dflash2_qpn8_rerank_requested() -> bool:
     )
 
 
+def _sm70_lm_head_packed_layout_requested() -> bool:
+    return (
+        _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
+        or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
+        or _sm70_dflash2_qpn8_rerank_requested()
+    )
+
+
 def _sm70_dflash2_use_dense_order() -> bool:
     """Keep production on the scored full-vocabulary tie-order contract."""
     if envs.VLLM_SM70_DFLASH2_QPN8_DENSE_ORDER:
@@ -99,15 +107,13 @@ def _is_sm70_lm_head_fastpath_eligible(layer: torch.nn.Module) -> bool:
         _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False)
         or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default())
         or _sm70_env_bool("VLLM_SM70_LM_HEAD_TOP1_TC", False)
+        or envs.VLLM_SM70_DFLASH2_FP32_LOGITS
         or _sm70_dflash2_qpn8_rerank_requested()
     ):
         _trace_sm70_lm_head_skip("disabled")
         return False
     if not current_platform.is_cuda_alike():
         _trace_sm70_lm_head_skip("non_cuda_platform")
-        return False
-    if not hasattr(torch.ops._C, "sm70_f16_prepare"):
-        _trace_sm70_lm_head_skip("missing_sm70_f16_prepare_op")
         return False
     if layer.weight.dtype != torch.float16:
         _trace_sm70_lm_head_skip(f"weight_dtype={layer.weight.dtype}")
@@ -197,6 +203,9 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
     torch.accelerator.empty_cache()
 
     device = weight.device
+    fp32_logits = envs.VLLM_SM70_DFLASH2_FP32_LOGITS
+    layer._sm70_dflash2_fp32_logits = fp32_logits
+    rerank_dtype = torch.float32 if fp32_logits else torch.float16
     max_rows = _SM70_DFLASH2_QPN8_MAX_ROWS
     candidates = _SM70_DFLASH2_QPN8_CANDIDATES
     layer.register_buffer("_sm70_dflash2_qpn8_codes", codes, persistent=False)
@@ -218,7 +227,7 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
     )
     layer.register_buffer(
         "_sm70_dflash2_rerank_logits",
-        torch.empty((max_rows, candidates), dtype=torch.float16, device=device),
+        torch.empty((max_rows, candidates), dtype=rerank_dtype, device=device),
         persistent=False,
     )
     selected_rows = max_rows * candidates
@@ -249,7 +258,7 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
     )
     layer.register_buffer(
         "_sm70_dflash2_rerank_dense_logits",
-        torch.empty((max_rows, rows), dtype=torch.float16, device=device),
+        torch.empty((max_rows, rows), dtype=rerank_dtype, device=device),
         persistent=False,
     )
     layer.register_buffer(
@@ -257,14 +266,14 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
         torch.empty((max_rows, candidates), dtype=torch.int64, device=device),
         persistent=False,
     )
-    # Keep distinct top-16 and top-20 outputs.  Slicing the columns of one
+    # Keep distinct top-16, top-20 and top-21 outputs. Slicing the columns of one
     # [max_rows, 20] allocation for top-16 leaves a row stride of 20 and makes
     # the result non-contiguous.  The TP all-gather requires contiguous inputs,
     # and inserting a runtime contiguous() copy would add work to both graphs.
-    for selector_k in (16, 20):
+    for selector_k in (16, 20, 21):
         layer.register_buffer(
             f"_sm70_dflash2_rerank_values_{selector_k}",
-            torch.empty((max_rows, selector_k), dtype=torch.float16, device=device),
+            torch.empty((max_rows, selector_k), dtype=rerank_dtype, device=device),
             persistent=False,
         )
         layer.register_buffer(
@@ -284,7 +293,8 @@ def _prepare_sm70_dflash2_qpn8_rerank(layer: torch.nn.Module) -> bool:
         )
     layer._sm70_dflash2_qpn8_rerank_prepared = True
     logger.info_once(
-        "SM70 DFlash2 QPN8 top-64 plus exact TurboMind FP16 rerank layout prepared."
+        "SM70 DFlash2 QPN8 top-64 rerank layout prepared (%s logits).",
+        "FP32" if fp32_logits else "FP16",
     )
     return True
 
@@ -294,7 +304,7 @@ def _sm70_dflash2_rerank_output_buffers(
     num_rows: int,
     selector_k: int,
 ) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
-    """Select graph-stable, contiguous rerank outputs for top-16 or top-20."""
+    """Select contiguous rerank outputs, including the target tie sentinel."""
     if selector_k == 16:
         values = layer._sm70_dflash2_rerank_values_16[:num_rows]
         positions = layer._sm70_dflash2_rerank_positions_16[:num_rows]
@@ -303,6 +313,10 @@ def _sm70_dflash2_rerank_output_buffers(
         values = layer._sm70_dflash2_rerank_values_20[:num_rows]
         positions = layer._sm70_dflash2_rerank_positions_20[:num_rows]
         ids = layer._sm70_dflash2_rerank_ids_20[:num_rows]
+    elif selector_k == 21:
+        values = layer._sm70_dflash2_rerank_values_21[:num_rows]
+        positions = layer._sm70_dflash2_rerank_positions_21[:num_rows]
+        ids = layer._sm70_dflash2_rerank_ids_21[:num_rows]
     else:
         raise ValueError(f"Unsupported DFlash2 rerank top-k: {selector_k}")
     return values, positions, ids
@@ -353,10 +367,35 @@ def _sm70_dflash2_candidate_order_topk(
 
 
 def maybe_prepare_sm70_lm_head_top1(layer: torch.nn.Module) -> bool:
-    if getattr(layer, "_sm70_f16_prepared", False):
-        return True
     if not _is_sm70_lm_head_fastpath_eligible(layer):
         return False
+
+    tp_size = getattr(layer, "tp_size", 1)
+    if (
+        envs.VLLM_SM70_DFLASH2_FP32_LOGITS
+        and tp_size in (2, 4)
+        and tuple(layer.weight.shape) == (248320 // tp_size, 5120)
+    ):
+        # Dense FP32 output must not depend on the TP4-only QPN8 candidate
+        # layout being available. TP2 otherwise silently keeps FP16 logits.
+        layer._sm70_dflash2_fp32_logits = True
+
+    raw_top1_requested = _sm70_env_bool(
+        "VLLM_SM70_LM_HEAD_TOP1", _sm70_lm_head_top1_default()
+    )
+    packed_layout_requested = _sm70_lm_head_packed_layout_requested()
+    if raw_top1_requested:
+        layer._sm70_f16_raw_top1_ready = True
+
+    if not packed_layout_requested:
+        logger.info_once("SM70 raw-weight LM head top1 path prepared.")
+        return True
+
+    if not hasattr(torch.ops._C, "sm70_f16_prepare"):
+        _trace_sm70_lm_head_skip("missing_sm70_f16_prepare_op")
+        return raw_top1_requested
+    if getattr(layer, "_sm70_f16_prepared", False):
+        return True
     prepared = sm70_ops.sm70_f16_prepare(layer.weight)
     layer._sm70_f16_tm_weight = prepared[0]
     layer._sm70_f16_k_ld = int(prepared[1][0].item())
@@ -375,6 +414,12 @@ def _maybe_sm70_lm_head_forward(
     x: torch.Tensor,
     bias: torch.Tensor | None = None,
 ) -> torch.Tensor | None:
+    if getattr(layer, "_sm70_dflash2_fp32_logits", False):
+        x_2d = x.reshape(-1, x.shape[-1]).contiguous()
+        out = torch.mm(x_2d, layer.weight.t(), out_dtype=torch.float32)
+        if bias is not None:
+            out = out + bias.float()
+        return out.reshape(*x.shape[:-1], out.shape[-1])
     if not _sm70_env_bool("VLLM_SM70_ENABLE_LM_HEAD_FASTPATH", False):
         return None
     if not getattr(layer, "_sm70_f16_prepared", False):
@@ -416,7 +461,9 @@ def _maybe_sm70_lm_head_top1(
         return None
     if bias is not None:
         return None
-    if not getattr(layer, "_sm70_f16_prepared", False):
+    raw_top1_ready = lm_head_top1 and getattr(layer, "_sm70_f16_raw_top1_ready", False)
+    packed_top1_ready = lm_head_top1_tc and getattr(layer, "_sm70_f16_prepared", False)
+    if not (raw_top1_ready or packed_top1_ready):
         _trace_sm70_lm_head_skip("top1_not_prepared")
         return None
     if not (
@@ -452,7 +499,7 @@ def _maybe_sm70_lm_head_top1(
 
     values = torch.empty((x_2d.size(0),), dtype=torch.float32, device=x_2d.device)
     indices = torch.empty((x_2d.size(0),), dtype=torch.int64, device=x_2d.device)
-    if lm_head_top1_tc and hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out"):
+    if packed_top1_ready and hasattr(torch.ops._C, "sm70_f16_lm_head_top1_tc_out"):
         tm_weight = getattr(layer, "_sm70_f16_tm_weight", None)
         k_ld = getattr(layer, "_sm70_f16_k_ld", None)
         if tm_weight is not None and k_ld is not None:
@@ -473,7 +520,7 @@ def _maybe_sm70_lm_head_top1(
     if num_rows != 1:
         return None
 
-    if not lm_head_top1 or not hasattr(torch.ops._C, "sm70_f16_lm_head_top1_out"):
+    if not raw_top1_ready or not hasattr(torch.ops._C, "sm70_f16_lm_head_top1_out"):
         return None
 
     sm70_ops.sm70_f16_lm_head_top1_out(
@@ -500,7 +547,13 @@ def _maybe_sm70_dflash2_qpn8_rerank(
         return None
     if not getattr(layer, "_sm70_dflash2_qpn8_rerank_prepared", False):
         return None
-    if selector_k not in (16, 20) or bias is not None:
+    if selector_k not in (16, 20, 21) or bias is not None:
+        return None
+    if (
+        selector_k == 21
+        and not _sm70_dflash2_use_dense_order()
+        and not getattr(layer, "_sm70_dflash2_fp32_logits", False)
+    ):
         return None
     if x.dtype != torch.float16 or not x.is_cuda:
         return None
@@ -539,23 +592,35 @@ def _maybe_sm70_dflash2_qpn8_rerank(
         out=(qpn8_values, qpn8_ids),
     )
 
-    sm70_ops.sm70_f16_indexed_rerank_packed_out(
-        layer._sm70_dflash2_rerank_logits[:num_rows],
-        x_2d,
-        layer._sm70_f16_tm_weight,
-        qpn8_ids,
-        layer._sm70_dflash2_rerank_selected_packed,
-        layer._sm70_dflash2_rerank_expanded,
-        layer._sm70_dflash2_rerank_partials,
-        layer._sm70_dflash2_rerank_barriers,
-        _SM70_DFLASH2_RERANK_CTA_N,
-        _SM70_DFLASH2_RERANK_SPLIT_K,
-    )
+    fp32_logits = getattr(layer, "_sm70_dflash2_fp32_logits", False)
+    if fp32_logits:
+        from vllm.model_executor.layers.sm70_fp32_lm_head import indexed_fp32_logits
+
+        indexed_fp32_logits(
+            x_2d,
+            layer.weight,
+            qpn8_ids,
+            layer._sm70_dflash2_rerank_logits[:num_rows],
+        )
+        logger.info_once("SM70 DFlash2 FP32 candidate logits enabled.")
+    else:
+        sm70_ops.sm70_f16_indexed_rerank_packed_out(
+            layer._sm70_dflash2_rerank_logits[:num_rows],
+            x_2d,
+            layer._sm70_f16_tm_weight,
+            qpn8_ids,
+            layer._sm70_dflash2_rerank_selected_packed,
+            layer._sm70_dflash2_rerank_expanded,
+            layer._sm70_dflash2_rerank_partials,
+            layer._sm70_dflash2_rerank_barriers,
+            _SM70_DFLASH2_RERANK_CTA_N,
+            _SM70_DFLASH2_RERANK_SPLIT_K,
+        )
     rerank_logits = layer._sm70_dflash2_rerank_logits[:num_rows]
     values, _positions, ids = _sm70_dflash2_rerank_output_buffers(
         layer, num_rows, selector_k
     )
-    use_dense_order = _sm70_dflash2_use_dense_order()
+    use_dense_order = fp32_logits or _sm70_dflash2_use_dense_order()
     if use_dense_order:
         _sm70_dflash2_dense_order_topk(
             layer._sm70_dflash2_rerank_dense_logits[:num_rows],
@@ -612,8 +677,8 @@ def _maybe_sm70_dflash2_qpn8_rerank(
         )
 
     logger.info_once(
-        "SM70 DFlash2 QPN8 top-64 plus exact packed TurboMind FP16 rerank "
-        "path enabled (dense_order=%s).",
+        "SM70 DFlash2 QPN8 top-64 plus %s rerank path enabled (dense_order=%s).",
+        "FP32 candidate" if fp32_logits else "packed TurboMind FP16",
         use_dense_order,
     )
     output_shape = (*x.shape[:-1], selector_k)
