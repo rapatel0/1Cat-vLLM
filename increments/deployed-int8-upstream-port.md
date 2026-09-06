@@ -84,4 +84,4 @@ The current `sglang-dflash2-fp16-tp4-final` deployment is the desired target. Th
 
 ## Current checkpoint
 
-None.
+`deployed` was merged and pushed at `2f9ec861cce8329c9204cbf1d6d70cf4470ce524`. It contains upstream main `24ff99d15`, the original `int8_block32` commit, and the additional live-overlay INT8 bridge/QSA/output-gate port. Static source checks, Python compilation, binding-presence checks, and no-conflict checks passed. The next action is an immutable SM70 image build from this exact public commit, then a manifest-backed rollout.
