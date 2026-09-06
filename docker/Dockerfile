@@ -453,15 +453,23 @@ COPY tools/ep_kernels/install_python_libraries.sh /tmp/install_python_libraries.
 # Defaults moved here from tools/ep_kernels/install_python_libraries.sh for centralized version management
 ARG DEEPEP_COMMIT_HASH=73b6ea4
 ARG NVSHMEM_VER
+# DeepEP compiles for Hopper and Blackwell only. Set BUILD_EP_KERNELS=0 for a
+# target such as SM70 that cannot use these kernels. The stage then produces an
+# empty wheel directory and saves a long compile.
+ARG BUILD_EP_KERNELS=1
 RUN --mount=type=cache,target=/opt/uv/cache \
     mkdir -p /tmp/ep_kernels_workspace/dist && \
-    export TORCH_CUDA_ARCH_LIST='9.0a 10.0a' && \
-    /tmp/install_python_libraries.sh \
-        --workspace /tmp/ep_kernels_workspace \
-        --mode wheel \
-        ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} \
-        ${NVSHMEM_VER:+--nvshmem-ver "$NVSHMEM_VER"} && \
-    find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete
+    if [ "${BUILD_EP_KERNELS}" = "0" ]; then \
+        echo "Skipping DeepEP kernels (BUILD_EP_KERNELS=0)."; \
+    else \
+        export TORCH_CUDA_ARCH_LIST='9.0a 10.0a' && \
+        /tmp/install_python_libraries.sh \
+            --workspace /tmp/ep_kernels_workspace \
+            --mode wheel \
+            ${DEEPEP_COMMIT_HASH:+--deepep-ref "$DEEPEP_COMMIT_HASH"} \
+            ${NVSHMEM_VER:+--nvshmem-ver "$NVSHMEM_VER"} && \
+        find /tmp/ep_kernels_workspace/nvshmem -name '*.a' -delete; \
+    fi
 #################### EXTENSIONS BUILD IMAGE ####################
 
 #################### WHEEL BUILD IMAGE ####################
@@ -511,9 +519,18 @@ COPY . .
 # detects it and ships it as-is, skipping the local cargo build.
 COPY --from=rust-build /workspace/vllm-rs vllm/vllm-rs
 
+# The build context can be a plain source tree without Git metadata, for
+# example a BuildKit Git context. Run the repository check only when the
+# context actually carries `.git`.
 ARG GIT_REPO_CHECK=0
-RUN --mount=type=bind,source=.git,target=.git \
-    if [ "$GIT_REPO_CHECK" != "0" ]; then bash tools/check_repo.sh ; fi
+RUN if [ "$GIT_REPO_CHECK" != "0" ]; then \
+        if [ -d .git ]; then \
+            bash tools/check_repo.sh; \
+        else \
+            echo "GIT_REPO_CHECK=1 requires a context with .git" >&2; \
+            exit 1; \
+        fi; \
+    fi
 
 ARG vllm_target_device="cuda"
 ENV VLLM_TARGET_DEVICE=${vllm_target_device}
@@ -534,12 +551,21 @@ RUN --mount=type=cache,target=/opt/uv/cache \
     cd flash-attention-v100 && \
     python3 setup.py bdist_wheel --dist-dir=/workspace/flash-attn-v100-dist
 
-# Build the vLLM wheel
+# Build the vLLM wheel.
+#
+# setuptools-scm derives the version from Git metadata. A Git-context build
+# has no `.git`, so pass VLLM_VERSION_OVERRIDE for a reproducible version.
+ARG VLLM_VERSION_OVERRIDE=""
 RUN --mount=type=cache,target=/opt/uv/cache \
-    --mount=type=bind,source=.git,target=.git \
     if [ "${vllm_target_device}" = "cuda" ]; then \
         export VLLM_USE_PRECOMPILED=1; \
         export VLLM_PRECOMPILED_WHEEL_LOCATION=$(ls /precompiled-wheels/*.whl); \
+    fi && \
+    if [ -n "${VLLM_VERSION_OVERRIDE}" ]; then \
+        export VLLM_VERSION_OVERRIDE="${VLLM_VERSION_OVERRIDE}"; \
+    elif [ ! -d .git ]; then \
+        echo "No .git in the build context. Set VLLM_VERSION_OVERRIDE." >&2; \
+        exit 1; \
     fi && \
     python3 setup.py bdist_wheel --dist-dir=dist --py-limited-api=cp38
 
@@ -766,9 +792,16 @@ RUN --mount=type=cache,target=/opt/uv/cache \
 # https://docs.flashinfer.ai/installation.html
 # From versions.json: .flashinfer.version
 ARG FLASHINFER_VERSION=0.6.11.post2
+# FlashInfer needs SM80 or later. Set INSTALL_FLASHINFER=0 for an SM70 image to
+# skip a large wheel and cubin download that the target cannot run.
+ARG INSTALL_FLASHINFER=1
 RUN --mount=type=cache,target=/opt/uv/cache \
-    uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
-        --extra-index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+    if [ "${INSTALL_FLASHINFER}" = "0" ]; then \
+        echo "Skipping FlashInfer (INSTALL_FLASHINFER=0)."; \
+    else \
+        uv pip install --system flashinfer-jit-cache==${FLASHINFER_VERSION} \
+            --extra-index-url https://flashinfer.ai/whl/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+    fi
 
 # ============================================================
 # OPENAI API SERVER DEPENDENCIES
@@ -845,18 +878,27 @@ uv pip list
 # Pytorch now installs NVSHMEM, setting LD_LIBRARY_PATH
 ENV LD_LIBRARY_PATH=/usr/local/cuda/lib64:$LD_LIBRARY_PATH
 
-# Install EP kernels wheels (DeepEP) that have been built in the `build` stage
+# Install EP kernels wheels (DeepEP) that have been built in the `build` stage.
+# The directory is empty when BUILD_EP_KERNELS=0.
 RUN --mount=type=bind,from=build,src=/tmp/ep_kernels_workspace/dist,target=/vllm-workspace/ep_kernels/dist \
     --mount=type=cache,target=/opt/uv/cache \
-    uv pip install --system ep_kernels/dist/*.whl --verbose \
-        --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.')
+    if ls ep_kernels/dist/*.whl >/dev/null 2>&1; then \
+        uv pip install --system ep_kernels/dist/*.whl --verbose \
+            --extra-index-url ${PYTORCH_CUDA_INDEX_BASE_URL}/cu$(echo $CUDA_VERSION | cut -d. -f1,2 | tr -d '.'); \
+    else \
+        echo "No DeepEP wheels to install."; \
+    fi
 
 # Download FlashInfer precompiled cubins AFTER all pip installs are done.
 # This must run after the vLLM wheel and EP kernels installs above, because
 # those can reinstall/touch flashinfer packages. Downloading cubins earlier
 # (in the flashinfer-jit-cache layer) causes ~2.5 GB of layer duplication
 # when a later pip install overwrites flashinfer package files.
-RUN flashinfer show-config && flashinfer download-cubin
+RUN if [ "${INSTALL_FLASHINFER}" = "0" ]; then \
+        echo "Skipping FlashInfer cubins (INSTALL_FLASHINFER=0)."; \
+    else \
+        flashinfer show-config && flashinfer download-cubin; \
+    fi
 
 # CUDA image changed from /usr/local/nvidia to /usr/local/cuda in 12.8 but will
 # return to /usr/local/nvidia in 13.0 to allow container providers to mount drivers
