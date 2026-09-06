@@ -57,3 +57,35 @@ Main mirror operation: validate `deployed`, fetch upstream, reset only the clean
 ## Current checkpoint
 
 None.
+
+## Completion
+
+### Delivered artifact
+
+`origin/deployed` preserves the fork source at `94f64714263e3af4399bbc0dd78069e5ce3a84b9`. It contains block-scaled INT8 commit `6833b8529`.
+
+`origin/main` now exactly equals `upstream/main` at `24ff99d157bd8fc34755fd5d44849ab434010473`.
+
+### Acceptance evidence and criterion status
+
+- Full — `origin/deployed` resolved to `94f647142` before and after the reset.
+- Full — `6833b8529` is an ancestor of `origin/deployed`.
+- Full — Fork main and upstream main resolved to the same SHA after the lease-protected force push.
+- Full — The clean clone was clean before reset and remained clean afterward.
+
+### Preserved behavior evidence
+
+Only fork main changed. The deployed branch and cluster state were not changed.
+
+### Reproduction or run commands
+
+- `git ls-remote origin refs/heads/main refs/heads/deployed`
+- `git merge-base --is-ancestor 6833b8529 origin/deployed`
+
+### Material residuals
+
+The deployed branch is a source-history checkpoint. The live overlay has no `.git` directory, so it cannot prove byte-for-byte identity with this commit.
+
+### Unverified behavior
+
+No source build or cluster deployment occurred.
