@@ -270,7 +270,8 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 logical_indices,
                 attn_metadata.block_table,
                 token_to_req,
-                output[:num_tokens],
+                out=output[:num_tokens],
+                output_gate=output_gate,
             )
             return output
 
