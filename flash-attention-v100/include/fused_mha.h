@@ -59,6 +59,8 @@ at::Tensor flash_attention_grouped_verify_paged(
 
 int64_t flash_attention_grouped_verify_max_query_tokens();
 
+int64_t flash_attention_grouped_verify_max_requests();
+
 int64_t flash_attention_grouped_sparse_page4_abi_version();
 
 at::Tensor flash_attention_grouped_sparse_page4(
@@ -148,6 +150,12 @@ void flash_attention_int8_block32_reshape_and_cache(
     const at::Tensor& key, const at::Tensor& value, at::Tensor& key_cache,
     at::Tensor& value_cache, at::Tensor& key_scales, at::Tensor& value_scales,
     at::Tensor& page_owners, const at::Tensor& slot_mapping);
+
+void flash_attention_int8_block32_paged_kv_to_fp16(
+    const at::Tensor& key_cache, const at::Tensor& value_cache,
+    const at::Tensor& key_scales, const at::Tensor& value_scales,
+    const at::Tensor& block_table, const at::Tensor& seq_lens,
+    at::Tensor& key_out, at::Tensor& value_out);
 
 void flash_attention_int8_block32_decode_paged(
     const at::Tensor& query, const at::Tensor& key_cache,
