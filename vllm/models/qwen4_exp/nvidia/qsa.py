@@ -271,7 +271,12 @@ class Qwen4ExpQSAFlashAttentionImpl(FlashAttentionImpl):
                 attn_metadata.block_table,
                 token_to_req,
                 out=output[:num_tokens],
-                output_gate=output_gate,
+                # The gate buffer is allocated for the whole batch, so it must
+                # be sliced to the active tokens exactly like the query and
+                # output views. The FP16 route below does the same.
+                output_gate=(
+                    None if output_gate is None else output_gate[:num_tokens]
+                ),
             )
             return output
 
