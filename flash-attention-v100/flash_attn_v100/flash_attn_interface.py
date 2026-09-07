@@ -1023,6 +1023,23 @@ def flash_attn_decode_paged_xqa_staged_available() -> bool:
     return hasattr(flash_attn_v100_cuda, "decode_paged_xqa_staged_fwd")
 
 
+def flash_attn_grouped_verify_max_requests() -> int:
+    """Return the native grouped-verifier request-count capability.
+
+    Extensions built before multi-request support do not expose the capability
+    entry. Those binaries verify one request per launch, so fall back to that
+    limit instead of routing a batch into the old op.
+    """
+    get_max_requests = getattr(
+        flash_attn_v100_cuda,
+        "grouped_verify_max_requests",
+        None,
+    )
+    if get_max_requests is None:
+        return 1
+    return int(get_max_requests())
+
+
 def flash_attn_grouped_verify_max_query_tokens() -> int:
     """Return the native grouped-verifier query-length capability.
 
@@ -1052,6 +1069,7 @@ def flash_attn_grouped_verify_paged(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     one_pass: bool = False,
+    query_start_loc: torch.Tensor | None = None,
 ) -> torch.Tensor:
     """Exact grouped q8/q16 H6/D256 DFlash2 verifier for SM70.
 
@@ -1087,6 +1105,7 @@ def flash_attn_grouped_verify_paged(
         float(k_scale),
         float(v_scale),
         bool(one_pass),
+        maybe_contiguous(query_start_loc),
     )
 
 
@@ -1694,6 +1713,8 @@ __all__ = [
     "flash_attn_decode_paged_xqa",
     "flash_attn_decode_paged_xqa_available",
     "flash_attn_grouped_verify_paged",
+    "flash_attn_grouped_verify_max_query_tokens",
+    "flash_attn_grouped_verify_max_requests",
     "flash_attn_decode_paged_wmma",
     "flash_attn_decode_qk_scores",
     "flash_attn_turboquant_decode_paged",

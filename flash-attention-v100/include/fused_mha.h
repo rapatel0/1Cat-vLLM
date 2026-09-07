@@ -55,7 +55,7 @@ at::Tensor flash_attention_grouped_verify_paged(
     const at::Tensor& seq_lens, at::Tensor& partial_out,
     at::Tensor& partial_lse, const float softmax_scale,
     const std::string& kv_cache_dtype, const float k_scale, const float v_scale,
-    const bool one_pass);
+    const bool one_pass, const std::optional<at::Tensor>& query_start_loc);
 
 int64_t flash_attention_grouped_verify_max_query_tokens();
 
