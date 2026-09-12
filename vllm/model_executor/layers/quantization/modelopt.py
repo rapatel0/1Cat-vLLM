@@ -1224,11 +1224,11 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
         if group_size is None:
             group_size = 16  # Default value
 
-        # For FP4, these fields are required
+        # Flash Next NVFP4 checkpoints omit kv_cache_quant_algo. They do not
+        # quantize KV. Require only group_size and exclude_modules.
         if is_checkpoint_nvfp4_serialized and "quantization" in original_config:
-            # Check if required fields are present in the quantization config
             quant_config = original_config["quantization"]
-            required_fields = ["group_size", "kv_cache_quant_algo", "exclude_modules"]
+            required_fields = ["group_size", "exclude_modules"]
             missing_fields = [
                 field for field in required_fields if field not in quant_config
             ]
