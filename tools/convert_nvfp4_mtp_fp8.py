@@ -167,7 +167,10 @@ def convert(nvfp4: Path, fp8: Path, out: Path, source: str) -> dict:
             continue
         os.symlink(item.resolve(), dest)
 
-    shard_name = "model-mtp-fp8.safetensors"
+    # Qwen4ExpMTP allow_patterns_overrides prefers model-bf16-*.safetensors
+    # and stops at the first matching glob. Use that prefix so the draft
+    # loader opens the FP8 expert shard with the other MTP files.
+    shard_name = "model-bf16-mtp-fp8.safetensors"
     save_file(
         {
             MTP_GATE_UP: w13,

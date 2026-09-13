@@ -1,59 +1,108 @@
 # Mixed NVFP4/FP8 MTP
 
-## Conversion
+## Scale convention (Phase 1)
 
-Official-parity (copy Flash Next FP8 MTP experts, fused):
+Official Flash Next FP8 MTP experts:
+
+- E4M3 weights, 128×128 blocks
+- `weight_scale_inv` is bfloat16
+- dequant = `fp8.float() * scale`
+- scale = `amax / 448`
+- MTP attn, shared expert, HC, router stay BF16
+
+See `docs/sm70_mtp_fp8_scale_forensics.md`.
+
+Runtime `amax / 448` matches official scales (median ratio 1.0). Do not call it ModelOpt MSE.
+
+## Conversion (Phase 2–3)
+
+Official-parity overlay (copy Flash Next FP8 experts, fused):
 
 ```
 python3 tools/convert_nvfp4_mtp_fp8.py \
   --nvfp4 /models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 \
   --fp8 /workspace/iron-002/hf-cache/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/236dfdf285828023ca3bcd3f37366c58a3469b13 \
-  --out /models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4-MTP-FP8 \
+  --out /workspace/iron-002/ckpts/Qwen3.8-Flash-Next-ABLITERATED-NVFP4-MTP-FP8 \
   --source official
 ```
 
-Runtime-amax comparison overlay:
+Runtime-amax overlay:
 
 ```
-python3 tools/convert_nvfp4_mtp_fp8.py \
-  --nvfp4 /models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 \
-  --fp8 /workspace/iron-002/hf-cache/models--Qwen--Qwen3.8-Flash-Next-FP8/snapshots/236dfdf285828023ca3bcd3f37366c58a3469b13 \
-  --out /models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4-MTP-FP8-AMAX \
-  --source runtime-amax
+python3 tools/convert_nvfp4_mtp_fp8.py ... --source runtime-amax \
+  --out /workspace/iron-002/ckpts/Qwen3.8-Flash-Next-ABLITERATED-NVFP4-MTP-FP8-AMAX
 ```
 
-## Launch (serialized ModelOpt-parity FP8 MTP)
+The draft loader's first matching glob is `model-bf16-*.safetensors`. The converter writes `model-bf16-mtp-fp8.safetensors`.
 
-```
-CUDA_VISIBLE_DEVICES=4,5,6,7 \
-VLLM_SLEEP_CALIBRATE=0 \
-vllm serve /models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4-MTP-FP8 \
-  --served-model-name qwen38 \
-  --tensor-parallel-size 4 \
-  --speculative-config '{"method":"mtp","num_speculative_tokens":4}' \
-  --kv-cache-dtype int8_block32 \
-  --max-model-len 262144 \
-  --port 8083
-```
+Written overlay (official source):
 
-Architecture fallback (original NVFP4 checkpoint, runtime-amax):
+- `mtp.layers.0.mlp.experts.gate_up_proj` float8 `[512,1280,2560]`
+- `w13_weight_scale_inv` bf16 `[512,10,20]`
+- `down_proj` float8 `[512,2560,640]`
+- `w2_weight_scale_inv` bf16 `[512,20,5]`
+- `hf_quant_config.json` `mixed_modules` + `fp8_serialized=true`
+- `official_vs_bf16_rel_l2_expert0_gate` = 0.026585
 
-```
-VLLM_SM70_MTP_BLOCK_FP8=1 VLLM_SM70_MTP_ARCH_FALLBACK=1
-```
+## Dispatch (Phase 4)
 
-BF16 MTP baseline:
+`mixed_modules` selects the expert path:
 
-```
-VLLM_SM70_MTP_BLOCK_FP8=0 VLLM_SM70_MTP_ARCH_FALLBACK=1
-```
+- `fp8_block128` + `fp8_serialized` → `Sm70SerializedBlockFp8MoEMethod`
+- `fp8_block128_runtime` / architecture fallback + `VLLM_SM70_MTP_BLOCK_FP8=1` → `Sm70OnlineBlockFp8MoEMethod`
+- main `language_model` experts → NVFP4
+- missing MTP format with mixed metadata → fail closed
+- `VLLM_SM70_MTP_ARCH_FALLBACK=1` (default) warns on old NVFP4 checkpoints
 
-Fail closed without mixed metadata:
+## Three-way bench (Phase 5)
 
-```
-VLLM_SM70_MTP_ARCH_FALLBACK=0
-```
+Shared settings: TP4, INT8 `int8_block32` KV, MTP4, `max_model_len=32768`, `max_num_seqs=1`, `gpu_memory_utilization=0.90`, temperature 0, 64 completion tokens, four prompts (coding, factual, reasoning, tool-use). One warmup.
+
+| config | coding tok/s | factual | reasoning | tool_use | GPU0 mem | MTP AL | pos accept | draft accept |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| BF16 MTP | 59.07 | 17.19 | 49.72 | 13.55 | 30522 MiB | n/a (metrics not flushed) | n/a | n/a |
+| runtime-amax FP8 | 84.81 | 51.84 | 76.99 | 34.89 | 30322 MiB | 4.30 | 1.000, 0.848, 0.758, 0.697 | 82.6% |
+| serialized official FP8 | 24.17 | 21.70 | 23.90 | 21.23 | 30522 MiB | 1.01 | 0.013, 0, 0, 0 | 0.3% |
+
+Temperature-0 coding/factual/tool-use prefixes matched across BF16 and runtime-amax. Serialized reasoning wording diverged (`t + b` vs `b + t`); verification still ran on the target model.
+
+Serialized official fused tensors load, but TP4 scale sharding makes drafts nearly useless. Do not treat that overlay as ModelOpt-parity serving until scale-shard loading is fixed.
 
 ## Default
 
-Do not set FP8 MTP as production default until the three-way bench table in this file has measured throughput, memory, and acceptance. Serialized official-parity is the candidate default if it wins those gates.
+**Use runtime-amax FP8 MTP.** It improved end-to-end tok/s, slightly reduced loaded memory, kept high MTP acceptance, and used the TurboMind block-FP8 kernel (no BF16 expert GEMM).
+
+Do not default to serialized official-parity until acceptance recovers.
+
+## Launch (selected config)
+
+```
+CUDA_VISIBLE_DEVICES=0,1,2,3 \
+FLASH_ATTN_V100=1 \
+VLLM_PLE_CPU_OFFLOAD=1 \
+VLLM_SM70_NVFP4_TURBOMIND=1 \
+VLLM_SM70_MTP_BLOCK_FP8=1 \
+VLLM_SM70_MTP_ARCH_FALLBACK=1 \
+VLLM_KV_CACHE_LAYOUT=NHD \
+vllm serve /models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 \
+  --served-model-name qwen38 \
+  --trust-remote-code \
+  --language-model-only \
+  --dtype float16 \
+  --kv-cache-dtype int8_block32 \
+  --tensor-parallel-size 4 \
+  --max-model-len 262144 \
+  --max-num-seqs 1 \
+  --gpu-memory-utilization 0.90 \
+  --attention-backend FLASH_ATTN_V100 \
+  --speculative-config '{"method":"mtp","num_speculative_tokens":4}' \
+  --host 0.0.0.0 --port 8100
+```
+
+## 256K live-service blocker
+
+4 concurrent 256K slots plus MTP is still not proven. GPU memory after a 32K MTP4 load is ~30.3 GiB / 32 GiB. 4-slot 256K no-MTP previously occupied the same island. Remaining blockers:
+
+- serialized official MTP acceptance collapse on TP4
+- process-group teardown leaks `VLLM::Worker_TP*` GPU memory unless those PIDs are killed
+- 4×256K KV + MTP4 likely needs throttling or 2 slots, not 4
