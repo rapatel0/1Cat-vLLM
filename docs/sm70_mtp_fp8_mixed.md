@@ -99,10 +99,19 @@ vllm serve /models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 \
   --host 0.0.0.0 --port 8100
 ```
 
-## 256K live-service blocker
+## 256K integration (runtime-amax)
 
-4 concurrent 256K slots plus MTP is still not proven. GPU memory after a 32K MTP4 load is ~30.3 GiB / 32 GiB. 4-slot 256K no-MTP previously occupied the same island. Remaining blockers:
+`max_model_len=262144`, MTP4, INT8 KV, 1 sequence, `gpu_memory_utilization=0.90`:
 
-- serialized official MTP acceptance collapse on TP4
-- process-group teardown leaks `VLLM::Worker_TP*` GPU memory unless those PIDs are killed
-- 4×256K KV + MTP4 likely needs throttling or 2 slots, not 4
+- GPU KV cache: **637,233 tokens** (5.16 GiB)
+- loaded GPU0: 30322 MiB
+- short prompts: 83.4 / 46.6 / 76.1 / 34.9 tok/s
+- SpecDecoding: AL **3.83**, positions 0.894, 0.766, 0.638, 0.532, draft accept **70.7%**
+- 4820-token prompt probe: 13 completion tokens in 6.78 s, HTTP 200
+
+4 concurrent 256K slots do not fit: 4 × 262144 > 637233. About **2** 256K slots fit. 4-slot 256K remains blocked without throttling or a second island.
+
+Other leftovers:
+
+- serialized official MTP acceptance collapse on TP4 fused scales
+- SIGKILL of the API server leaks `VLLM::Worker_TP*` GPU memory; kill those PIDs
