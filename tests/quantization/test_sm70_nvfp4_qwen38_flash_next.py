@@ -153,6 +153,26 @@ def test_sm70_nvfp4_min_capability_is_70_with_turbomind():
         assert ModelOptNvFp4Config.get_min_capability() == 70
 
 
+def test_block_fp8_matches_official_mtp_scale_layout():
+    from vllm.model_executor.layers.quantization.fp8_sm70_moe import (
+        block_fp8_quantize,
+    )
+
+    torch.manual_seed(0)
+    weight = torch.randn(2, 640, 2560, dtype=torch.float16)
+    quant, scale = block_fp8_quantize(weight)
+    assert quant.dtype == torch.float8_e4m3fn
+    assert quant.shape == (2, 640, 2560)
+    assert scale.shape == (2, 5, 20)
+    recon = (
+        quant.float()
+        * scale.repeat_interleave(128, dim=1)[:, :640]
+        .repeat_interleave(128, dim=2)[:, :, :2560]
+    )
+    rel = (recon - weight.float()).norm() / weight.float().norm()
+    assert rel < 0.05
+
+
 def test_smoke_script_uses_native_sm70_path_not_emulation():
     source = Path("tools/qwen38_flash_next_nvfp4_smoke.py").read_text()
     assert 'moe_backend="emulation"' not in source

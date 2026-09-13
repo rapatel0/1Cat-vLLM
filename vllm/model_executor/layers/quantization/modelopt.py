@@ -1088,6 +1088,17 @@ def _explicit_nvfp4_emulation_requested() -> bool:
     )
 
 
+def _is_qwen4_mtp_draft() -> bool:
+    from vllm.config import get_current_vllm_config_or_none
+
+    cfg = get_current_vllm_config_or_none()
+    if cfg is None:
+        return False
+    hf = getattr(cfg.model_config, "hf_config", None)
+    arches = getattr(hf, "architectures", None) or []
+    return any("Qwen4ExpMTP" in str(arch) for arch in arches)
+
+
 def _try_prepare_sm70_modelopt_nvfp4(layer: torch.nn.Module) -> bool:
     """Prepare exact-SM70 TurboMind NVFP4 weights for a ModelOpt linear.
 
@@ -1164,23 +1175,27 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
-        if (
-            isinstance(layer, RoutedExperts)
-            and not self.is_layer_excluded(prefix)
-            and sm70_tm.is_exact_sm70_cuda_platform()
-        ):
-            if not sm70_tm.should_use_nvfp4_moe_turbomind():
-                raise NotImplementedError(
-                    "ModelOpt NVFP4 MoE on SM70 requires the TurboMind backend."
+        if isinstance(layer, RoutedExperts) and sm70_tm.is_exact_sm70_cuda_platform():
+            if _is_qwen4_mtp_draft() and envs.VLLM_SM70_MTP_BLOCK_FP8:
+                from vllm.model_executor.layers.quantization.fp8_sm70_moe import (
+                    Sm70OnlineBlockFp8MoEMethod,
                 )
-            from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
-                ModelOptNvFp4SM70MoEMethod,
-            )
 
-            return ModelOptNvFp4SM70MoEMethod(
-                quant_config=self,
-                moe_config=layer.moe_config,
-            )
+                return Sm70OnlineBlockFp8MoEMethod(layer)
+            if not self.is_layer_excluded(prefix):
+                if not sm70_tm.should_use_nvfp4_moe_turbomind():
+                    raise NotImplementedError(
+                        "ModelOpt NVFP4 MoE on SM70 requires the "
+                        "TurboMind backend."
+                    )
+                from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
+                    ModelOptNvFp4SM70MoEMethod,
+                )
+
+                return ModelOptNvFp4SM70MoEMethod(
+                    quant_config=self,
+                    moe_config=layer.moe_config,
+                )
         return super().get_quant_method(layer, prefix)
 
     @classmethod
