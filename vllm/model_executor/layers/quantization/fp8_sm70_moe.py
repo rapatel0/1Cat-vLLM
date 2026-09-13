@@ -1413,14 +1413,20 @@ def block_fp8_quantize(
     weight: torch.Tensor,
     block_n: int = 128,
     block_k: int = 128,
+    *,
+    scale_dtype: torch.dtype = torch.bfloat16,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Quantize `[E, N, K]` weights to E4M3 with 128x128 scales.
+    """Quantize `[E, N, K]` weights to E4M3 with official Flash Next scales.
 
-    The scale tensor multiplies dequantized values. That matches official
-    Flash Next FP8 `weight_scale_inv` layout: `[E, N/128, K/128]`.
+    Proven convention from Qwen3.8-Flash-Next-FP8 MTP experts:
+    dequant = fp8.float() * weight_scale_inv
+    weight_scale_inv = amax / 448, layout [E, ceil(N/128), ceil(K/128)],
+    scale dtype bfloat16. This is runtime-amax, not a ModelOpt MSE clone.
     """
     if weight.ndim != 3:
         raise ValueError(f"expected [E, N, K] weights, got {tuple(weight.shape)}")
+    if block_n != 128 or block_k != 128:
+        raise ValueError("official MTP FP8 uses 128x128 blocks only")
     num_experts, n, k = weight.shape
     ns = (n + block_n - 1) // block_n
     ks = (k + block_k - 1) // block_k
@@ -1431,11 +1437,11 @@ def block_fp8_quantize(
         weight_f = torch.nn.functional.pad(weight_f, (0, pad_k, 0, pad_n))
     blocks = weight_f.view(num_experts, ns, block_n, ks, block_k)
     amax = blocks.abs().amax(dim=(2, 4)).clamp(min=1e-12)
-    scale = amax / _E4M3_MAX
-    quant = blocks / scale.unsqueeze(2).unsqueeze(4)
+    scale_f = amax / _E4M3_MAX
+    quant = blocks / scale_f.unsqueeze(2).unsqueeze(4)
     quant = quant.clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn)
     quant = quant.reshape(num_experts, ns * block_n, ks * block_k)[:, :n, :k]
-    return quant.contiguous(), scale.contiguous()
+    return quant.contiguous(), scale_f.to(scale_dtype).contiguous()
 
 
 class _BlockFp8QuantConfig:

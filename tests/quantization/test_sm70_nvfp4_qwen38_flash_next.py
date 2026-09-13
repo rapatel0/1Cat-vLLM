@@ -162,6 +162,7 @@ def test_block_fp8_matches_official_mtp_scale_layout():
     weight = torch.randn(2, 640, 2560, dtype=torch.float16)
     quant, scale = block_fp8_quantize(weight)
     assert quant.dtype == torch.float8_e4m3fn
+    assert scale.dtype == torch.bfloat16
     assert quant.shape == (2, 640, 2560)
     assert scale.shape == (2, 5, 20)
     recon = (
