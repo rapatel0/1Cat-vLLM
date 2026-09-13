@@ -352,6 +352,11 @@ def _init_offload_distributed() -> None:
     # world, regardless of any DP environment variables inherited from the GPU
     # worker. The real DP/TP configuration is used later for model construction,
     # registration, and request routing.
+    # The offload process builds the model as a single unsharded stage, so a
+    # VLLM_PP_LAYER_PARTITION inherited from the GPU workers would be checked
+    # against pp_size=1 and rejected. Drop it for this process only.
+    os.environ.pop("VLLM_PP_LAYER_PARTITION", None)
+
     offload_config = VllmConfig()
     offload_parallel_config = offload_config.parallel_config
     offload_parallel_config.data_parallel_size = 1
