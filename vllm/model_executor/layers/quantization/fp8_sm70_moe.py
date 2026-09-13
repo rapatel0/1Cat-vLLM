@@ -1450,11 +1450,36 @@ class _BlockFp8QuantConfig:
     is_checkpoint_fp8_serialized = True
 
 
+class Sm70SerializedBlockFp8MoEMethod(Fp8SM70MoEMethod):
+    """Load already-serialized 128x128 E4M3 MTP experts. No runtime requant."""
+
+    def __init__(self, layer: RoutedExperts) -> None:
+        super().__init__(_BlockFp8QuantConfig(), layer)
+        logger.info_once(
+            "SM70 MTP experts: serialized block FP8 E4M3 [128, 128] "
+            "(TurboMind unpack to FP16 HMMA)."
+        )
+
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        from vllm.model_executor.layers.quantization.mixed_module_format import (
+            validate_serialized_fp8_experts,
+        )
+
+        validate_serialized_fp8_experts(layer.w13_weight, layer.w2_weight)
+        if not hasattr(layer, "w13_weight_scale_inv"):
+            raise ValueError("serialized MTP FP8 missing w13_weight_scale_inv")
+        super().process_weights_after_loading(layer)
+
+
 class Sm70OnlineBlockFp8MoEMethod(Fp8SM70MoEMethod):
     """Load BF16 MoE experts, then pack official 128x128 FP8 for SM70."""
 
     def __init__(self, layer: RoutedExperts) -> None:
         super().__init__(_BlockFp8QuantConfig(), layer)
+        logger.info_once(
+            "SM70 MTP experts: runtime-amax block FP8 E4M3 [128, 128] "
+            "(not ModelOpt MSE; TurboMind unpack to FP16 HMMA)."
+        )
 
     def create_weights(
         self,
@@ -1495,6 +1520,11 @@ class Sm70OnlineBlockFp8MoEMethod(Fp8SM70MoEMethod):
         layer.w2_input_scale = None
 
     def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        from vllm.model_executor.layers.quantization.mixed_module_format import (
+            validate_runtime_amax_experts,
+        )
+
+        validate_runtime_amax_experts(layer.w13_weight, layer.w2_weight)
         w13_fp8, w13_scale = block_fp8_quantize(layer.w13_weight)
         w2_fp8, w2_scale = block_fp8_quantize(layer.w2_weight)
         layer.w13_weight = Parameter(w13_fp8, requires_grad=False)

@@ -296,6 +296,7 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
     VLLM_SM70_MTP_BLOCK_FP8: bool = True
+    VLLM_SM70_MTP_ARCH_FALLBACK: bool = True
     VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL: bool = True
     VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS: bool = False
     VLLM_SM70_NVFP4_DENSE_GATED_SILU: bool = True
@@ -2448,6 +2449,9 @@ environment_variables: dict[str, Callable[[], Any]] = {
     ),
     "VLLM_SM70_MTP_BLOCK_FP8": lambda: bool(
         int(os.getenv("VLLM_SM70_MTP_BLOCK_FP8", "1"))
+    ),
+    "VLLM_SM70_MTP_ARCH_FALLBACK": lambda: bool(
+        int(os.getenv("VLLM_SM70_MTP_ARCH_FALLBACK", "1"))
     ),
     # Dispatch all 256 routed experts in one grouped TurboMind call for the
     # exact Qwen3.6-35B-A3B TP1/2/4 NVFP4 prefill shapes. B1-B8 decode keeps
