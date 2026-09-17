@@ -612,46 +612,73 @@ def build_gdn_spec_decode_state_contract(
             return spec_sequence_masks_cpu
         return spec_sequence_masks_cpu.to(tensor.device, non_blocking=True)
 
-    block_mask = _mask_for(block_table_tensor)
-    seq_mask = _mask_for(seq_lens)
-    accepted_mask = _mask_for(num_accepted_tokens)
+    # Boolean advanced indexing (``tensor[mask]``) runs ``nonzero`` on the
+    # tensor's device, which blocks on ``cudaStreamSynchronize``. On the MTP
+    # decode path this helper performed five such indexes per call and ran
+    # once per GDN KV-cache group, so the syncs dominated metadata build.
+    # Resolve the row indices once on the CPU mask instead and reuse them via
+    # ``index_select``. Boolean masking yields rows in ascending index order,
+    # which is exactly ``nonzero`` order, so this is value-identical.
+    _spec_rows_cpu = spec_sequence_masks_cpu.nonzero().flatten()
+    _non_spec_rows_cpu = (~spec_sequence_masks_cpu).nonzero().flatten()
+    _rows_cache: dict[torch.device, tuple[torch.Tensor, torch.Tensor]] = {}
+
+    def _rows_for(tensor: torch.Tensor) -> tuple[torch.Tensor, torch.Tensor]:
+        """Return (spec_rows, non_spec_rows) on ``tensor``'s device."""
+        cached = _rows_cache.get(tensor.device)
+        if cached is None:
+            if tensor.device == _spec_rows_cpu.device:
+                cached = (_spec_rows_cpu, _non_spec_rows_cpu)
+            else:
+                cached = (
+                    _spec_rows_cpu.to(tensor.device, non_blocking=True),
+                    _non_spec_rows_cpu.to(tensor.device, non_blocking=True),
+                )
+            _rows_cache[tensor.device] = cached
+        return cached
+
     if spec_state_slot_selectors is None:
         spec_state_slot_selectors = num_accepted_tokens
-    selector_mask = _mask_for(spec_state_slot_selectors)
 
+    _bt_spec, _bt_non_spec = _rows_for(block_table_tensor)
+    _acc_spec, _acc_non_spec = _rows_for(num_accepted_tokens)
     if current_state_block_ids is not None:
-        current_mask = _mask_for(current_state_block_ids)
+        _cur_spec, _cur_non_spec = _rows_for(current_state_block_ids)
         state_block_ids = current_state_block_ids[:, : num_spec + 1]
-        spec_state_indices_tensor = state_block_ids[current_mask]
-        non_spec_source = state_block_ids[~current_mask]
+        spec_state_indices_tensor = state_block_ids.index_select(0, _cur_spec)
+        non_spec_source = state_block_ids.index_select(0, _cur_non_spec)
         non_spec_state_indices_tensor = select_gdn_state_block_ids(
             non_spec_source,
-            num_accepted_tokens[~accepted_mask],
+            num_accepted_tokens.index_select(0, _acc_non_spec),
             num_spec,
         )
     elif is_mamba_cache_all:
+        _sl_spec, _sl_non_spec = _rows_for(seq_lens)
         spec_state_indices_tensor = gather_gdn_state_block_ids(
-            block_table_tensor[block_mask],
-            seq_lens[seq_mask],
+            block_table_tensor.index_select(0, _bt_spec),
+            seq_lens.index_select(0, _sl_spec),
             block_size,
             num_spec + 1,
         )
         non_spec_state_indices_tensor = gather_gdn_state_block_ids(
-            block_table_tensor[~block_mask],
-            seq_lens[~seq_mask],
+            block_table_tensor.index_select(0, _bt_non_spec),
+            seq_lens.index_select(0, _sl_non_spec),
             block_size,
             1,
         ).squeeze(1)
     else:
-        spec_state_indices_tensor = block_table_tensor[block_mask, : num_spec + 1]
+        spec_state_indices_tensor = block_table_tensor.index_select(0, _bt_spec)[
+            :, : num_spec + 1
+        ]
         non_spec_state_indices_tensor = select_gdn_state_block_ids(
-            block_table_tensor[~block_mask],
-            num_accepted_tokens[~accepted_mask],
+            block_table_tensor.index_select(0, _bt_non_spec),
+            num_accepted_tokens.index_select(0, _acc_non_spec),
             num_spec,
         )
 
-    spec_num_accepted_tokens = num_accepted_tokens[accepted_mask]
-    spec_state_slot_selectors = spec_state_slot_selectors[selector_mask]
+    spec_num_accepted_tokens = num_accepted_tokens.index_select(0, _acc_spec)
+    _sel_spec, _ = _rows_for(spec_state_slot_selectors)
+    spec_state_slot_selectors = spec_state_slot_selectors.index_select(0, _sel_spec)
     if os.getenv("VLLM_SM70_GDN_STATE_CONTRACT_ASSERT") == "1":
         if spec_num_accepted_tokens.numel() != spec_state_indices_tensor.shape[0]:
             raise AssertionError(
@@ -1778,7 +1805,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_state_slot_selectors = state_contract.spec_state_slot_selectors
             assert spec_query_start_loc is not None
             if common_gdn_metadata is None:
-                assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
+                # ``spec_query_start_loc`` lives on the device, so ``.item()``
+                # forces a cudaStreamSynchronize on every build. The value is
+                # a construction invariant, not input validation, so keep the
+                # check behind the same opt-in gate used by the other GDN sync
+                # asserts in this file. The common_gdn_metadata branch below
+                # already compares host scalars and needs no gate.
+                if envs.VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT:
+                    assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
             else:
                 assert (
                     common_gdn_metadata.num_spec_decode_tokens == num_spec_decode_tokens
