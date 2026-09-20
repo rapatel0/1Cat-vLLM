@@ -6950,6 +6950,43 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                     head_size=self.head_size,
                 )
             )
+            if os.getenv(
+                "VLLM_FLASH_V100_INT8_BLOCK32_SCALAR_FALLBACK", "0"
+            ) != "1":
+                self.flash_attn_decode_paged_xqa(
+                    query,
+                    key_cache,
+                    value_cache,
+                    attn_metadata.block_table,
+                    attn_metadata.seq_lens,
+                    softmax_scale=self.scale,
+                    out=out_view,
+                    kv_cache_dtype="int8_block32",
+                    k_scale=1.0,
+                    v_scale=1.0,
+                    window_size=window_size,
+                    max_seq_len_hint=getattr(
+                        attn_metadata,
+                        "flash_v100_decode_max_seq_len_hint",
+                        None,
+                    ),
+                    workspace_seq_capacity_hint=getattr(
+                        attn_metadata,
+                        "flash_v100_decode_workspace_seq_capacity_hint",
+                        None,
+                    ),
+                    active_num_partitions=getattr(
+                        attn_metadata,
+                        "flash_v100_decode_active_num_partitions",
+                        None,
+                    ),
+                    partition_size_hint=256,
+                    batch_context_routing=False,
+                    key_scales=key_scales,
+                    value_scales=value_scales,
+                )
+                _record_route("decode_int8_block32_xqa")
+                return output
             self.int8_block32_decode_paged(
                 query,
                 key_cache,
@@ -6961,7 +6998,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 out_view,
                 self.scale,
             )
-            _record_route("decode_int8_block32_register")
+            _record_route("decode_int8_block32_register_fallback")
             return output
 
         key_cache, value_cache = _split_paged_kv_cache(kv_cache)

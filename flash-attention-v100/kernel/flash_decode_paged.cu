@@ -5424,14 +5424,15 @@ at::Tensor flash_attention_decode_paged_xqa(
         key_scales->data_ptr<at::Half>());
     const __half* v_scale_ptr = reinterpret_cast<const __half*>(
         value_scales->data_ptr<at::Half>());
+    const bool use_split = q.size(0) >= 4;
 #define LAUNCH_INT8_BLOCK32_XQA(PAGE_SIZE)                                  \
   launch_flash_attention_decode_paged_xqa_tc_256_wide<                      \
-      256, 6, true, kXQATC256WideThreads, 1, PAGE_SIZE, false, false,       \
-      kXQARouteAllSeqLens, false, false, false,                             \
+      256, 6, true, kXQATC256WideThreads, 2, PAGE_SIZE, false, false,       \
+      kXQARouteAllSeqLens, true, false, false,                              \
       flash_v100::KV_CACHE_DTYPE_INT8_BLOCK32>(                             \
       q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits, \
       exp_sums, active_num_partitions, softmax_scale, 1.0f, 1.0f,          \
-      launch_num_partitions, false, 8, stream, 0, 0, 0, true,              \
+      launch_num_partitions, use_split, 16, stream, 0, 0, 0, true,          \
       k_scale_ptr, v_scale_ptr, key_scales->stride(0),                     \
       key_scales->stride(1), value_scales->stride(0),                      \
       value_scales->stride(1))
