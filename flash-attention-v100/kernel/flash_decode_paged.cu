@@ -5416,8 +5416,9 @@ at::Tensor flash_attention_decode_paged_xqa(
                 "INT8 block32 XQA requires q_per_kv=6 and Hkv=1");
     TORCH_CHECK(partition_size == 256,
                 "INT8 block32 XQA requires partition_size=256");
-    TORCH_CHECK(k_cache.size(1) == 1648 || k_cache.size(1) == 3296,
-                "INT8 block32 XQA supports page sizes 1648 and 3296");
+    TORCH_CHECK(k_cache.size(1) == 1568 || k_cache.size(1) == 1648 ||
+                    k_cache.size(1) == 3296,
+                "INT8 block32 XQA supports page sizes 1568, 1648, and 3296");
     TORCH_CHECK(use_padded_smem,
                 "INT8 block32 XQA requires the padded shared-memory path");
     const __half* k_scale_ptr = reinterpret_cast<const __half*>(
@@ -5436,7 +5437,9 @@ at::Tensor flash_attention_decode_paged_xqa(
       k_scale_ptr, v_scale_ptr, key_scales->stride(0),                     \
       key_scales->stride(1), value_scales->stride(0),                      \
       value_scales->stride(1))
-    if (k_cache.size(1) == 1648) {
+    if (k_cache.size(1) == 1568) {
+      LAUNCH_INT8_BLOCK32_XQA(1568);
+    } else if (k_cache.size(1) == 1648) {
       LAUNCH_INT8_BLOCK32_XQA(1648);
     } else {
       LAUNCH_INT8_BLOCK32_XQA(3296);
