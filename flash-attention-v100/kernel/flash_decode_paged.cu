@@ -32,6 +32,9 @@ int kv_cache_dtype_code_from_string(const std::string& kv_cache_dtype) {
   if (kv_cache_dtype == "fp8_e5m2") {
     return flash_v100::KV_CACHE_DTYPE_FP8_E5M2;
   }
+  if (kv_cache_dtype == "int8_block32") {
+    return flash_v100::KV_CACHE_DTYPE_INT8_BLOCK32;
+  }
   return -1;
 }
 
@@ -636,6 +639,27 @@ fp8_e5m2_pair_to_half2_bits(const uint16_t raw_pair) {
          (static_cast<uint32_t>(raw_pair & 0xff00u) << 16);
 }
 
+__device__ __forceinline__ uint4 int8x8_to_half8_scaled(
+    const uint32_t w0, const uint32_t w1, const float scale) {
+  uint32_t out_words[4];
+#pragma unroll
+  for (int i = 0; i < 4; ++i) {
+    const uint32_t word = (i < 2) ? w0 : w1;
+    const int shift = (i & 1) * 16;
+    const int8_t a = static_cast<int8_t>((word >> shift) & 0xffu);
+    const int8_t b = static_cast<int8_t>((word >> (shift + 8)) & 0xffu);
+    const __half2 h2 = __floats2half2_rn(static_cast<float>(a) * scale,
+                                         static_cast<float>(b) * scale);
+    union {
+      __half2 h2;
+      uint32_t u;
+    } conv;
+    conv.h2 = h2;
+    out_words[i] = conv.u;
+  }
+  return make_uint4(out_words[0], out_words[1], out_words[2], out_words[3]);
+}
+
 __device__ __forceinline__ uint4 fp8_e5m2_vector_to_half8(const uint64_t raw) {
   return make_uint4(
       fp8_e5m2_pair_to_half2_bits(static_cast<uint16_t>(raw)),
@@ -742,7 +766,10 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
     const int tile_page_offset, const int kv_tile_start, const int block_size,
     const int kv_head_idx, const int64_t block_stride,
     const int64_t token_stride, const int64_t head_stride,
-    const int panel_offset, const uint16_t* __restrict__ e4m3_lut = nullptr) {
+    const int panel_offset, const uint16_t* __restrict__ e4m3_lut = nullptr,
+    const __half* __restrict__ int8_block_scales = nullptr,
+    const int64_t int8_scale_block_stride = 0,
+    const int64_t int8_scale_head_stride = 0) {
   const int row = copy_idx / panel_d_stride_uint4;
   const int vec_col = copy_idx % panel_d_stride_uint4;
   const int token_offset = tile_page_offset + kv_tile_start + row;
@@ -800,10 +827,24 @@ __device__ __forceinline__ uint4 load_xqa_tc_kv_vector(
   if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP16) {
     const uint4* cache_vec = reinterpret_cast<const uint4*>(kv_cache);
     return __ldg(&cache_vec[physical_offset / 8 + vec_col]);
+  } else if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_INT8_BLOCK32) {
+    const int channel_offset = panel_offset + vec_col * 8;
+    const int channel_block = channel_offset / 32;
+    const int64_t scale_index =
+        static_cast<int64_t>(physical_block) * int8_scale_block_stride +
+        static_cast<int64_t>(kv_head_idx) * int8_scale_head_stride +
+        channel_block;
+    const float scale = __half2float(int8_block_scales[scale_index]);
+    const uint32_t* packed = reinterpret_cast<const uint32_t*>(
+        reinterpret_cast<const int8_t*>(kv_cache) + physical_offset +
+        vec_col * 8);
+    const uint32_t w0 = __ldg(packed);
+    const uint32_t w1 = __ldg(packed + 1);
+    return int8x8_to_half8_scaled(w0, w1, scale);
   } else {
     static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
                       KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
-                  "XQA only supports fp16, FP8 E4M3, and FP8 E5M2 KV");
+                  "XQA only supports fp16, FP8 E4M3, FP8 E5M2, and INT8 block32 KV");
     const uint64_t* cache_vec = reinterpret_cast<const uint64_t*>(kv_cache);
     const uint64_t raw = __ldg(&cache_vec[physical_offset / 8 + vec_col]);
     if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
@@ -831,12 +872,16 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
     const int kv_head_idx, const int64_t block_stride,
     const int64_t token_stride, const int64_t head_stride,
     const int panel_offset, const int copy_thread_idx = threadIdx.x,
-    const uint16_t* __restrict__ e4m3_lut = nullptr) {
+    const uint16_t* __restrict__ e4m3_lut = nullptr,
+    const __half* __restrict__ int8_block_scales = nullptr,
+    const int64_t int8_scale_block_stride = 0,
+    const int64_t int8_scale_head_stride = 0) {
   uint4* shared_vec = reinterpret_cast<uint4*>(shared_kv);
   if constexpr (FP8_PAIR_LOAD) {
     static_assert(KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
-                      KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
-                  "Paired XQA loads require FP8 KV");
+                      KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
+                      KV_DTYPE == flash_v100::KV_CACHE_DTYPE_INT8_BLOCK32,
+                  "Paired XQA loads require FP8 or INT8 block32 KV");
     static_assert(!E4M3_SHARED_LUT,
                   "Paired E4M3 conversion does not use the shared LUT");
     const int pair_stride = panel_d_stride_uint4 / 2;
@@ -891,18 +936,30 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
       const uint4 raw = __ldg(reinterpret_cast<const uint4*>(kv_cache) +
                               physical_offset / 16 + vec_pair);
       const int shared_offset = row * kv_smem_stride_uint4 + vec_pair * 2;
-      const uint64_t raw_lo =
-          static_cast<uint64_t>(raw.x) | (static_cast<uint64_t>(raw.y) << 32);
-      shared_vec[shared_offset] =
-          KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3
-              ? fp8_e4m3fn_vector_to_half8_fast(raw_lo)
-              : fp8_e5m2_vector_to_half8(raw_lo);
-      const uint64_t raw_hi =
-          static_cast<uint64_t>(raw.z) | (static_cast<uint64_t>(raw.w) << 32);
-      shared_vec[shared_offset + 1] =
-          KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3
-              ? fp8_e4m3fn_vector_to_half8_fast(raw_hi)
-              : fp8_e5m2_vector_to_half8(raw_hi);
+      if constexpr (KV_DTYPE == flash_v100::KV_CACHE_DTYPE_INT8_BLOCK32) {
+        const int channel_offset = panel_offset + vec_pair * 16;
+        const int channel_block = channel_offset / 32;
+        const int64_t scale_index =
+            static_cast<int64_t>(physical_block) * int8_scale_block_stride +
+            static_cast<int64_t>(kv_head_idx) * int8_scale_head_stride +
+            channel_block;
+        const float scale = __half2float(int8_block_scales[scale_index]);
+        shared_vec[shared_offset] = int8x8_to_half8_scaled(raw.x, raw.y, scale);
+        shared_vec[shared_offset + 1] = int8x8_to_half8_scaled(raw.z, raw.w, scale);
+      } else {
+        const uint64_t raw_lo =
+            static_cast<uint64_t>(raw.x) | (static_cast<uint64_t>(raw.y) << 32);
+        shared_vec[shared_offset] =
+            KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3
+                ? fp8_e4m3fn_vector_to_half8_fast(raw_lo)
+                : fp8_e5m2_vector_to_half8(raw_lo);
+        const uint64_t raw_hi =
+            static_cast<uint64_t>(raw.z) | (static_cast<uint64_t>(raw.w) << 32);
+        shared_vec[shared_offset + 1] =
+            KV_DTYPE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3
+                ? fp8_e4m3fn_vector_to_half8_fast(raw_hi)
+                : fp8_e5m2_vector_to_half8(raw_hi);
+      }
     }
   } else {
     const int copy_count = valid_kv_tile_rows * panel_d_stride_uint4;
@@ -915,7 +972,9 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel(
                                 E4M3_SHARED_LUT>(
               kv_cache, page_ids, copy_idx, panel_d_stride_uint4,
               tile_page_offset, kv_tile_start, block_size, kv_head_idx,
-              block_stride, token_stride, head_stride, panel_offset, e4m3_lut);
+              block_stride, token_stride, head_stride, panel_offset, e4m3_lut,
+              int8_block_scales, int8_scale_block_stride,
+              int8_scale_head_stride);
     }
   }
 }
@@ -930,11 +989,14 @@ __device__ __forceinline__ void load_int8_block32_kv_panel(
     const int block_size, const int kv_head_idx, const int64_t block_stride,
     const int64_t token_stride, const int64_t head_stride,
     const int64_t scale_block_stride, const int64_t scale_head_stride) {
-  const int copy_count = valid_kv_tile_rows * panel_d_stride_uint4;
-  for (int copy_idx = threadIdx.x; copy_idx < copy_count;
-       copy_idx += NUM_THREADS) {
-    const int row = copy_idx / panel_d_stride_uint4;
-    const int vec_col = copy_idx % panel_d_stride_uint4;
+  const int pair_stride = panel_d_stride_uint4 / 2;
+  const int total_pairs = valid_kv_tile_rows * pair_stride;
+  uint4* shared_vec = reinterpret_cast<uint4*>(shared_kv);
+
+  for (int pair_idx = threadIdx.x; pair_idx < total_pairs;
+       pair_idx += NUM_THREADS) {
+    const int row = pair_idx / pair_stride;
+    const int vec_pair = pair_idx % pair_stride;
     const int token_offset = tile_page_offset + row;
     int logical_block;
     int block_offset;
@@ -949,40 +1011,30 @@ __device__ __forceinline__ void load_int8_block32_kv_panel(
       block_offset = token_offset % block_size;
     }
     const int physical_block = page_ids[logical_block];
-    const int channel_offset = vec_col * 8;
+    const int channel_offset = vec_pair * 16;
+    const int channel_block = channel_offset / 32;
+    const int64_t scale_index =
+        static_cast<int64_t>(physical_block) * scale_block_stride +
+        static_cast<int64_t>(kv_head_idx) * scale_head_stride +
+        channel_block;
+    const float scale = __half2float(block_scales[scale_index]);
+
     const int64_t physical_offset =
         static_cast<int64_t>(physical_block) * block_stride +
         static_cast<int64_t>(block_offset) * token_stride +
-        static_cast<int64_t>(kv_head_idx) * head_stride + channel_offset;
-    const uint32_t* packed_codes = reinterpret_cast<const uint32_t*>(
+        static_cast<int64_t>(kv_head_idx) * head_stride +
+        channel_offset;
+
+    const uint32_t* packed = reinterpret_cast<const uint32_t*>(
         reinterpret_cast<const int8_t*>(kv_cache) + physical_offset);
-    const int channel_block = channel_offset / 32;
-    const float scale = __half2float(
-        block_scales[static_cast<int64_t>(physical_block) * scale_block_stride +
-                     static_cast<int64_t>(kv_head_idx) * scale_head_stride +
-                     channel_block]);
-    uint32_t* destination = reinterpret_cast<uint32_t*>(
-        shared_kv + row * kv_smem_stride_uint4 * 8 + channel_offset);
-#pragma unroll
-    for (int word = 0; word < 2; ++word) {
-      const uint32_t codes = __ldg(packed_codes + word);
-#pragma unroll
-      for (int pair = 0; pair < 2; ++pair) {
-        const int bit_offset = pair * 16;
-        const int8_t first = static_cast<int8_t>((codes >> bit_offset) & 0xffu);
-        const int8_t second =
-            static_cast<int8_t>((codes >> (bit_offset + 8)) & 0xffu);
-        const __half2 values =
-            __floats2half2_rn(static_cast<float>(first) * scale,
-                              static_cast<float>(second) * scale);
-        union {
-          __half2 half2_value;
-          uint32_t packed_value;
-        } converter;
-        converter.half2_value = values;
-        destination[word * 2 + pair] = converter.packed_value;
-      }
-    }
+    const uint32_t w0 = __ldg(packed);
+    const uint32_t w1 = __ldg(packed + 1);
+    const uint32_t w2 = __ldg(packed + 2);
+    const uint32_t w3 = __ldg(packed + 3);
+
+    const int shared_offset = row * kv_smem_stride_uint4 + vec_pair * 2;
+    shared_vec[shared_offset] = int8x8_to_half8_scaled(w0, w1, scale);
+    shared_vec[shared_offset + 1] = int8x8_to_half8_scaled(w2, w3, scale);
   }
 }
 
@@ -997,7 +1049,10 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel_and_zero(
     const int kv_head_idx, const int64_t block_stride,
     const int64_t token_stride, const int64_t head_stride,
     const int panel_offset, const int copy_thread_idx,
-    const uint16_t* __restrict__ e4m3_lut = nullptr) {
+    const uint16_t* __restrict__ e4m3_lut = nullptr,
+    const __half* __restrict__ int8_block_scales = nullptr,
+    const int64_t int8_scale_block_stride = 0,
+    const int64_t int8_scale_head_stride = 0) {
   const int copy_count = valid_kv_tile_rows * panel_d_stride_uint4;
   uint4* shared_vec = reinterpret_cast<uint4*>(shared_kv);
   constexpr int kLoadStages = 4;
@@ -1014,7 +1069,8 @@ __device__ __forceinline__ void load_xqa_tc_kv_panel_and_zero(
                 kv_cache, page_ids, copy_idx, panel_d_stride_uint4,
                 tile_page_offset, kv_tile_start, block_size, kv_head_idx,
                 block_stride, token_stride, head_stride, panel_offset,
-                e4m3_lut);
+                e4m3_lut, int8_block_scales, int8_scale_block_stride,
+                int8_scale_head_stride);
       }
     }
 #pragma unroll
@@ -1311,7 +1367,13 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
         const int64_t v_block_stride, const int64_t v_token_stride,
         const int64_t v_head_stride, const float softmax_scale,
         const float k_scale, const float v_scale, const int route_seq_len_begin,
-        const int route_seq_len_end, const int route_seq_len_final) {
+        const int route_seq_len_end, const int route_seq_len_final,
+        const __half* __restrict__ k_block_scales,
+        const __half* __restrict__ v_block_scales,
+        const int64_t k_scale_block_stride,
+        const int64_t k_scale_head_stride,
+        const int64_t v_scale_block_stride,
+        const int64_t v_scale_head_stride) {
   constexpr int D = 256;
   constexpr int WMMA_M = 8;
   constexpr int WMMA_N = 32;
@@ -1539,7 +1601,8 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
               smem.k_buffer(0), k_cache, smem.page_ids, valid_kv_tile_rows,
               qk_panel_d_stride_uint4, qk_smem_stride_uint4, tile_page_offset,
               kv_tile_start, block_size, kv_head_idx, k_block_stride,
-              k_token_stride, k_head_stride, 0, producer_tid, e4m3_lut);
+              k_token_stride, k_head_stride, 0, producer_tid, e4m3_lut,
+              k_block_scales, k_scale_block_stride, k_scale_head_stride);
         }
         __syncthreads();
 
@@ -1555,7 +1618,8 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
                 qk_smem_stride_uint4, tile_page_offset, kv_tile_start,
                 block_size, kv_head_idx, k_block_stride, k_token_stride,
                 k_head_stride, panel_offset + kQKPanelDim, producer_tid,
-                e4m3_lut);
+                e4m3_lut, k_block_scales, k_scale_block_stride,
+                k_scale_head_stride);
           }
           if (warp_id < kConsumerWarps) {
             const int tile_n = warp_id * WMMA_N;
@@ -1584,7 +1648,8 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
               qk_panel_d_stride_uint4, qk_smem_stride_uint4, tile_page_offset,
               kv_tile_start, block_size, kv_head_idx, k_block_stride,
               k_token_stride, k_head_stride, panel_offset, threadIdx.x,
-              e4m3_lut);
+              e4m3_lut, k_block_scales, k_scale_block_stride,
+              k_scale_head_stride);
           for (int idx = tid + valid_kv_tile_rows * qk_panel_d_stride_uint4;
                idx < kXQATCBlockN * qk_panel_d_stride_uint4;
                idx += NUM_THREADS) {
@@ -1733,7 +1798,8 @@ __global__ void __launch_bounds__(NUM_THREADS, MIN_BLOCKS_PER_SM)
             sV, v_cache, smem.page_ids, valid_kv_tile_rows,
             pv_panel_d_stride_uint4, kv_smem_stride_uint4, tile_page_offset,
             kv_tile_start, block_size, kv_head_idx, v_block_stride,
-            v_token_stride, v_head_stride, panel_offset, threadIdx.x, e4m3_lut);
+            v_token_stride, v_head_stride, panel_offset, threadIdx.x, e4m3_lut,
+            v_block_scales, v_scale_block_stride, v_scale_head_stride);
         for (int idx = tid + valid_kv_tile_rows * pv_panel_d_stride_uint4;
              idx < kXQATCBlockN * pv_panel_d_stride_uint4; idx += NUM_THREADS) {
           const int row = idx / pv_panel_d_stride_uint4;
@@ -3545,7 +3611,13 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
     const bool use_split_reduce, const int split_reduce_dim_tile,
     cudaStream_t stream, const int route_seq_len_begin = 0,
     const int route_seq_len_end = 0, const int route_seq_len_final = 0,
-    const bool launch_reduce = true) {
+    const bool launch_reduce = true,
+    const __half* k_block_scales = nullptr,
+    const __half* v_block_scales = nullptr,
+    const int64_t k_scale_block_stride = 0,
+    const int64_t k_scale_head_stride = 0,
+    const int64_t v_scale_block_stride = 0,
+    const int64_t v_scale_head_stride = 0) {
   static_assert(!E4M3_SHARED_LUT ||
                     KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3,
                 "The shared conversion LUT requires an E4M3 specialization");
@@ -3594,10 +3666,21 @@ void launch_flash_attention_decode_paged_xqa_tc_256_wide(
             k_cache.stride(0), k_cache.stride(1), k_cache.stride(2),           \
             v_cache.stride(0), v_cache.stride(1), v_cache.stride(2),           \
             softmax_scale, k_scale, v_scale, route_seq_len_begin,              \
-            route_seq_len_end, route_seq_len_final);                           \
+            route_seq_len_end, route_seq_len_final, k_block_scales,            \
+            v_block_scales, k_scale_block_stride, k_scale_head_stride,         \
+            v_scale_block_stride, v_scale_head_stride);                        \
   } while (0)
 
-  if constexpr (KV_DTYPE_OVERRIDE == flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
+  if constexpr (KV_DTYPE_OVERRIDE ==
+                flash_v100::KV_CACHE_DTYPE_INT8_BLOCK32) {
+    TORCH_CHECK(k_cache.scalar_type() == at::kChar &&
+                    v_cache.scalar_type() == at::kChar,
+                "INT8 block32 XQA requires int8 KV cache");
+    TORCH_CHECK(k_block_scales != nullptr && v_block_scales != nullptr,
+                "INT8 block32 XQA requires K/V scale tensors");
+    LAUNCH_XQA_PARTITION(flash_v100::KV_CACHE_DTYPE_INT8_BLOCK32);
+  } else if constexpr (KV_DTYPE_OVERRIDE ==
+                       flash_v100::KV_CACHE_DTYPE_FP8_E4M3) {
     static_assert(!(FP8_PAIR_LOAD && E4M3_SHARED_LUT),
                   "Paired E4M3 conversion and the shared LUT are exclusive");
     TORCH_CHECK(k_cache.scalar_type() == at::kByte,
@@ -4854,7 +4937,9 @@ at::Tensor flash_attention_decode_paged_xqa(
     const float softmax_scale, const int partition_size,
     const int launch_num_partitions, const std::string& kv_cache_dtype,
     const float k_scale, const float v_scale, const int window_size_left,
-    const int window_size_right, const int batch_context_max_seq_len) {
+    const int window_size_right, const int batch_context_max_seq_len,
+    const std::optional<at::Tensor>& key_scales_,
+    const std::optional<at::Tensor>& value_scales_) {
   TORCH_CHECK(q.is_cuda(), "q must be on CUDA");
   TORCH_CHECK(k_cache.is_cuda() && v_cache.is_cuda(),
               "k_cache and v_cache must be on CUDA");
@@ -4868,13 +4953,18 @@ at::Tensor flash_attention_decode_paged_xqa(
   const int kv_dtype_code = kv_cache_dtype_code_from_string(kv_cache_dtype);
   TORCH_CHECK(kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16 ||
                   kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E4M3 ||
-                  kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
-              "XQA decode supports fp16, fp8_e4m3, and fp8_e5m2 KV cache "
-              "only");
+                  kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP8_E5M2 ||
+                  kv_dtype_code == flash_v100::KV_CACHE_DTYPE_INT8_BLOCK32,
+              "XQA decode supports fp16, fp8_e4m3, fp8_e5m2, and "
+              "int8_block32 KV cache only");
   if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_FP16) {
     TORCH_CHECK(k_cache.dtype() == torch::kFloat16 &&
                     v_cache.dtype() == torch::kFloat16,
                 "fp16 XQA requires fp16 K/V tensors");
+  } else if (kv_dtype_code == flash_v100::KV_CACHE_DTYPE_INT8_BLOCK32) {
+    TORCH_CHECK(k_cache.dtype() == torch::kInt8 &&
+                    v_cache.dtype() == torch::kInt8,
+                "INT8 block32 XQA requires int8 K/V tensors");
   } else {
     TORCH_CHECK(
         k_cache.dtype() == torch::kUInt8 && v_cache.dtype() == torch::kUInt8,
@@ -4908,6 +4998,38 @@ at::Tensor flash_attention_decode_paged_xqa(
   TORCH_CHECK(k_cache.sizes() == v_cache.sizes(), "K/V cache shape mismatch");
   TORCH_CHECK(k_cache.size(3) == q.size(2), "KV head_dim mismatch");
   TORCH_CHECK(q.size(2) == 256, "XQA decode supports head_dim=256 only");
+  const bool int8_block32_kv =
+      kv_dtype_code == flash_v100::KV_CACHE_DTYPE_INT8_BLOCK32;
+  const at::Tensor* key_scales = nullptr;
+  const at::Tensor* value_scales = nullptr;
+  if (int8_block32_kv) {
+    TORCH_CHECK(key_scales_.has_value() && value_scales_.has_value(),
+                "INT8 block32 XQA requires K/V scale tensors");
+    key_scales = &key_scales_.value();
+    value_scales = &value_scales_.value();
+    TORCH_CHECK(key_scales->is_cuda() && value_scales->is_cuda(),
+                "INT8 block32 XQA scales must be CUDA tensors");
+    TORCH_CHECK(key_scales->device() == q.device() &&
+                    value_scales->device() == q.device(),
+                "INT8 block32 XQA scales must be on the query device");
+    TORCH_CHECK(key_scales->dtype() == torch::kFloat16 &&
+                    value_scales->dtype() == torch::kFloat16,
+                "INT8 block32 XQA scales must be fp16");
+    TORCH_CHECK(key_scales->dim() == 3 && value_scales->dim() == 3,
+                "INT8 block32 XQA scales require [blocks,heads,channel_blocks]");
+    TORCH_CHECK(key_scales->sizes() == value_scales->sizes(),
+                "INT8 block32 XQA K/V scale shapes must match");
+    TORCH_CHECK(key_scales->size(0) == k_cache.size(0) &&
+                    key_scales->size(1) == k_cache.size(2) &&
+                    key_scales->size(2) == k_cache.size(3) / 32,
+                "INT8 block32 XQA scale shape must match KV cache");
+    TORCH_CHECK(key_scales->stride(2) == 1 &&
+                    value_scales->stride(2) == 1,
+                "INT8 block32 XQA scale channel dimension must be contiguous");
+  } else {
+    TORCH_CHECK(!key_scales_.has_value() && !value_scales_.has_value(),
+                "XQA scale tensors are valid only for int8_block32 KV");
+  }
   const int num_heads_q = q.size(1);
   const int num_heads_kv = k_cache.size(2);
   TORCH_CHECK(num_heads_kv > 0 && num_heads_q % num_heads_kv == 0,
@@ -5287,6 +5409,40 @@ at::Tensor flash_attention_decode_paged_xqa(
   const bool padded_smem_enabled = xqa_padded_smem_enabled();
   const bool use_padded_smem =
       padded_smem_enabled && q_per_kv == 6 && partition_size == 256;
+  if (int8_block32_kv) {
+    TORCH_CHECK(q.size(0) >= 1 && q.size(0) <= 8,
+                "INT8 block32 XQA supports batch sizes 1 through 8");
+    TORCH_CHECK(q_per_kv == 6 && k_cache.size(2) == 1,
+                "INT8 block32 XQA requires q_per_kv=6 and Hkv=1");
+    TORCH_CHECK(partition_size == 256,
+                "INT8 block32 XQA requires partition_size=256");
+    TORCH_CHECK(k_cache.size(1) == 1648 || k_cache.size(1) == 3296,
+                "INT8 block32 XQA supports page sizes 1648 and 3296");
+    TORCH_CHECK(use_padded_smem,
+                "INT8 block32 XQA requires the padded shared-memory path");
+    const __half* k_scale_ptr = reinterpret_cast<const __half*>(
+        key_scales->data_ptr<at::Half>());
+    const __half* v_scale_ptr = reinterpret_cast<const __half*>(
+        value_scales->data_ptr<at::Half>());
+#define LAUNCH_INT8_BLOCK32_XQA(PAGE_SIZE)                                  \
+  launch_flash_attention_decode_paged_xqa_tc_256_wide<                      \
+      256, 6, true, kXQATC256WideThreads, 1, PAGE_SIZE, false, false,       \
+      kXQARouteAllSeqLens, false, false, false,                             \
+      flash_v100::KV_CACHE_DTYPE_INT8_BLOCK32>(                             \
+      q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits, \
+      exp_sums, active_num_partitions, softmax_scale, 1.0f, 1.0f,          \
+      launch_num_partitions, false, 8, stream, 0, 0, 0, true,              \
+      k_scale_ptr, v_scale_ptr, key_scales->stride(0),                     \
+      key_scales->stride(1), value_scales->stride(0),                      \
+      value_scales->stride(1))
+    if (k_cache.size(1) == 1648) {
+      LAUNCH_INT8_BLOCK32_XQA(1648);
+    } else {
+      LAUNCH_INT8_BLOCK32_XQA(3296);
+    }
+#undef LAUNCH_INT8_BLOCK32_XQA
+    return out;
+  }
   const bool use_g6_dual_cta_dense = !use_padded_smem &&
                                      k_cache.size(1) == 784 &&
                                      xqa_g6_dual_cta_dense_enabled();
