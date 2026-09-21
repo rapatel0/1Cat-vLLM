@@ -6142,13 +6142,38 @@ at::Tensor flash_attention_decode_paged_xqa(
       k_scale_ptr, v_scale_ptr, key_scales->stride(0),                     \
       key_scales->stride(1), value_scales->stride(0),                      \
       value_scales->stride(1))
-    if (k_cache.size(1) == 1568) {
+#define LAUNCH_INT8_BLOCK32_XQA_P512(PAGE_SIZE)                             \
+  launch_flash_attention_decode_paged_xqa_tc_256_wide<                      \
+      512, 6, true, kXQATC256WideThreads, 2, PAGE_SIZE, false, false,       \
+      kXQARouteAllSeqLens, false, false, false,                             \
+      flash_v100::KV_CACHE_DTYPE_INT8_BLOCK32>(                             \
+      q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits, \
+      exp_sums, active_num_partitions, softmax_scale, 1.0f, 1.0f,          \
+      launch_num_partitions, use_split, 16, stream, 0, 0, 0, true,          \
+      k_scale_ptr, v_scale_ptr, key_scales->stride(0),                     \
+      key_scales->stride(1), value_scales->stride(0),                      \
+      value_scales->stride(1))
+    // Batch-dependent partition dispatch. Measured end-to-end graph
+    // results at 32K: batch 4 runs 5.2 percent faster with 512-token
+    // partitions (fewer, longer-lived CTAs amortize per-CTA setup and
+    // reduce work), while batch 1 and batch 8 measured best with the
+    // 256-token geometry. Dispatch stays on measured points only.
+    if (q.size(0) == 4) {
+      if (k_cache.size(1) == 1568) {
+        LAUNCH_INT8_BLOCK32_XQA_P512(1568);
+      } else if (k_cache.size(1) == 1648) {
+        LAUNCH_INT8_BLOCK32_XQA_P512(1648);
+      } else {
+        LAUNCH_INT8_BLOCK32_XQA_P512(3296);
+      }
+    } else if (k_cache.size(1) == 1568) {
       LAUNCH_INT8_BLOCK32_XQA(1568);
     } else if (k_cache.size(1) == 1648) {
       LAUNCH_INT8_BLOCK32_XQA(1648);
     } else {
       LAUNCH_INT8_BLOCK32_XQA(3296);
     }
+#undef LAUNCH_INT8_BLOCK32_XQA_P512
 #undef LAUNCH_INT8_BLOCK32_XQA
     return out;
   }
