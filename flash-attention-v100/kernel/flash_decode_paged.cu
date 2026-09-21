@@ -5429,7 +5429,7 @@ at::Tensor flash_attention_decode_paged_xqa(
 #define LAUNCH_INT8_BLOCK32_XQA(PAGE_SIZE)                                  \
   launch_flash_attention_decode_paged_xqa_tc_256_wide<                      \
       256, 6, true, kXQATC256WideThreads, 2, PAGE_SIZE, false, false,       \
-      kXQARouteAllSeqLens, true, false, false,                              \
+      kXQARouteAllSeqLens, false, false, false,                             \
       flash_v100::KV_CACHE_DTYPE_INT8_BLOCK32>(                             \
       q, k_cache, v_cache, out, block_table, seq_lens, tmp_out, max_logits, \
       exp_sums, active_num_partitions, softmax_scale, 1.0f, 1.0f,          \
