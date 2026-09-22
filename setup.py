@@ -289,7 +289,8 @@ def remove_rpath(path: Path) -> None:
 
 class CMakeExtension(Extension):
     def __init__(self, name: str, cmake_lists_dir: str = ".", **kwa) -> None:
-        super().__init__(name, sources=[], py_limited_api=not is_freethreaded(), **kwa)
+        kwa.setdefault("py_limited_api", not is_freethreaded())
+        super().__init__(name, sources=[], **kwa)
         self.cmake_lists_dir = os.path.abspath(cmake_lists_dir)
 
 
@@ -894,7 +895,10 @@ class precompiled_wheel_utils:
                     r"flash_qla/ops/gated_delta_rule/chunk/sm70/[^/]+\.so"
                 )
                 sm70_sampler_ext_regex = re.compile(
-                    r"vllm/_sm70_sampler_C(?:\.[^/]+)?\.so$"
+                    r"vllm/_sm70_(?:sampler|exact_reduce)_C(?:\.[^/]+)?\.so$"
+                )
+                h3_ext_regex = re.compile(
+                    r"vllm/_h3_(?:w8a16|flashinfer|flashattn)_C(?:\.[^/]+)?\.so$"
                 )
                 file_members = []
                 for member in wheel.filelist:
@@ -916,6 +920,7 @@ class precompiled_wheel_utils:
                         or flash_attn_v100_ext_regex.match(member.filename)
                         or flash_qla_sm70_ext_regex.match(member.filename)
                         or sm70_sampler_ext_regex.match(member.filename)
+                        or h3_ext_regex.match(member.filename)
                     ):
                         file_members.append(member)
 
@@ -1243,6 +1248,23 @@ if _is_hip():
 if _is_cuda():
     if _cuda_arch_contains(7, 0):
         ext_modules.append(CMakeExtension(name="vllm._sm70_sampler_C"))
+        # These extensions use pybind11/libtorch_python and therefore require
+        # the interpreter-specific CPython ABI suffix emitted by CMake.
+        ext_modules.append(
+            CMakeExtension(name="vllm._sm70_exact_reduce_C", py_limited_api=False)
+        )
+        ext_modules.append(
+            CMakeExtension(name="vllm._h3_w8a16_C", py_limited_api=False)
+        )
+        ext_modules.append(
+            CMakeExtension(name="vllm._h3_flashinfer_C", py_limited_api=False)
+        )
+        ext_modules.append(
+            CMakeExtension(name="vllm._h3_flashattn_C", py_limited_api=False)
+        )
+        ext_modules.append(
+            CMakeExtension(name="vllm._sm70_sparse_attention_C", py_limited_api=False)
+        )
     build_sm70_fa2 = _cuda_arch_contains(7, 0) and not _cuda_arch_at_least(8, 0)
     if _cuda_arch_at_least(8, 0) or build_sm70_fa2:
         ext_modules.append(CMakeExtension(name="vllm.vllm_flash_attn._vllm_fa2_C"))
@@ -1404,7 +1426,19 @@ setup(
             "soundfile",
             "mistral_common[audio]",
         ],  # Required for audio processing
-        "video": [],  # Kept for backwards compatibility
+        "image": ["diffusers==0.40.0", "accelerate>=1.12", "nvidia-ml-py"],
+        "video": [
+            "diffusers==0.40.0",
+            "av>=14",
+            "imageio>=2.37.2",
+            "imageio-ffmpeg>=0.6",
+            "soundfile>=0.13",
+            "scipy",
+            "einops",
+            "omegaconf",
+            "accelerate>=1.12",
+            "nvidia-ml-py",
+        ],
         "flashinfer": [],  # Kept for backwards compatibility
         # Optional deps for Helion kernel development
         # NOTE: When updating helion version, also update CI files:

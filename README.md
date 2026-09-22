@@ -47,6 +47,13 @@ Demo: [4× V100 running Qwen3.8-27B-NVFP4-DFlash2](https://www.bilibili.com/vide
 
 # 📊 Performance First
 
+SM70 Flash-V100 now resolves `--kv-cache-dtype fp8` to E4M3. DFlash2 E4M3
+verification uses repaired FP32 attention state, and the Qwen3.8 DFlash2
+configuration enables FP32 logits by default. Rebuild Flash-V100 for precision
+revision 4; see [the precision contract and validation](docs/design/sm70_dflash2_fp32_defaults.md).
+Historical E5M2/FP16-partial performance results below keep their original
+configuration and are not speed claims for these precision defaults.
+
 ## Long-Context Attention: 17.92 → 47.1 → ≈60.8 TFLOP/s
 
 | Stage | Evidence | Useful causal Attention compute | Notes |
@@ -1151,15 +1158,11 @@ Current directions include:
 
 # 💬 WeChat Community
 
-Join the **1Cat-vLLM Open-Source Community Group 5** by scanning the latest QR code below. Click the image to open it at full resolution.
+Join the **1Cat-vLLM Open-Source Community Group 8** by scanning the latest QR code below. Click the image to open it at full resolution.
 
-<p align="center">
-  <a href="./assets/wechat-group-5.jpg">
-    <img src="./assets/wechat-group-5.jpg" alt="WeChat QR code for 1Cat-vLLM Open-Source Community Group 5" width="420">
-  </a>
-</p>
+<img width="966" height="1518" alt="472f168308d5e697058d30e51ffb2f4c" src="https://github.com/user-attachments/assets/fa8c71be-6a81-491e-895a-04bca665cceb" />
 
-> This QR code is valid through **September 7, 2026**. WeChat group QR codes expire periodically; if it has expired, add WeChat ID **`YM_isi`** to request the latest invitation.
+> This QR code is valid through **September 20, 2026**. WeChat group QR codes expire periodically; if it has expired, add WeChat ID **`YM_isi`** to request the latest invitation.
 
 ---
 

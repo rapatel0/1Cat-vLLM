@@ -39,7 +39,7 @@ class SM70TurboMindLinearState:
 
 
 # States retain only data_ptr(), so this cache owns the bounded allocation.
-_nvfp4_qpn4_dense_workspaces: dict[tuple[int, torch.dtype], torch.Tensor] = {}
+_nvfp4_qpn4_dense_workspaces: dict[tuple, torch.Tensor] = {}
 
 
 def clear_sm70_turbomind_workspaces() -> None:
@@ -351,13 +351,14 @@ def get_nvfp4_qpn4_dense_workspace(weight: torch.Tensor) -> torch.Tensor | None:
     device_index = weight.device.index
     if device_index is None:
         device_index = torch.accelerator.current_device_index()
-    cache_key = (device_index, torch.float16)
+    elements = max(NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS, weight.numel() * 2)
+    cache_key = (device_index, torch.float16, elements)
     workspace = _nvfp4_qpn4_dense_workspaces.get(cache_key)
     if workspace is not None:
         return workspace
     try:
         workspace = torch.empty(
-            (NVFP4_QPN4_DENSE_WORKSPACE_ELEMENTS,),
+            (elements,),
             dtype=torch.float16,
             device=weight.device,
         )
@@ -444,6 +445,16 @@ def apply_prepared_linear(
             state.weight,
             state.scales,
             state.group_size,
+            state.k_ld,
+            state.q_ld,
+        )
+    elif state.op_kind == "nvfp4" and state.use_scale_code:
+        sm70_ops.nvfp4_qpn2_compact_tm_gemm_sm70_out(
+            out,
+            reshaped_x,
+            state.weight,
+            state.scales,
+            state.global_scale,
             state.k_ld,
             state.q_ld,
         )

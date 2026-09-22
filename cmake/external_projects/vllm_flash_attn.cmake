@@ -94,6 +94,45 @@ install(CODE "set(CMAKE_INSTALL_PREFIX \"\${CMAKE_INSTALL_PREFIX}/vllm/\")" ALL_
 FetchContent_MakeAvailable(vllm-flash-attn)
 message(STATUS "vllm-flash-attn is available at ${vllm-flash-attn_SOURCE_DIR}")
 
+# Keep the precision-qualified SM70 prefill route in the parent repository.
+# Its private CUTLASS visitors have distinct types and do not modify the
+# legacy FA2 headers or operators, which remain available for rollback.
+if(VLLM_FLASH_ATTN_SM70 AND TARGET _vllm_fa2_C)
+  set(SM70_V37_DIR "${CMAKE_CURRENT_LIST_DIR}/../../csrc/attention/sm70_v37")
+  set(SM70_V37_CUDA_SRCS
+    "${SM70_V37_DIR}/prefill.cu"
+    "${SM70_V37_DIR}/tail.cu"
+    "${SM70_V37_DIR}/bridge.cu")
+  # FA2 is created in a child directory. Source properties must be visible in
+  # that target's scope; setting them only in the parent silently loses SM70.
+  set_source_files_properties(${SM70_V37_CUDA_SRCS}
+    TARGET_DIRECTORY _vllm_fa2_C
+    PROPERTIES COMPILE_OPTIONS "-gencode=arch=compute_70,code=sm_70")
+  target_sources(_vllm_fa2_C PRIVATE
+    ${SM70_V37_CUDA_SRCS}
+    "${SM70_V37_DIR}/register.cpp")
+endif()
+
+# The grouped E4M3 FP32 long-context route ships inside the same extension, so
+# the accelerated path is available without an externally built DSO.
+if(VLLM_FLASH_ATTN_SM70 AND TARGET _vllm_fa2_C)
+  set(SM70_GROUPED_LONG_DIR
+      "${CMAKE_CURRENT_LIST_DIR}/../../csrc/attention/sm70_grouped_long")
+  set(SM70_GROUPED_LONG_SRC
+      "${SM70_GROUPED_LONG_DIR}/kernel/grouped-attention.cu"
+      "${SM70_GROUPED_LONG_DIR}/kernel/scalar-attention.cu")
+  # Flags mirror the manifest the operator was qualified with. As with v37, the
+  # properties must be set in the target scope or SM70 silently loses them.
+  set_source_files_properties(${SM70_GROUPED_LONG_SRC}
+    TARGET_DIRECTORY _vllm_fa2_C
+    PROPERTIES COMPILE_OPTIONS
+      "-gencode=arch=compute_70,code=sm_70;-O3;-std=c++17;--use_fast_math;--expt-relaxed-constexpr;--expt-extended-lambda;-U__CUDA_NO_HALF_OPERATORS__;-U__CUDA_NO_HALF_CONVERSIONS__;-U__CUDA_NO_HALF2_OPERATORS__")
+  target_include_directories(_vllm_fa2_C PRIVATE "${SM70_GROUPED_LONG_DIR}/include")
+  target_sources(_vllm_fa2_C PRIVATE ${SM70_GROUPED_LONG_SRC})
+endif()
+
+include("${CMAKE_CURRENT_LIST_DIR}/../sm70_79t.cmake")
+
 # Restore the install prefix after FA's install rules
 install(CODE "set(CMAKE_INSTALL_PREFIX \"\${OLD_CMAKE_INSTALL_PREFIX}\")" ALL_COMPONENTS)
 install(CODE "set(CMAKE_INSTALL_LOCAL_ONLY TRUE)" ALL_COMPONENTS)

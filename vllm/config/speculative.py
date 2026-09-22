@@ -152,6 +152,12 @@ class SpeculativeConfig:
     warn users when they mistakenly provide the wrong argument."""
 
     # Draft model configuration
+    mtp_expert_quantization: Literal["fp8"] | None = None
+    """Opt in to FP8-resident Qwen4Exp MTP experts on SM70 with an AWQ or
+    ModelOpt checkpoint whose MTP experts are unquantized. Serialized block-FP8
+    MTP experts use their checkpoint scales without this online-conversion flag.
+    Target weights are unchanged.
+    """
     quantization: me_quant.QuantizationMethods | str | None = None
     """Quantization method that was used to quantize the draft model weights.
     If `None`, we assume the model weights are not quantized. Note that it only
@@ -385,6 +391,12 @@ class SpeculativeConfig:
             or self.use_dspark()
         )
         factors.append(uses_aux_hidden_states)
+
+        # Online FP8 changes the draft expert kernels and padded weight layout.
+        # Include None too: old MTP artifacts may have been compiled with FP8
+        # under the same key as FP16, before this field was hashed.
+        if self.method == "mtp":
+            factors.append(("mtp_expert_quantization", self.mtp_expert_quantization))
 
         # The specific layers used also affect the computation graph
         if uses_aux_hidden_states and self.draft_model_config is not None:
@@ -890,6 +902,7 @@ class SpeculativeConfig:
                     MTPModelTypes
                 ):
                     self.method = "mtp"
+                    self._inherit_target_rope_for_extended_native_mtp()
                     if (
                         self.num_speculative_tokens > 1
                         and self.draft_model_config.hf_config.model_type
@@ -1091,6 +1104,96 @@ class SpeculativeConfig:
                 f"stage [{last_start}, {last_end}); got {layer_ids}. Adjust "
                 "VLLM_PP_LAYER_PARTITION or the DSpark layer contract."
             )
+
+    def _inherit_target_rope_for_extended_native_mtp(self) -> None:
+        """Validate and inherit target YaRN for an extended native drafter."""
+        if (
+            self.method != "mtp"
+            or self.max_model_len is None
+            or self.target_model_config is None
+            or self.draft_model_config is None
+            or self.model != self.target_model_config.model
+        ):
+            return
+
+        draft_text_config = get_hf_text_config(self.draft_model_config.hf_config)
+        draft_native_limit = getattr(draft_text_config, "max_position_embeddings", None)
+        if draft_native_limit is None or self.max_model_len <= draft_native_limit:
+            return
+
+        target_text_config = get_hf_text_config(self.target_model_config.hf_config)
+        rope_parameters = getattr(target_text_config, "rope_parameters", None)
+        # A checkpoint may already carry valid scaling (including non-YaRN
+        # scaling). Preserve it when both models agree and its derived limit
+        # covers the request. Only missing extensions need target inheritance.
+        if (
+            getattr(draft_text_config, "rope_parameters", None) == rope_parameters
+            and self.max_model_len <= self.draft_model_config.get_and_verify_max_len(-1)
+        ):
+            return
+        if (
+            not isinstance(rope_parameters, dict)
+            or rope_parameters.get("rope_type") != "yarn"
+        ):
+            raise ValueError(
+                "Extending native MTP beyond max_position_embeddings requires "
+                "explicit target YaRN rope_parameters; got "
+                f"{rope_parameters!r}."
+            )
+
+        original_limit = rope_parameters.get("original_max_position_embeddings")
+        factor = rope_parameters.get("factor")
+        try:
+            if original_limit is None or factor is None:
+                raise TypeError("YaRN original limit and factor must be present")
+            original_limit_value = float(original_limit)
+            factor_value = float(factor)
+            draft_native_limit_value = float(draft_native_limit)
+        except (TypeError, ValueError, OverflowError) as error:
+            raise ValueError(
+                "Native MTP YaRN extension requires numeric "
+                "original_max_position_embeddings and factor."
+            ) from error
+
+        if (
+            not math.isfinite(original_limit_value)
+            or not math.isfinite(factor_value)
+            or original_limit_value <= 0
+            or factor_value <= 1
+            or original_limit_value != draft_native_limit_value
+        ):
+            raise ValueError(
+                "Native MTP YaRN extension requires the target's positive "
+                "original_max_position_embeddings to match the drafter's "
+                "native max_position_embeddings and factor to be greater "
+                f"than one; got original={original_limit!r}, "
+                f"native={draft_native_limit!r}, factor={factor!r}."
+            )
+
+        scaled_limit = original_limit_value * factor_value
+        if not math.isfinite(scaled_limit):
+            raise ValueError(
+                "Native MTP YaRN extension requires a finite scaled limit."
+            )
+        validated_yarn_limit = int(scaled_limit)
+        validated_limit = min(
+            validated_yarn_limit,
+            self.target_model_config.max_model_len,
+        )
+        if self.max_model_len > validated_limit:
+            raise ValueError(
+                f"Native MTP max_model_len={self.max_model_len} exceeds the "
+                f"validated target YaRN limit={validated_limit}."
+            )
+
+        draft_text_config.rope_parameters = copy.deepcopy(rope_parameters)
+        logger.info(
+            "Extended native MTP context from %s to %s with validated target "
+            "YaRN parameters (factor=%s).",
+            draft_native_limit,
+            self.max_model_len,
+            factor,
+        )
 
     def _validate_suffix_decoding(self):
         if not has_arctic_inference():
@@ -1301,6 +1404,7 @@ class SpeculativeConfig:
                     "dflash_ddtree tree verification is enabled."
                 )
 
+        self._verify_mtp_expert_quantization()
         if self.rejection_sample_method == "synthetic":
             # Consolidate to per-position rates
             self.synthetic_acceptance_rates = self._resolve_synthetic_acceptance_rates(
@@ -1325,6 +1429,23 @@ class SpeculativeConfig:
 
         self.verify_equal_vocab_size_if_draft_model()
         return self
+
+    def _verify_mtp_expert_quantization(self):
+        if self.mtp_expert_quantization is None:
+            return
+        from vllm.platforms import current_platform
+
+        if not current_platform.is_cuda() or not current_platform.is_device_capability(
+            (7, 0)
+        ):
+            raise ValueError("mtp_expert_quantization currently requires CUDA SM70")
+        hf_config = getattr(self.draft_model_config, "hf_config", None)
+        if self.method != "mtp" or getattr(hf_config, "architectures", []) != [
+            "Qwen4ExpMTP"
+        ]:
+            raise ValueError("mtp_expert_quantization currently requires Qwen4Exp MTP")
+        if self.rejection_sample_method != "standard":
+            raise ValueError("FP8 MTP requires standard rejection sampling")
 
     def verify_equal_vocab_size_if_draft_model(self):
         if (

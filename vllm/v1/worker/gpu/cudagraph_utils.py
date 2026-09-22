@@ -1,8 +1,9 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import os
 from collections import defaultdict
 from collections.abc import Callable
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, NamedTuple
 
 import torch
@@ -56,6 +57,22 @@ def get_explicit_cudagraph_memory_reserve(cudagraph_mode: CUDAGraphMode) -> int:
     return reserve_bytes
 
 
+def get_sm70_cudagraph_memory_reserve(
+    cudagraph_mode: CUDAGraphMode, activation_peak_bytes: int
+) -> int:
+    """Budget a profiled activation peak for graph pools, unless overridden.
+
+    V2 cannot capture the real graphs before allocating KV. Reserve the measured
+    forward scratch peak instead of silently reserving zero on SM70. This is an
+    admission estimate, not a hard cap on the CUDA caching allocator.
+    """
+    if "VLLM_V2_CUDAGRAPH_MEM_MIB" in os.environ:
+        return get_explicit_cudagraph_memory_reserve(cudagraph_mode)
+    if cudagraph_mode == CUDAGraphMode.NONE:
+        return 0
+    return max(0, activation_peak_bytes)
+
+
 def _use_split_sm70_mtp_cudagraphs(vllm_config: VllmConfig) -> bool:
     speculative_config = vllm_config.speculative_config
     return bool(
@@ -100,6 +117,7 @@ class BatchExecutionDescriptor:
     num_tokens: int
     num_reqs: int | None  # None means no request padding is needed (PIECEWISE graphs)
     uniform_token_count: int | None = None
+    attention_context_bucket: int | None = None
 
 
 def _is_compatible(
@@ -164,6 +182,27 @@ class CudaGraphManager:
                     "query lengths %s.",
                     self.decode_query_lens,
                 )
+        self._sm70_dflash2_tail_graphs = bool(
+            envs.VLLM_SM70_DFLASH2_TAIL_CUDAGRAPHS
+            and isinstance(self, ModelCudaGraphManager)
+            and speculative_config is not None
+            and speculative_config.method == "dflash"
+            and decode_query_len == 8
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+            and not self.compilation_config.pass_config.enable_sp
+        )
+        if self._sm70_dflash2_tail_graphs:
+            # Target verifier tails are independent of adaptive lookup. The
+            # drafter always produces its trained block width and must not
+            # capture these target-only shapes.
+            self.decode_query_lens = tuple(
+                dict.fromkeys((*self.decode_query_lens, *range(7, 0, -1)))
+            )
+            logger.info_once(
+                "Capturing SM70 DFlash2 target tail query lengths %s.",
+                self.decode_query_lens,
+            )
 
         self.dp_size = vllm_config.parallel_config.data_parallel_size
         self.tp_size = vllm_config.parallel_config.tensor_parallel_size
@@ -202,10 +241,10 @@ class CudaGraphManager:
             # B1 short verification can still replay a graph when
             # max_num_seqs=1.
             if len(self.decode_query_lens) > 1:
-                short_query_len = min(self.decode_query_lens)
-                if short_query_len not in self._capture_sizes:
-                    self._capture_sizes.append(short_query_len)
-                    self._capture_sizes.sort()
+                for query_len in self.decode_query_lens:
+                    if query_len not in self._capture_sizes:
+                        self._capture_sizes.append(query_len)
+                self._capture_sizes.sort()
         self._init_candidates()
 
     def _init_candidates(self) -> None:
@@ -231,6 +270,14 @@ class CudaGraphManager:
                         query_len <= num_tokens <= self.max_num_reqs * query_len
                         and num_tokens % query_len == 0
                     ):
+                        if (
+                            self._sm70_dflash2_tail_graphs
+                            and query_len < self.decode_query_len
+                            and num_tokens != query_len
+                        ):
+                            # Only single-request tails are admitted. Avoid
+                            # changing batching routes or multiplying captures.
+                            continue
                         desc = BatchExecutionDescriptor(
                             cg_mode=decode_mode,
                             num_tokens=num_tokens,
@@ -405,6 +452,77 @@ class ModelCudaGraphManager(CudaGraphManager):
         self.aux_hidden_states: list[torch.Tensor] = []
         self.use_aux_hidden_state_outputs = False
         self.intermediate_tensors: IntermediateTensors | None = None
+        self._long_attention_graphs: dict[
+            BatchExecutionDescriptor, BatchExecutionDescriptor
+        ] = {}
+        from vllm.v1.attention.ops.sm70_e4m3_long import (
+            long_attention_enabled,
+            long_attention_graph_contract,
+        )
+        from vllm.v1.attention.ops.sm70_e4m3_scalar import (
+            scalar_tail_attention_available,
+        )
+
+        if (
+            long_attention_enabled()
+            and current_platform.is_cuda()
+            and current_platform.is_device_capability((7, 0))
+            and self.dp_size == 1
+            and vllm_config.parallel_config.pipeline_parallel_size == 1
+        ):
+            # The served window decides the bound, not a literal: the operator's
+            # manifest only says what it was qualified for. A caller that carries
+            # no model config leaves the bound at the declared capability.
+            model_config = getattr(vllm_config, "model_config", None)
+            served = int(getattr(model_config, "max_model_len", 0) or 0)
+            context_limit, query_rows = long_attention_graph_contract(served or None)
+            if context_limit is not None:
+                if self._sm70_dflash2_tail_graphs and (
+                    bool(envs.VLLM_SM70_DFLASH2_SCALAR_ATTENTION_MANIFEST)
+                    or scalar_tail_attention_available()
+                ):
+                    query_rows = (1, *query_rows)
+                descs = self._capture_descs.get(CUDAGraphMode.FULL, [])
+                for desc in list(descs):
+                    if (
+                        desc.num_reqs == 1
+                        and desc.uniform_token_count in query_rows
+                        and desc.num_tokens == desc.uniform_token_count
+                    ):
+                        variant = replace(desc, attention_context_bucket=context_limit)
+                        self._long_attention_graphs[desc] = variant
+                        descs.append(variant)
+                logger.info_once(
+                    "SM70 E4M3 long-context graph variants captured at bound=%d "
+                    "for query rows %s (served window=%s).",
+                    context_limit,
+                    tuple(query_rows),
+                    served or "unknown",
+                    scope="process",
+                )
+
+    def select_attention_graph(
+        self, desc: BatchExecutionDescriptor, cpu_upper_bounds: torch.Tensor
+    ) -> BatchExecutionDescriptor:
+        variant = self._long_attention_graphs.get(desc)
+        if variant is None or variant not in self.graphs:
+            return desc
+        # Never materialize device lengths on the host. A missing or oversized
+        # CPU hint conservatively selects the existing full-context graph.
+        if cpu_upper_bounds.device.type != "cpu" or cpu_upper_bounds.numel() != 1:
+            return desc
+        upper = int(cpu_upper_bounds[0])
+        limit = variant.attention_context_bucket
+        if limit is None:
+            return desc
+        if desc.uniform_token_count == 1 and upper * 2 < limit:
+            # The compact scalar route is admitted for long-context tails only.
+            # "Long" is half the captured bound rather than a literal, so a
+            # different served window keeps the same behaviour.
+            return desc
+        if 0 < upper <= limit:
+            return variant
+        return desc
 
     def capture(
         self,
@@ -461,10 +579,16 @@ class ModelCudaGraphManager(CudaGraphManager):
 
             def forward_fn(cg_mode: CUDAGraphMode) -> None:
                 batch_descriptor = None
-                if cg_mode == CUDAGraphMode.PIECEWISE:
-                    assert attn_metadata is None
+                if (
+                    cg_mode == CUDAGraphMode.PIECEWISE
+                    or desc.attention_context_bucket is not None
+                ):
+                    if cg_mode == CUDAGraphMode.PIECEWISE:
+                        assert attn_metadata is None
                     batch_descriptor = BatchDescriptor(
-                        num_tokens=num_tokens, has_lora=has_lora
+                        num_tokens=num_tokens,
+                        has_lora=has_lora,
+                        attention_context_bucket=desc.attention_context_bucket,
                     )
                 with (
                     sm70_decode_graph_compilation(desc.cg_mode == CUDAGraphMode.FULL),

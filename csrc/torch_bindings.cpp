@@ -358,6 +358,32 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor[]");
   ops.impl("nvfp4_qpn2_prepare_sm70", torch::kCUDA, &nvfp4_qpn2_prepare_sm70);
 
+  ops.def("nvfp4_qpn2_prepare_scales_sm70(Tensor weight_scale) -> Tensor");
+  ops.def(
+      "nvfp4_qpn2_restore_tm_scales_sm70_out(Tensor(a!) out, "
+      "Tensor scales, float global_scale) -> ()");
+  ops.impl("nvfp4_qpn2_restore_tm_scales_sm70_out", torch::kCUDA,
+           &nvfp4_qpn2_restore_tm_scales_sm70_out);
+  // Python may be newer than the loaded extension. Only this version retains
+  // compact-scale scratch across layers in larger CUDA graphs.
+  ops.def("nvfp4_qpn2_compact_scales_version_sm70() -> int",
+          []() -> int64_t { return 1; });
+  ops.def(
+      "nvfp4_qpn2_compact_tm_gemm_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor weight, Tensor scales, float global_scale, int k_ld, "
+      "int q_ld, bool gated_silu) -> ()");
+  ops.impl("nvfp4_qpn2_compact_tm_gemm_sm70_out", torch::kCUDA,
+           &nvfp4_qpn2_compact_tm_gemm_sm70_out);
+  ops.impl("nvfp4_qpn2_prepare_scales_sm70", torch::kCUDA,
+           &nvfp4_qpn2_prepare_scales_sm70);
+  ops.def(
+      "nvfp4_qpn2_tm_dispatch_sm70_out(Tensor(a!) out, Tensor input, "
+      "Tensor tm_weight, Tensor scales, float global_scale, int split_k, "
+      "int accumulator_chains, Tensor tm_scales, int tm_group_size, "
+      "int tm_k_ld, int tm_q_ld, bool gated_silu, int min_prefill_m) -> ()");
+  ops.impl("nvfp4_qpn2_tm_dispatch_sm70_out", torch::kCUDA,
+           &nvfp4_qpn2_tm_dispatch_sm70_out);
+
   ops.def(
       "nvfp4_qpn2_gemm_sm70_out(Tensor(a!) out, Tensor input, Tensor codes, "
       "Tensor scales, float global_scale, int split_k, "
@@ -618,6 +644,18 @@ TORCH_LIBRARY_EXPAND(TORCH_EXTENSION_NAME, ops) {
       "Tensor ptrs_s, int total_slots, int k, int n, int group_size) -> ()");
   ops.impl("awq_moe_active_dense_stage_sm70_out", torch::kCUDA,
            &awq_moe_active_dense_stage_sm70_out);
+
+  ops.def(
+      "awq_moe_chunked_w2_sm70_out("
+      "Tensor(a!) out, Tensor(b!) chunk_output, Tensor input, "
+      "Tensor expert_offsets, Tensor permuted_idx, Tensor topk_weights, "
+      "Tensor(c!) chunk_expert_offsets, Tensor(d!) chunk_range_begin, "
+      "Tensor(e!) chunk_range_end, Tensor(f!) chunk_a_indices, "
+      "Tensor(g!) chunk_inv_permuted_idx, Tensor ptrs_w, Tensor ptrs_s, "
+      "int num_tokens, int top_k, int num_experts, int k, int n, "
+      "int hidden_logical_size, int group_size, int chunk_tokens) -> ()");
+  ops.impl("awq_moe_chunked_w2_sm70_out", torch::kCUDA,
+           &awq_moe_chunked_w2_sm70_out);
 
   ops.def(
       "awq_moe_single_token_dense_stage_sm70_out("

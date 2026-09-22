@@ -80,11 +80,13 @@ DEFAULT_V2_MODEL_RUNNER_ARCHITECTURES = frozenset(
         "Qwen4ExpForConditionalGeneration",
     }
 )
-_SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16)
+_SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 16, 32)
 _SM70_MTP_CUDAGRAPH_REQUEST_SIZES = (1, 2, 3, 4, 6, 8, 12, 16)
 _SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES = (1, 2, 4, 8, 9, 18)
 
 _SM70_DFLASH2_VERIFIER_DEFAULTS = {
+    # Preserve candidate and dense logits in FP32 through sampling.
+    "VLLM_SM70_DFLASH2_FP32_LOGITS": "1",
     # This is the target projection's memory-neutral FP8 layout, not the
     # rejected draft-MLP QPN8 experiment. Per-layer TP/shape checks retain the
     # original layout whenever the exact operator contract is unavailable.
@@ -97,6 +99,9 @@ _SM70_DFLASH2_VERIFIER_DEFAULTS = {
     "VLLM_SM70_DFLASH2_FUSED_GDN_NORM": "1",
     "VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT": "1",
     "VLLM_SM70_DFLASH2_FUSED_GEMMA_RMS": "1",
+    # Keep the no-residual/FP16-residual reductions consistent across ranks
+    # and process starts. Autotuning them perturbs the initial GDN state.
+    "VLLM_SM70_DFLASH2_FIXED_GEMMA_RMS": "1",
     "VLLM_SM70_DFLASH2_FUSED_SMALLQ_METADATA": "1",
     "VLLM_SM70_DFLASH2_GROUPED_SMALLQ_METADATA": "1",
     "VLLM_SM70_DFLASH2_SPARSE_TARGET_REJECTION": "1",
@@ -218,6 +223,98 @@ def _is_sm70_qwen38_nomtp_dual_compile_contract(
     )
 
 
+def _participating_cuda_device_ids(cfg: "VllmConfig") -> tuple[int, ...]:
+    """Local device assignment used by UniProc/Multiproc and GPUWorker.
+
+    Visibility is not participation: unused devices must not change engine
+    defaults. Ray/custom placement is not known here, so preserve the legacy
+    device-zero decision for those executors instead of guessing their ranks.
+    """
+    from vllm.platforms import current_platform
+
+    if not current_platform.is_cuda() or current_platform.device_count() == 0:
+        return ()
+    parallel = cfg.parallel_config
+    backend = parallel.distributed_executor_backend
+    if backend == "external_launcher":
+        return (int(os.environ.get("LOCAL_RANK", "0")),)
+    if backend not in (None, "uni", "mp") or parallel.data_parallel_backend == "ray":
+        return (0,)
+    start = 0
+    if parallel.world_size == 1:
+        device = cfg.device_config.device
+        if isinstance(device, torch.device) and device.index is not None:
+            start = device.index
+    if parallel.nnodes_within_dp == 1:
+        dp_rank = parallel.data_parallel_rank_local
+        if dp_rank is None:
+            dp_rank = parallel.data_parallel_index
+        start += (
+            dp_rank * parallel.tensor_parallel_size * parallel.pipeline_parallel_size
+        )
+    return tuple(range(start, start + parallel.local_world_size))
+
+
+def _apply_sm70_qwen38_nomtp_defaults(
+    cfg: "VllmConfig", *, is_sm70: bool
+) -> tuple[str, ...]:
+    """Complete the admitted NVFP4 baseline without global experimental defaults."""
+    if not is_sm70 or not _is_sm70_qwen38_nomtp_dual_compile_contract(
+        cfg.model_config, cfg.speculative_config, cfg.parallel_config
+    ):
+        return ()
+    parallel = cfg.parallel_config
+    if (
+        cfg.model_config.quantization != "modelopt_fp4"
+        or cfg.lora_config is not None
+        or parallel.enable_expert_parallel
+        or parallel.enable_dbo
+        or parallel.data_parallel_size != 1
+        or parallel.nnodes_within_dp != 1
+        or cfg.cache_config.cache_dtype not in ("auto", "float16")
+        or cfg.cache_config.mamba_ssm_cache_dtype not in ("auto", "float32")
+    ):
+        return ()
+
+    defaults = {
+        "VLLM_SM70_QWEN38_FP16_GEMV": "1",
+        "VLLM_SM70_QWEN38_FUSED_GDN_INPUT_FP16": "1",
+        "VLLM_SM70_QWEN38_FUSED_HC_FP16": "1",
+        "VLLM_QWEN3NEXT_ENABLE_SHARED_MOE_OVERLAP": "1",
+        "VLLM_SM70_MOE_ADD_ALLREDUCE": "1",
+    }
+    applied = []
+    for name, value in defaults.items():
+        if name not in os.environ:
+            os.environ[name] = value
+            applied.append(name)
+    return tuple(applied)
+
+
+def _any_participating_device_is_capability(
+    cfg: "VllmConfig", capability: tuple[int, int]
+) -> bool:
+    from vllm.platforms import current_platform
+
+    return any(
+        current_platform.is_device_capability(capability, device_id=device_id)
+        for device_id in _participating_cuda_device_ids(cfg)
+    )
+
+
+def _any_participating_device_is_pre_ampere(cfg: "VllmConfig") -> bool:
+    """Whether any participating CUDA device is Volta or Turing.
+
+    The SM70 Flash-V100 baseline is a pre-Ampere tuning, not a Volta tuning:
+    both capabilities take the same kernels, the same fp16 accumulation
+    contract and the same compile graph. Gating it on exactly (7, 0) leaves a
+    Turing-only deployment unconfigured, and that does not merely run slower.
+    """
+    return _any_participating_device_is_capability(
+        cfg, (7, 0)
+    ) or _any_participating_device_is_capability(cfg, (7, 5))
+
+
 def _apply_sm70_dflash2_verifier_defaults() -> tuple[str, ...]:
     """Set quality-audited defaults while preserving every explicit override."""
     applied = []
@@ -242,7 +339,10 @@ def _apply_sm70_qwen38_hybrid_ple_defaults(
 
 
 def _sm70_nomtp_cudagraph_capture_sizes(max_num_seqs: int) -> list[int]:
-    max_graph_reqs = min(max(int(max_num_seqs), 1), 16)
+    # B32 is the largest concurrency with end-to-end SM70 graph validation.
+    # Keep larger scheduler capacities usable through the regular piecewise
+    # path without forcing an unvalidated, memory-heavy full-graph capture.
+    max_graph_reqs = min(max(int(max_num_seqs), 1), 32)
     capture_sizes = {
         size for size in _SM70_NOMTP_CUDAGRAPH_CAPTURE_SIZES if size <= max_graph_reqs
     }
@@ -417,10 +517,14 @@ def _sm70_speculative_cudagraph_capture_sizes(
     decode_query_len: int,
 ) -> list[int]:
     """Return bounded auxiliary and verifier shapes without a TP contract."""
-    verifier_sizes = _sm70_mtp_cudagraph_capture_sizes(
-        max_num_seqs,
-        decode_query_len,
-    )
+    # DFlash verification has the same B32 attention/layout coverage as
+    # ordinary decode. A 16-request cap leaves C32 outside CUDA Graph replay.
+    max_graph_reqs = min(max(int(max_num_seqs), 1), 32)
+    request_sizes = {
+        size for size in _SM70_MTP_CUDAGRAPH_REQUEST_SIZES if size <= max_graph_reqs
+    }
+    request_sizes.add(max_graph_reqs)
+    verifier_sizes = [decode_query_len * size for size in request_sizes]
     return sorted(
         set(_SM70_SPECULATIVE_AUX_CUDAGRAPH_CAPTURE_SIZES) | set(verifier_sizes)
     )
@@ -572,10 +676,15 @@ def apply_prefix_anchored_swa_constraints(cfg: "VllmConfig") -> None:
     from vllm.platforms import current_platform
     from vllm.v1.attention.backends.registry import AttentionBackendEnum
 
-    if not (
-        current_platform.is_cuda() and current_platform.is_device_capability((7, 0))
+    devices = _participating_cuda_device_ids(cfg)
+    if not devices or not all(
+        current_platform.is_device_capability((7, 0), device_id=device_id)
+        for device_id in devices
     ):
-        raise ValueError("prefix_anchored_decode_window requires an NVIDIA SM70 GPU")
+        raise ValueError(
+            "prefix_anchored_decode_window requires an NVIDIA SM70 GPU "
+            "for every participating rank"
+        )
 
     model_config = cfg.model_config
     if model_config is None:
@@ -1621,7 +1730,7 @@ class VllmConfig:
             self.parallel_config,
             is_sm70=(
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_participating_device_is_capability(self, (7, 0))
             ),
         )
         sm70_glm5_dflash_tp8_pp1_verifier = (
@@ -1631,7 +1740,7 @@ class VllmConfig:
                 self.parallel_config,
                 is_sm70=(
                     current_platform.is_cuda()
-                    and current_platform.is_device_capability((7, 0))
+                    and _any_participating_device_is_capability(self, (7, 0))
                 ),
             )
         )
@@ -1641,7 +1750,7 @@ class VllmConfig:
             self.parallel_config,
             is_sm70=(
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_participating_device_is_capability(self, (7, 0))
             ),
         )
 
@@ -1658,8 +1767,8 @@ class VllmConfig:
             )
 
         if envs.VLLM_SM70_USE_BREAKABLE_CUDAGRAPH:
-            if current_platform.is_cuda() and current_platform.is_device_capability(
-                (7, 0)
+            if current_platform.is_cuda() and _any_participating_device_is_capability(
+                self, (7, 0)
             ):
                 if "VLLM_USE_BREAKABLE_CUDAGRAPH" not in os.environ:
                     os.environ["VLLM_USE_BREAKABLE_CUDAGRAPH"] = "1"
@@ -1737,7 +1846,7 @@ class VllmConfig:
             and self.parallel_config.tensor_parallel_size <= 2
             and sm70_fp8_kv_requested
             and current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0))
+            and _any_participating_device_is_capability(self, (7, 0))
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
             and envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             and "VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK" not in os.environ
@@ -1756,7 +1865,7 @@ class VllmConfig:
             and self.model_config.quantization == "fp8"
             and self.model_config.is_moe
             and current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0))
+            and _any_participating_device_is_capability(self, (7, 0))
             and envs.VLLM_SM70_FP8_DEQUANT_FALLBACK
             and envs.VLLM_SM70_FP8_MOE_DEQUANT_FALLBACK
             and not envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
@@ -1778,7 +1887,7 @@ class VllmConfig:
         )
         sm70_flash_v100_baseline = (
             current_platform.is_cuda()
-            and current_platform.is_device_capability((7, 0))
+            and _any_participating_device_is_pre_ampere(self)
             and envs.VLLM_SM70_FLASH_ATTN_V100
             and sm70_flash_v100_backend
         )
@@ -1878,6 +1987,23 @@ class VllmConfig:
                         env_value,
                     )
             if (
+                not sm70_compile_disabled_by_user
+                and not sm70_no_compile_decode_graph_requested
+                and envs.VLLM_SM70_FLASH_V100_0DOT3_COMPILE_GRAPH
+            ):
+                for env_name in _apply_sm70_qwen38_nomtp_defaults(
+                    self,
+                    is_sm70=all(
+                        current_platform.is_device_capability((7, 0), device_id=i)
+                        for i in _participating_cuda_device_ids(self)
+                    ),
+                ):
+                    logger.info_once(
+                        "Auto-setting %s=1 for the quality-qualified SM70 "
+                        "Qwen3.8 NVFP4 TP4 no-MTP path. Set it explicitly to override.",
+                        env_name,
+                    )
+            if (
                 _is_sm70_qwen38_nomtp_dual_compile_contract(
                     self.model_config,
                     self.speculative_config,
@@ -1949,7 +2075,7 @@ class VllmConfig:
                 )
             elif (
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_participating_device_is_capability(self, (7, 0))
                 and envs.VLLM_SM70_FLASH_ATTN_V100
             ):
                 self.compilation_config.mode = CompilationMode.VLLM_COMPILE
@@ -2044,11 +2170,14 @@ class VllmConfig:
                         "Auto-setting VLLM_MQ_BROADCASTER_MAX_CHUNKS=64 for "
                         "SM70 Flash-V100 0.0.3 compile graph startup."
                     )
-                if "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" not in os.environ:
+                if (
+                    not self.use_v2_model_runner
+                    and "VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS" not in os.environ
+                ):
                     os.environ["VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS"] = "0"
                     logger.info_once(
-                        "Auto-setting VLLM_MEMORY_PROFILER_ESTIMATE_CUDAGRAPHS=0 "
-                        "for SM70 Flash-V100 0.0.3 compile graph startup."
+                        "Disabling the legacy SM70 graph memory profiler; "
+                        "V2 budgets its graph reserve before KV allocation."
                     )
                 if "VLLM_SM70_LM_HEAD_TOP1" not in os.environ:
                     os.environ["VLLM_SM70_LM_HEAD_TOP1"] = "0"
@@ -2126,7 +2255,7 @@ class VllmConfig:
                 )
             elif (
                 current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_participating_device_is_capability(self, (7, 0))
                 and envs.VLLM_SM70_FLASH_ATTN_V100
             ):
                 capture_size = max(
@@ -2181,7 +2310,7 @@ class VllmConfig:
                 self.model_config is not None
                 and self.model_config.quantization == "fp8"
                 and current_platform.is_cuda()
-                and current_platform.is_device_capability((7, 0))
+                and _any_participating_device_is_capability(self, (7, 0))
                 and envs.use_sm70_turbomind(envs.VLLM_SM70_FP8_TURBOMIND)
             )
 

@@ -702,6 +702,21 @@ def _is_dflash2_spec_config(vllm_config: object) -> bool:
     return uses_dflash_selector_engine(vllm_config)
 
 
+def _sm70_current_device_is_volta() -> bool:
+    """Whether this worker builds its layers on a Volta device.
+
+    The other SM70 gates in this file ask device 0, which reads the same card
+    from every rank on a mixed node: all devices stay visible to every worker
+    and only ``set_device`` differs. The full-forward wrapper decides what the
+    compiler gets to see, so it has to ask the accelerator that is current.
+    """
+    if not current_platform.is_cuda():
+        return False
+    return current_platform.is_device_capability(
+        (7, 0), device_id=torch.accelerator.current_device_index()
+    )
+
+
 def _sm70_qwen_gdn_full_forward_enabled(
     layer_name: LayerNameType,
     *,
@@ -1724,10 +1739,11 @@ def _resolve_gdn_prefill_backend(
         supports_flashinfer = True
     elif head_k_dim == 128 and backend in ("auto", "flashqla_sm70"):
         capability = current_platform.get_device_capability()
-        is_sm70_or_sm75 = (
-            capability is not None
-            and capability.major == 7
-            and capability.minor in (0, 5)
+        is_sm70 = (
+            capability is not None and capability.major == 7 and capability.minor == 0
+        )
+        is_sm75 = (
+            capability is not None and capability.major == 7 and capability.minor == 5
         )
         supports_model_dtype = model_dtype == torch.float16
         try:
@@ -1737,8 +1753,17 @@ def _resolve_gdn_prefill_backend(
         except ImportError:
             supports_flashqla_sm70 = False
         else:
-            supports_flashqla_sm70 = is_sm70_or_sm75 and supports_model_dtype
-        if is_sm70_or_sm75 and not supports_model_dtype:
+            supports_flashqla_sm70 = is_sm70 and supports_model_dtype
+        if is_sm75:
+            logger.warning_once(
+                "FlashQLA-SM70 GDN prefill cannot run on Turing (sm75): the "
+                "kernel asks for 86016 B of dynamic shared memory per block "
+                "and Turing caps the opt-in limit at 65536 B, so the worker "
+                "dies during engine init. Its VLK CUDA variant does fit but "
+                "is slower than Triton/FLA from 2048 tokens per chunk "
+                "upwards. Falling back to Triton/FLA."
+            )
+        if is_sm70 and not supports_model_dtype:
             logger.warning_once(
                 "FlashQLA-SM70 GDN prefill is V100 production-validated only "
                 "for fp16 model activations; model dtype %s falls back to "
@@ -2433,6 +2458,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
         )
+        self.enable_sm70_dflash2_tp2_gdn_bv2 = bool(
+            self.enable_sm70_dflash2_fused_gdn_verify
+            and self.tp_size == 2
+            and envs.VLLM_SM70_DFLASH2_TP2_GDN_BV2
+        )
         self.enable_sm70_dflash2_fused_gdn_norm = bool(
             envs.VLLM_SM70_DFLASH2_FUSED_GDN_NORM
             and current_platform.is_device_capability(70)
@@ -2442,6 +2472,13 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             envs.VLLM_SM70_DFLASH2_FUSED_GDN_SPLIT
             and current_platform.is_device_capability(70)
             and _is_dflash2_spec_config(vllm_config)
+        )
+        self.enable_sm70_dflash2_fused_gdn_combined_split = bool(
+            envs.VLLM_SM70_DFLASH2_FUSED_GDN_COMBINED_SPLIT
+            and current_platform.is_device_capability(70)
+            and _is_dflash2_spec_config(vllm_config)
+            and self.tp_size == 4
+            and self.hidden_size == 5120
         )
         self.enable_sm70_dflash2_fused_qkv_pack = bool(
             envs.VLLM_SM70_DFLASH2_FUSED_QKV_PACK
@@ -2488,11 +2525,21 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             and envs.VLLM_SM70_QWEN_GDN_003_SPEC_CORE_OP
             and not block_003_deep_mtp
         )
+        # The automatic arm is Volta-only. The wrapper runs the whole layer
+        # through one opaque custom op, so Inductor never sees the input and
+        # output projections around the recurrent core and the gated RMSNorm
+        # falls back to its native chain. On Turing that costs about fifteen
+        # extra elementwise launches per GDN layer and step. The recurrent
+        # core keeps its own boundary either way, and an explicit
+        # VLLM_SM70_QWEN_GDN_FULL_FORWARD=1 still forces the wrapper anywhere.
         self.maybe_sm70_qwen_gdn_full_forward = (
             not self.disable_sm70_qwen_gdn_full_forward
             and (
                 self.force_sm70_qwen_gdn_full_forward
-                or self.auto_sm70_qwen_gdn_full_forward
+                or (
+                    self.auto_sm70_qwen_gdn_full_forward
+                    and _sm70_current_device_is_volta()
+                )
             )
         )
         if self.maybe_sm70_qwen_gdn_full_forward:
@@ -3858,8 +3905,15 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             ):
                 conv_state_cache, ssm_state_cache = _resolve_qwen_gdn_kv_cache_args(
                     layer_name,
-                    output,
+                    hidden_states if output is None else output,
                 )
+                if output is None:
+                    return torch.ops.vllm.qwen_gdn_full_forward_direct(
+                        hidden_states,
+                        conv_state_cache,
+                        ssm_state_cache,
+                        layer_name,
+                    )
                 torch.ops.vllm.qwen_gdn_full_forward(
                     hidden_states,
                     output,
@@ -3873,7 +3927,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     def _full_forward(
         self,
         hidden_states: torch.Tensor,
-        output: torch.Tensor,
+        output: torch.Tensor | None,
     ):
         return self._forward_method(hidden_states, output)
 
@@ -5181,7 +5235,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             # The supported verifier contract keeps recurrent state in FP32;
             # an explicit FP16 cache override is also supported.
             and ssm_state.dtype in (torch.float16, torch.float32)
-            and mixed_qkv.is_contiguous()
+            and mixed_qkv.ndim == 2
+            # Qwen3.5's fused projection and in-place convolution retain the
+            # wider QKVZBA row stride. The packed consumer can read it directly.
+            and mixed_qkv.stride(1) == 1
+            and mixed_qkv.stride(0) >= mixed_qkv.shape[1]
             and a.is_contiguous()
             and b.is_contiguous()
             and core_attn_out.is_contiguous()
@@ -5202,7 +5260,11 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
     ) -> torch.Tensor:
         num_tokens = mixed_qkv.shape[0]
         out = core_attn_out[:num_tokens].unsqueeze(1)
-        g, beta = fused_gdn_gating(self.A_log, a, b, self.dt_bias)
+        # Match the ordinary speculative verifier's FP32 beta materialization.
+        # The gating helper otherwise defaults to the FP16 dtype of b.
+        g, beta = fused_gdn_gating(
+            self.A_log, a, b, self.dt_bias, beta_dtype=torch.float32
+        )
         fused_sigmoid_gating_delta_rule_update_mixed_qkv_out(
             A_log=self.A_log,
             a=a,
@@ -5229,6 +5291,7 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
             quantize_state_each_step=False,
             match_recurrent_schedule=True,
             match_recurrent_numerics=True,
+            sm70_tp2_q8_bv2=getattr(self, "enable_sm70_dflash2_tp2_gdn_bv2", False),
         )
         return out.transpose(0, 1)
 
@@ -5766,20 +5829,19 @@ class QwenGatedDeltaNetAttention(GatedDeltaNetAttention):
                 assert query_spec is not None
                 assert key_spec is not None
                 assert value_spec is not None
-                g_spec, beta_spec = fused_gdn_gating(
-                    self.A_log,
-                    a_spec,
-                    b_spec,
-                    self.dt_bias,
-                    beta_dtype=torch.float32,
-                )
+                # One fused launch instead of gating + recurrent update: the
+                # kernel computes the sigmoid gating itself, so g/beta never
+                # materialize and the surrounding elementwise work disappears.
+                # Same routine the DFlash2 branch above already uses.
                 core_attn_out_spec, last_recurrent_state = (
-                    fused_recurrent_gated_delta_rule(
+                    fused_sigmoid_gating_delta_rule_update(
+                        A_log=self.A_log,
+                        a=a_spec,
+                        b=b_spec,
+                        dt_bias=self.dt_bias,
                         q=query_spec,
                         k=key_spec,
                         v=value_spec,
-                        g=g_spec,
-                        beta=beta_spec,
                         initial_state=ssm_state,
                         inplace_final_state=True,
                         cu_seqlens=spec_query_start_loc[  # type: ignore[index]
@@ -7145,6 +7207,34 @@ def qwen_gdn_full_forward_fake(
     """Fake implementation for torch.compile."""
 
 
+def qwen_gdn_full_forward_direct(
+    hidden_states: torch.Tensor,
+    conv_state_cache: torch.Tensor,
+    ssm_state_cache: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    """Keep the full-forward order while returning its projection allocation."""
+    layer_name = _resolve_layer_name(layer_name)
+    layer = get_forward_context().no_compile_layers[layer_name]
+    # Match the original opaque op's explicit recurrent-state dependencies.
+    # Its eager body accesses these same caches through the layer object.
+    _ = conv_state_cache, ssm_state_cache
+    output = layer._full_forward(hidden_states, None)
+    if output is None:
+        raise RuntimeError("Direct GDN full-forward did not return a projection")
+    _log_runtime_route_once("SM70 Qwen GDN direct full-forward output route hit.")
+    return output
+
+
+def qwen_gdn_full_forward_direct_fake(
+    hidden_states: torch.Tensor,
+    conv_state_cache: torch.Tensor,
+    ssm_state_cache: torch.Tensor,
+    layer_name: LayerNameType,
+) -> torch.Tensor:
+    return torch.empty_like(hidden_states)
+
+
 def qwen_gdn_output_projection(
     core_attn_out: torch.Tensor,
     z: torch.Tensor,
@@ -7448,6 +7538,14 @@ direct_register_custom_op(
     op_func=qwen_gdn_full_forward,
     mutates_args=["output", "conv_state_cache", "ssm_state_cache"],
     fake_impl=qwen_gdn_full_forward_fake,
+)
+
+
+direct_register_custom_op(
+    op_name="qwen_gdn_full_forward_direct",
+    op_func=qwen_gdn_full_forward_direct,
+    mutates_args=["conv_state_cache", "ssm_state_cache"],
+    fake_impl=qwen_gdn_full_forward_direct_fake,
 )
 
 

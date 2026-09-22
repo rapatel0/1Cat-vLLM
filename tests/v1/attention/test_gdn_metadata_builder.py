@@ -311,9 +311,14 @@ def _build(
     batch_spec: BatchSpec,
     num_decode_draft_tokens: list[int] | None = None,
     use_common_metadata: bool = False,
+    is_prefilling: list[bool] | None = None,
 ) -> GDNAttentionMetadata:
     """Build GDN attention metadata, optionally with spec-decode kwargs."""
     common = create_common_attn_metadata(batch_spec, BLOCK_SIZE, DEVICE)
+    if is_prefilling is not None:
+        common = common.replace(
+            is_prefilling=torch.tensor(is_prefilling, dtype=torch.bool, device=DEVICE)
+        )
     kwargs: dict = {}
     if num_decode_draft_tokens is not None:
         num_decode_draft_tokens_cpu = torch.tensor(
@@ -409,6 +414,97 @@ def test_gdn_build_classification(
     assert meta.num_prefills == test_case.expected_num_prefills
     assert meta.num_prefill_tokens == test_case.expected_num_prefill_tokens
     assert meta.num_spec_decodes == test_case.expected_num_spec_decodes
+
+
+@pytest.mark.parametrize("use_full_cuda_graph", [False, True])
+@pytest.mark.parametrize(
+    (
+        "num_speculative_tokens",
+        "query_len",
+        "seq_len",
+        "is_prefilling",
+        "expected_prefills",
+        "expected_initial_state",
+    ),
+    [
+        pytest.param(7, 1, 1, True, 1, [False], id="fresh-singleton"),
+        pytest.param(7, 1, 17, True, 1, [True], id="cached-singleton-extension"),
+        pytest.param(7, 1, 17, False, 0, None, id="regular-decode"),
+        pytest.param(7, 2, 2, True, 1, [False], id="two-token-prefill"),
+        pytest.param(7, 17, 17, True, 1, [False], id="longer-prefill"),
+        pytest.param(7, 1, 1, None, 0, None, id="legacy-metadata"),
+        pytest.param(0, 1, 1, True, 0, None, id="non-speculative-unchanged"),
+    ],
+)
+def test_singleton_prefill_state_initialization(
+    local_gdn_model: str,
+    use_full_cuda_graph: bool,
+    num_speculative_tokens: int,
+    query_len: int,
+    seq_len: int,
+    is_prefilling: bool | None,
+    expected_prefills: int,
+    expected_initial_state: list[bool] | None,
+):
+    builder = _create_gdn_builder(
+        local_gdn_model,
+        num_speculative_tokens=num_speculative_tokens,
+        use_full_cuda_graph=use_full_cuda_graph,
+        max_cudagraph_capture_size=8,
+    )
+    meta = _build(
+        builder,
+        BatchSpec(seq_lens=[seq_len], query_lens=[query_len]),
+        num_decode_draft_tokens=[-1] if num_speculative_tokens else None,
+        is_prefilling=None if is_prefilling is None else [is_prefilling],
+    )
+
+    assert meta.num_spec_decodes == 0
+    assert meta.num_prefills == expected_prefills
+    assert meta.num_decodes == 1 - expected_prefills
+    assert meta.num_prefill_tokens == query_len * expected_prefills
+    if expected_initial_state is None:
+        assert meta.has_initial_state is None
+    else:
+        assert meta.has_initial_state is not None
+        assert meta.has_initial_state.tolist() == expected_initial_state
+
+
+@pytest.mark.parametrize("poison", [10.0, float("nan")], ids=["recycled", "nan"])
+def test_singleton_prefill_masks_recycled_conv_state(local_gdn_model: str, poison):
+    from vllm.model_executor.layers.mamba.ops.cpu.causal_conv1d import (
+        causal_conv1d_torch,
+    )
+
+    builder = _create_gdn_builder(local_gdn_model, num_speculative_tokens=7)
+    meta = _build(
+        builder,
+        BatchSpec(seq_lens=[1], query_lens=[1]),
+        num_decode_draft_tokens=[-1],
+        is_prefilling=[True],
+    )
+    assert meta.num_prefills == 1
+    assert meta.has_initial_state is not None
+    assert meta.non_spec_query_start_loc is not None
+    assert meta.non_spec_state_indices_tensor is not None
+    states = torch.full((1, 1, 3), poison, dtype=torch.float32, device=DEVICE)
+    output = causal_conv1d_torch(
+        x=torch.ones((1, 1), dtype=torch.float32, device=DEVICE),
+        weight=torch.ones((1, 4), dtype=torch.float32, device=DEVICE),
+        bias=None,
+        conv_states=states,
+        query_start_loc=meta.non_spec_query_start_loc,
+        cache_indices=torch.zeros_like(meta.non_spec_state_indices_tensor),
+        has_initial_state=meta.has_initial_state,
+        activation=None,
+    )
+    torch.testing.assert_close(output, torch.ones_like(output), rtol=0, atol=0)
+    torch.testing.assert_close(
+        states,
+        torch.tensor([[[0.0, 0.0, 1.0]]], device=DEVICE),
+        rtol=0,
+        atol=0,
+    )
 
 
 @pytest.mark.parametrize(
@@ -960,6 +1056,62 @@ def test_full_cuda_graph_capture_single_token_decode_is_not_spec(local_gdn_model
 
     assert meta.num_decodes == 1
     assert meta.num_spec_decodes == 0
+
+
+@pytest.mark.parametrize("query_len", range(1, 9))
+@pytest.mark.parametrize("cache_mode", ["none", "align"])
+def test_dflash_tail_capture_matches_runtime_metadata(
+    local_gdn_model, query_len, cache_mode
+):
+    builders = [
+        _create_gdn_builder(
+            local_gdn_model,
+            num_speculative_tokens=7,
+            use_full_cuda_graph=True,
+            mamba_cache_mode=cache_mode,
+            max_cudagraph_capture_size=8,
+        )
+        for _ in range(2)
+    ]
+    common = create_common_attn_metadata(
+        BatchSpec(seq_lens=[262143], query_lens=[query_len]), BLOCK_SIZE, DEVICE
+    ).replace(
+        block_table_tensor=torch.arange(
+            10, 10 + 262144 // BLOCK_SIZE + 8, dtype=torch.int32
+        ).reshape(1, -1)
+    )
+    drafts = torch.tensor([-1 if query_len == 1 else query_len - 1])
+    runtime_kwargs = dict(
+        common_prefix_len=0,
+        common_attn_metadata=common,
+        num_accepted_tokens=torch.tensor([query_len], dtype=torch.int32),
+        num_decode_draft_tokens_cpu=drafts,
+        common_gdn_metadata=compute_common_gdn_attn_metadata(
+            num_decode_draft_tokens_cpu=drafts,
+            query_start_loc=common.query_start_loc,
+            query_start_loc_cpu=common.query_start_loc_cpu,
+            num_spec_state_tokens=7,
+            legacy_mixed_decode_routing=False,
+        ),
+    )
+    runtime = builders[0].build(**runtime_kwargs)
+    captured = builders[1].build_for_cudagraph_capture(common)
+    # Capture deliberately poisons state indices. Runtime preparation must
+    # refresh the same storage referenced by the captured graph.
+    tensor = (
+        captured.non_spec_state_indices_tensor
+        if query_len == 1
+        else captured.spec_state_indices_tensor
+    )
+    pointer = tensor.data_ptr()
+    refreshed = builders[1].build(**runtime_kwargs)
+    refreshed_tensor = (
+        refreshed.non_spec_state_indices_tensor
+        if query_len == 1
+        else refreshed.spec_state_indices_tensor
+    )
+    assert refreshed_tensor.data_ptr() == pointer
+    _assert_gdn_metadata_equal(captured, runtime)
 
 
 def test_full_cuda_graph_capture_keeps_spec_state_selector(local_gdn_model):

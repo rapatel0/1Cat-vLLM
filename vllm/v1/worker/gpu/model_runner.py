@@ -318,7 +318,7 @@ class GPUModelRunner(LoRAModelRunnerMixin):
     def _sm70_v2_mtp_profile_enabled(self) -> bool:
         return (
             self.speculative_config is not None
-            and self.speculative_config.method == "mtp"
+            and self.speculative_config.method in ("mtp", "dflash", "dspark")
             and self.is_last_pp_rank
             and self.device.type == "cuda"
             and envs.VLLM_SM70_MTP_PROFILE
@@ -1459,6 +1459,21 @@ class GPUModelRunner(LoRAModelRunnerMixin):
         num_toks = scheduler_output.total_num_scheduled_tokens
         max_query_len = max(scheduler_output.num_scheduled_tokens.values())
         uniform_tok_count = get_uniform_token_count(num_reqs, num_toks, max_query_len)
+        if (
+            not dummy_run
+            and getattr(self.cudagraph_manager, "_sm70_dflash2_tail_graphs", False)
+            and num_reqs == 1
+            and 1 <= num_toks < 8
+        ):
+            req_id = next(iter(scheduler_output.num_scheduled_tokens))
+            req_index = self.req_states.req_id_to_index[req_id]
+            if (
+                self.req_states.num_computed_prefill_tokens[req_index]
+                < self.req_states.prefill_len.np[req_index]
+            ):
+                # A short prompt/chunk must initialize GDN state rather than
+                # replay a graph captured for an already initialized decode.
+                uniform_tok_count = None
 
         skip_compiled = False
         if self.is_encoder_decoder and scheduler_output.scheduled_encoder_inputs:
@@ -1633,6 +1648,9 @@ class GPUModelRunner(LoRAModelRunnerMixin):
             # NOTE(woosuk): Here, we don't need to pass the input tensors,
             # because they are already copied to the CUDA graph input buffers.
             assert self.cudagraph_manager is not None
+            batch_desc = self.cudagraph_manager.select_attention_graph(
+                batch_desc, input_batch.seq_lens_cpu_upper_bound
+            )
             self.kv_connector.pre_forward(scheduler_output)
             model_output = self.cudagraph_manager.run_fullgraph(batch_desc)
         else:
