@@ -2229,6 +2229,11 @@ template <int MAX_QUERY_TOKENS, bool TWO_PASS, int PAGE_BLOCK_SIZE = 0,
           bool SINGLE_QUERY = false, bool CONTIGUOUS_HKV1_LAYOUT = false,
           bool STAGE_PARTITION_PAGE_IDS = false,
           int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
+          bool SPARSE_PAGE4 = false, bool ROW_SEQLENS = false,
+          bool COMPENSATE_P = false>
+          bool SINGLE_QUERY = false, bool CONTIGUOUS_HKV1_LAYOUT = false,
+          bool STAGE_PARTITION_PAGE_IDS = false,
+          int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
           bool SPARSE_PAGE4 = false>
 __global__
 __launch_bounds__(kGroupedVerifyThreads, 2) void flash_attention_grouped_verify_e5m2_partial_kernel(
@@ -2246,7 +2251,8 @@ __launch_bounds__(kGroupedVerifyThreads, 2) void flash_attention_grouped_verify_
     const __half* __restrict__ key_block_scales = nullptr,
     const __half* __restrict__ value_block_scales = nullptr,
     const int64_t scale_block_stride = 0, const int64_t scale_head_stride = 0,
-    const int* __restrict__ query_start_loc = nullptr) {
+    const int* __restrict__ query_start_loc = nullptr,
+    const int* __restrict__ row_lengths = nullptr) {
   using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
   const int head_group = blockIdx.x;
   const int split_id = blockIdx.y;
@@ -2327,6 +2333,10 @@ __launch_bounds__(kGroupedVerifyThreads, 2) void flash_attention_grouped_verify_
   __half* shared_kv = smem.storage.compute.kv;
   float* shared_scores = smem.storage.compute.score_prob.scores;
   __half* shared_probs = smem.storage.compute.score_prob.probs;
+  // Upstream COMPENSATE_P: residual probability panel after the smem struct.
+  __half* shared_prob_residual = reinterpret_cast<__half*>(
+      grouped_verify_smem_raw + sizeof(GroupedVerifySmem));
+  constexpr int kResidualStride = kGroupedVerifyProbStride;
   const int* page_ids =
       block_table + static_cast<int64_t>(group_idx) * max_num_blocks;
   int split_page_offset = 0;
@@ -5466,7 +5476,11 @@ at::Tensor flash_attention_grouped_verify_paged(
 
   const dim3 partial_grid(head_groups, grouped_splits,
                           static_cast<unsigned>(num_requests));
-  const size_t partial_shared_mem = sizeof(GroupedVerifySmem);
+  const size_t partial_shared_mem =
+      sizeof(GroupedVerifySmem) +
+      (COMPENSATE_P ? kGroupedVerifyRows * kGroupedVerifyProbStride *
+                          sizeof(__half)
+                    : 0);
 #define LAUNCH_GROUPED_VERIFY_PARTIAL(MAX_QUERY_TOKENS, TWO_PASS, PAGE_SIZE,   \
                                       SINGLE_QUERY, CONTIGUOUS_LAYOUT,         \
                                       STAGE_PAGE_IDS, KV_DTYPE)                \
