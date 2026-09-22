@@ -2229,13 +2229,13 @@ template <int MAX_QUERY_TOKENS, bool TWO_PASS, int PAGE_BLOCK_SIZE = 0,
           bool SINGLE_QUERY = false, bool CONTIGUOUS_HKV1_LAYOUT = false,
           bool STAGE_PARTITION_PAGE_IDS = false,
           int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
-          bool SPARSE_PAGE4 = false, bool ROW_SEQLENS = false,
-          bool COMPENSATE_P = false>
+          bool SPARSE_PAGE4 = false, typename PARTIAL_T = __half,
+          bool ROW_SEQLENS = false, bool COMPENSATE_P = false>
 __global__
 __launch_bounds__(kGroupedVerifyThreads, 2) void flash_attention_grouped_verify_e5m2_partial_kernel(
     const __half* __restrict__ q, const void* __restrict__ k_cache,
     const void* __restrict__ v_cache, const int* __restrict__ block_table,
-    const int* __restrict__ seq_lens, __half* __restrict__ partial_out,
+    const int* __restrict__ seq_lens, PARTIAL_T* __restrict__ partial_out,
     float* __restrict__ partial_lse, const int query_len,
     const int max_num_blocks, const int page_block_size,
     const int64_t k_block_stride, const int64_t k_token_stride,
@@ -2764,7 +2764,11 @@ __launch_bounds__(kGroupedVerifyThreads, 2) void flash_attention_grouped_verify_
                             kGroupedVerifyHeadDim +
                         d);
         }
-        partial_out[output_idx] = __float2half_rn(shared_output[idx] * scale);
+        if constexpr (std::is_same_v<PARTIAL_T, float>) {
+          partial_out[output_idx] = shared_output[idx] * scale;
+        } else {
+          partial_out[output_idx] = __float2half_rn(shared_output[idx] * scale);
+        }
       }
     }
     __syncthreads();
@@ -3413,7 +3417,6 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
         d] = __float2half_rn(accumulator);
   }
 }
-template <int MAX_QUERY_TOKENS, bool SINGLE_QUERY>
 template <int MAX_QUERY_TOKENS, bool SINGLE_QUERY>
 __launch_bounds__(512, 1) void flash_attention_grouped_verify_e5m2_combine_kernel_512(
     const __half* __restrict__ partial_out,
