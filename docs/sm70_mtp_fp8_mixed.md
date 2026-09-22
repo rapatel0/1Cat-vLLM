@@ -90,11 +90,15 @@ vllm serve /models/Qwen3.8-Flash-Next-ABLITERATED-NVFP4 \
   --language-model-only \
   --dtype float16 \
   --kv-cache-dtype int8_block32 \
+  --kv-offloading-size 32 \
+  --kv-offloading-backend native \
   --tensor-parallel-size 4 \
   --max-model-len 262144 \
-  --max-num-seqs 1 \
+  --max-num-seqs 4 \
   --gpu-memory-utilization 0.90 \
   --attention-backend FLASH_ATTN_V100 \
+  --enable-prefix-caching \
+  --mamba-cache-mode align \
   --speculative-config '{"method":"mtp","num_speculative_tokens":4}' \
   --host 0.0.0.0 --port 8100
 ```
