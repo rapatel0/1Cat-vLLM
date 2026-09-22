@@ -2273,7 +2273,13 @@ __launch_bounds__(kGroupedVerifyThreads, 2) void flash_attention_grouped_verify_
                    kGroupedVerifyHeadDim;
     partial_lse += static_cast<int64_t>(group_idx) * Traits::kSplits *
                    MAX_QUERY_TOKENS * kGroupedVerifyHeads;
-  const int total_kv = seq_lens[group_idx];
+  }
+  int total_kv = seq_lens[group_idx];
+  if constexpr (ROW_SEQLENS) {
+    total_kv = 0;
+    for (int i = 0; i < group_query_len; ++i)
+      total_kv = max(total_kv, row_lengths[i]);
+  }
   if (total_kv <= 0) {
     if constexpr (SPARSE_PAGE4) {
       constexpr int kGroupOutputElements =
@@ -2316,11 +2322,6 @@ __launch_bounds__(kGroupedVerifyThreads, 2) void flash_attention_grouped_verify_
   const int tid = threadIdx.x;
   const int warp_id = tid / kWarpSize;
   const int lane_id = tid % kWarpSize;
-  if constexpr (ROW_SEQLENS) {
-    total_kv = 0;
-    for (int i = 0; i < group_query_len; ++i)
-      total_kv = max(total_kv, row_lengths[i]);
-  }
 
   extern __shared__ char grouped_verify_smem_raw[];
   GroupedVerifySmem& smem =
