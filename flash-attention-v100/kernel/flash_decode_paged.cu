@@ -3338,6 +3338,113 @@ __launch_bounds__(512, 1) void flash_attention_grouped_verify_e5m2_partial_kerne
   }
 }
 
+template <int MAX_QUERY_TOKENS, bool SINGLE_QUERY, typename PARTIAL_T = __half,
+          bool ROW_SEQLENS = false>
+__global__
+__launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m2_combine_kernel_request_major(
+    const PARTIAL_T* __restrict__ partial_out,
+    const float* __restrict__ partial_lse, const int* __restrict__ seq_lens,
+    __half* __restrict__ out, const int query_len,
+    const int* row_lengths = nullptr) {
+  using Traits = GroupedVerifyTraits<MAX_QUERY_TOKENS>;
+  const int token_idx = blockIdx.x;
+  const int head_idx = blockIdx.y;
+  const int request_idx = blockIdx.z;
+  if (token_idx >= query_len || head_idx >= kGroupedVerifyHeads) {
+    return;
+  }
+  partial_out += static_cast<int64_t>(request_idx) * Traits::kSplits *
+                 MAX_QUERY_TOKENS * kGroupedVerifyHeads * kGroupedVerifyHeadDim;
+  partial_lse += static_cast<int64_t>(request_idx) * Traits::kSplits *
+                 MAX_QUERY_TOKENS * kGroupedVerifyHeads;
+  seq_lens += request_idx;
+  out += static_cast<int64_t>(request_idx) * query_len * kGroupedVerifyHeads *
+         kGroupedVerifyHeadDim;
+
+  int total_kv = seq_lens[0];
+  if constexpr (ROW_SEQLENS) {
+    total_kv = 0;
+    for (int i = 0; i < query_len; ++i)
+      total_kv = max(total_kv, row_lengths[i]);
+    // Padding may leave every partial unwritten. Never read stale workspace.
+    if (row_lengths[token_idx] <= 0) {
+      for (int d = threadIdx.x; d < kGroupedVerifyHeadDim; d += blockDim.x)
+        out[(token_idx * kGroupedVerifyHeads + head_idx) *
+                kGroupedVerifyHeadDim +
+            d] = __float2half_rn(0.0f);
+      return;
+    }
+  }
+  const int active_splits =
+      grouped_verify_active_splits<MAX_QUERY_TOKENS, SINGLE_QUERY>(total_kv);
+  __shared__ float split_lse[Traits::kSplits];
+  __shared__ float split_sum[ROW_SEQLENS ? Traits::kSplits : 1];
+  __shared__ float final_max;
+  __shared__ float final_inv_sum;
+
+  if (threadIdx.x < Traits::kSplits) {
+    const int64_t lse_idx =
+        (static_cast<int64_t>(threadIdx.x) * MAX_QUERY_TOKENS + token_idx) *
+            kGroupedVerifyHeads +
+        head_idx;
+    if constexpr (ROW_SEQLENS) {
+      split_lse[threadIdx.x] =
+          threadIdx.x < active_splits ? partial_lse[2 * lse_idx] : kXQANegInf;
+      split_sum[threadIdx.x] =
+          threadIdx.x < active_splits ? partial_lse[2 * lse_idx + 1] : 0.0f;
+    } else {
+      split_lse[threadIdx.x] =
+          threadIdx.x < active_splits ? partial_lse[lse_idx] : kXQANegInf;
+    }
+  }
+  __syncthreads();
+
+  if (threadIdx.x == 0) {
+    float max_lse = kXQANegInf;
+    for (int split = 0; split < active_splits; ++split) {
+      max_lse = fmaxf(max_lse, split_lse[split]);
+    }
+    float sum = 0.0f;
+    for (int split = 0; split < active_splits; ++split) {
+      if (split_lse[split] > -1.0e20f) {
+        const float weight = __expf(fmaxf(split_lse[split] - max_lse, -80.0f));
+        if constexpr (ROW_SEQLENS) {
+          sum = fmaf(weight, split_sum[split], sum);
+        } else {
+          sum += weight;
+        }
+      }
+    }
+    final_max = max_lse;
+    final_inv_sum = sum > 0.0f ? 1.0f / sum : 0.0f;
+  }
+  __syncthreads();
+
+  for (int d = threadIdx.x; d < kGroupedVerifyHeadDim;
+       d += kGroupedVerifyThreads) {
+    float accumulator = 0.0f;
+    for (int split = 0; split < active_splits; ++split) {
+      if (split_lse[split] > -1.0e20f) {
+        const float weight =
+            __expf(fmaxf(split_lse[split] - final_max, -80.0f)) * final_inv_sum;
+        const int64_t partial_idx =
+            (((static_cast<int64_t>(split) * MAX_QUERY_TOKENS + token_idx) *
+                  kGroupedVerifyHeads +
+              head_idx) *
+                 kGroupedVerifyHeadDim +
+             d);
+        if constexpr (std::is_same_v<PARTIAL_T, float>) {
+          accumulator = fmaf(weight, partial_out[partial_idx], accumulator);
+        } else {
+          accumulator =
+              fmaf(weight, __half2float(partial_out[partial_idx]), accumulator);
+        }
+      }
+    }
+    out[(token_idx * kGroupedVerifyHeads + head_idx) * kGroupedVerifyHeadDim +
+        d] = __float2half_rn(accumulator);
+  }
+}
 template <int MAX_QUERY_TOKENS, bool SINGLE_QUERY>
 __global__
 __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m2_combine_kernel(
@@ -3418,6 +3525,7 @@ __launch_bounds__(kGroupedVerifyThreads) void flash_attention_grouped_verify_e5m
   }
 }
 template <int MAX_QUERY_TOKENS, bool SINGLE_QUERY>
+__global__
 __launch_bounds__(512, 1) void flash_attention_grouped_verify_e5m2_combine_kernel_512(
     const __half* __restrict__ partial_out,
     const float* __restrict__ partial_lse, const int* __restrict__ seq_lens,
@@ -5278,8 +5386,8 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
       partial.data_ptr<float>(), lse.data_ptr<float>(), q.size(0),
       block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
       v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale, nullptr,
-      1, row_lengths.data_ptr<int>());
-  flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
+      1, nullptr, row_lengths.data_ptr<int>());
+  flash_attention_grouped_verify_e5m2_combine_kernel_request_major<8, false, float, true>
       <<<dim3(q.size(0), 6), kGroupedVerifyThreads, 0, stream>>>(
           partial.data_ptr<float>(), lse.data_ptr<float>(),
           row_lengths.data_ptr<int>(),
