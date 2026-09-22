@@ -2231,10 +2231,6 @@ template <int MAX_QUERY_TOKENS, bool TWO_PASS, int PAGE_BLOCK_SIZE = 0,
           int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
           bool SPARSE_PAGE4 = false, bool ROW_SEQLENS = false,
           bool COMPENSATE_P = false>
-          bool SINGLE_QUERY = false, bool CONTIGUOUS_HKV1_LAYOUT = false,
-          bool STAGE_PARTITION_PAGE_IDS = false,
-          int KV_DTYPE = flash_v100::KV_CACHE_DTYPE_FP8_E5M2,
-          bool SPARSE_PAGE4 = false>
 __global__
 __launch_bounds__(kGroupedVerifyThreads, 2) void flash_attention_grouped_verify_e5m2_partial_kernel(
     const __half* __restrict__ q, const void* __restrict__ k_cache,
