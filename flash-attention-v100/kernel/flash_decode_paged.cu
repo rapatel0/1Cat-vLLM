@@ -152,6 +152,23 @@ bool xqa_padded_smem_enabled() {
   return value == nullptr || value[0] != '0';
 }
 
+// Batch-dependent partition dispatch override for INT8 block32 XQA:
+// 0 (default) uses the measured per-batch routing, 256 or 512 forces one
+// geometry for all batches so unmeasured batch sizes can be profiled.
+int xqa_int8_partition_override() {
+  const char* value = std::getenv("VLLM_FLASH_V100_INT8_PARTITION");
+  if (value == nullptr) {
+    return 0;
+  }
+  const int parsed = std::atoi(value);
+  return parsed == 512 ? 512 : 0;
+}
+
+bool xqa_int8_partition_force_256() {
+  const char* value = std::getenv("VLLM_FLASH_V100_INT8_PARTITION");
+  return value != nullptr && std::atoi(value) == 256;
+}
+
 bool xqa_g6_dual_cta_enabled() {
   const char* value = std::getenv("VLLM_FLASH_V100_XQA_G6_DUAL_CTA");
   return value != nullptr && value[0] == '1';
@@ -6158,7 +6175,16 @@ at::Tensor flash_attention_decode_paged_xqa(
     // partitions (fewer, longer-lived CTAs amortize per-CTA setup and
     // reduce work), while batch 1 and batch 8 measured best with the
     // 256-token geometry. Dispatch stays on measured points only.
-    if (q.size(0) == 4) {
+    if (xqa_int8_partition_force_256()) {
+      if (k_cache.size(1) == 1568) {
+        LAUNCH_INT8_BLOCK32_XQA(1568);
+      } else if (k_cache.size(1) == 1648) {
+        LAUNCH_INT8_BLOCK32_XQA(1648);
+      } else {
+        LAUNCH_INT8_BLOCK32_XQA(3296);
+      }
+    } else if (xqa_int8_partition_override() == 512 ||
+               (q.size(0) == 4 || q.size(0) == 5 || q.size(0) == 7)) {
       if (k_cache.size(1) == 1568) {
         LAUNCH_INT8_BLOCK32_XQA_P512(1568);
       } else if (k_cache.size(1) == 1648) {
