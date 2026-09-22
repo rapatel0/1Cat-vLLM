@@ -1404,3 +1404,135 @@ class Fp8SM70MoEMethod(FusedMoEMethodBase):
     ) -> FusedMoEQuantConfig | None:
         del layer
         return None
+
+
+_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+
+
+def block_fp8_quantize(
+    weight: torch.Tensor,
+    block_n: int = 128,
+    block_k: int = 128,
+    *,
+    scale_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize `[E, N, K]` weights to E4M3 with official Flash Next scales.
+
+    Proven convention from Qwen3.8-Flash-Next-FP8 MTP experts:
+    dequant = fp8.float() * weight_scale_inv
+    weight_scale_inv = amax / 448, layout [E, ceil(N/128), ceil(K/128)],
+    scale dtype bfloat16. This is runtime-amax, not a ModelOpt MSE clone.
+    """
+    if weight.ndim != 3:
+        raise ValueError(f"expected [E, N, K] weights, got {tuple(weight.shape)}")
+    if block_n != 128 or block_k != 128:
+        raise ValueError("official MTP FP8 uses 128x128 blocks only")
+    num_experts, n, k = weight.shape
+    ns = (n + block_n - 1) // block_n
+    ks = (k + block_k - 1) // block_k
+    pad_n = ns * block_n - n
+    pad_k = ks * block_k - k
+    weight_f = weight.to(torch.float32)
+    if pad_n or pad_k:
+        weight_f = torch.nn.functional.pad(weight_f, (0, pad_k, 0, pad_n))
+    blocks = weight_f.view(num_experts, ns, block_n, ks, block_k)
+    amax = blocks.abs().amax(dim=(2, 4)).clamp(min=1e-12)
+    scale_f = amax / _E4M3_MAX
+    quant = blocks / scale_f.unsqueeze(2).unsqueeze(4)
+    quant = quant.clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn)
+    quant = quant.reshape(num_experts, ns * block_n, ks * block_k)[:, :n, :k]
+    return quant.contiguous(), scale_f.to(scale_dtype).contiguous()
+
+
+class _BlockFp8QuantConfig:
+    weight_block_size = [128, 128]
+    activation_scheme = "dynamic"
+    is_checkpoint_fp8_serialized = True
+
+
+class Sm70SerializedBlockFp8MoEMethod(Fp8SM70MoEMethod):
+    """Load already-serialized 128x128 E4M3 MTP experts. No runtime requant."""
+
+    def __init__(self, layer: RoutedExperts) -> None:
+        super().__init__(_BlockFp8QuantConfig(), layer)
+        logger.info_once(
+            "SM70 MTP experts: serialized block FP8 E4M3 [128, 128] "
+            "(TurboMind unpack to FP16 HMMA)."
+        )
+
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        from vllm.model_executor.layers.quantization.mixed_module_format import (
+            validate_serialized_fp8_experts,
+        )
+
+        validate_serialized_fp8_experts(layer.w13_weight, layer.w2_weight)
+        if not hasattr(layer, "w13_weight_scale_inv"):
+            raise ValueError("serialized MTP FP8 missing w13_weight_scale_inv")
+        super().process_weights_after_loading(layer)
+
+
+class Sm70OnlineBlockFp8MoEMethod(Fp8SM70MoEMethod):
+    """Load BF16 MoE experts, then pack official 128x128 FP8 for SM70."""
+
+    def __init__(self, layer: RoutedExperts) -> None:
+        super().__init__(_BlockFp8QuantConfig(), layer)
+        logger.info_once(
+            "SM70 MTP experts: runtime-amax block FP8 E4M3 [128, 128] "
+            "(not ModelOpt MSE; TurboMind unpack to FP16 HMMA)."
+        )
+
+    def create_weights(
+        self,
+        layer: RoutedExperts,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        layer.num_experts = num_experts
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = self.weight_block_size
+        w13_up_dim = 2 * intermediate_size_per_partition
+        w13_weight = Parameter(
+            torch.empty(
+                num_experts,
+                w13_up_dim,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+        w2_weight = Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        from vllm.model_executor.layers.quantization.mixed_module_format import (
+            validate_runtime_amax_experts,
+        )
+
+        validate_runtime_amax_experts(layer.w13_weight, layer.w2_weight)
+        w13_fp8, w13_scale = block_fp8_quantize(layer.w13_weight)
+        w2_fp8, w2_scale = block_fp8_quantize(layer.w2_weight)
+        layer.w13_weight = Parameter(w13_fp8, requires_grad=False)
+        layer.w2_weight = Parameter(w2_fp8, requires_grad=False)
+        layer.w13_weight_scale_inv = Parameter(w13_scale, requires_grad=False)
+        layer.w2_weight_scale_inv = Parameter(w2_scale, requires_grad=False)
+        logger.info_once(
+            "SM70 MTP experts requantized to block FP8 E4M3 [128, 128] "
+            "(same recipe as Qwen3.8-Flash-Next-FP8)."
+        )
+        super().process_weights_after_loading(layer)

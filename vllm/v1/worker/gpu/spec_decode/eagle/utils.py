@@ -1,5 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+import contextlib
+
 import torch
 import torch.nn as nn
 
@@ -24,6 +26,64 @@ def _should_share(eagle: nn.Module, flag: str, draft, target) -> bool:
     return torch.equal(w, target.weight)
 
 
+class _SingleStagePpView:
+    """Present one pipeline stage while delegating real collectives."""
+
+    def __init__(self, group):
+        self._group = group
+
+    @property
+    def world_size(self) -> int:
+        return 1
+
+    @property
+    def rank_in_group(self) -> int:
+        return 0
+
+    @property
+    def is_first_rank(self) -> bool:
+        return True
+
+    @property
+    def is_last_rank(self) -> bool:
+        return True
+
+    def __getattr__(self, name):
+        return getattr(self._group, name)
+
+
+@contextlib.contextmanager
+def single_stage_pp_for_draft(vllm_config: VllmConfig):
+    """Public alias used by the speculator around draft forwards."""
+    with _unsharded_pp_for_draft(vllm_config):
+        yield
+
+
+@contextlib.contextmanager
+def _unsharded_pp_for_draft(vllm_config: VllmConfig):
+    """Build the drafter as a single pipeline stage.
+
+    The speculator runs only on the last PP rank, which owns the target's
+    final hidden states. A PP-sharded draft head would make its non-first
+    stage demand IntermediateTensors that the speculator never sends, and
+    its layers would be split across ranks that never call it. Build the
+    whole head on each rank instead; only the last rank ever runs it.
+    """
+    if vllm_config.parallel_config.pipeline_parallel_size == 1:
+        yield
+        return
+
+    from vllm.distributed import parallel_state
+
+    original_pp = parallel_state._PP
+    assert original_pp is not None
+    parallel_state._PP = _SingleStagePpView(original_pp)
+    try:
+        yield
+    finally:
+        parallel_state._PP = original_pp
+
+
 def get_target_lm_head(target_model: nn.Module, target_language_model: nn.Module):
     """Return the language-model head for plain and conditional targets."""
     return getattr(target_language_model, "lm_head", None) or getattr(
@@ -37,7 +97,7 @@ def load_eagle_model(target_model: nn.Module, vllm_config: VllmConfig) -> nn.Mod
     speculative_config = vllm_config.speculative_config
     assert speculative_config is not None
     draft_model_config = speculative_config.draft_model_config
-    with set_model_tag("eagle_head"):
+    with set_model_tag("eagle_head"), _unsharded_pp_for_draft(vllm_config):
         eagle_model = get_model(
             vllm_config=vllm_config, model_config=draft_model_config
         )

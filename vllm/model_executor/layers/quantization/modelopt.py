@@ -1088,6 +1088,17 @@ def _explicit_nvfp4_emulation_requested() -> bool:
     )
 
 
+def _is_qwen4_mtp_draft() -> bool:
+    from vllm.config import get_current_vllm_config_or_none
+
+    cfg = get_current_vllm_config_or_none()
+    if cfg is None:
+        return False
+    hf = getattr(cfg.model_config, "hf_config", None)
+    arches = getattr(hf, "architectures", None) or []
+    return any("Qwen4ExpMTP" in str(arch) for arch in arches)
+
+
 def _try_prepare_sm70_modelopt_nvfp4(layer: torch.nn.Module) -> bool:
     """Prepare exact-SM70 TurboMind NVFP4 weights for a ModelOpt linear.
 
@@ -1125,12 +1136,18 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
         kv_cache_quant_algo: str | None = None,
         exclude_modules: list[str] | None = None,
         group_size: int = 16,
+        mixed_modules: dict[str, str] | None = None,
+        fp8_serialized: bool = False,
+        fp8_scale_convention: str = "amax_div_448",
     ) -> None:
         if exclude_modules is None:
             exclude_modules = []
         super().__init__(exclude_modules)
         self.quant_method = quant_method
         self.is_checkpoint_nvfp4_serialized = is_checkpoint_nvfp4_serialized
+        self.mixed_modules = mixed_modules or {}
+        self.fp8_serialized = fp8_serialized
+        self.fp8_scale_convention = fp8_scale_convention
         if is_checkpoint_nvfp4_serialized:
             logger.warning(
                 "Detected ModelOpt NVFP4 checkpoint (quant_algo=%s). Please "
@@ -1164,24 +1181,75 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
     def get_quant_method(
         self, layer: torch.nn.Module, prefix: str
     ) -> "QuantizeMethodBase | None":
-        if (
-            isinstance(layer, RoutedExperts)
-            and not self.is_layer_excluded(prefix)
-            and sm70_tm.is_exact_sm70_cuda_platform()
-        ):
-            if not sm70_tm.should_use_nvfp4_moe_turbomind():
-                raise NotImplementedError(
-                    "ModelOpt NVFP4 MoE on SM70 requires the TurboMind backend."
+        if isinstance(layer, RoutedExperts) and sm70_tm.is_exact_sm70_cuda_platform():
+            method = self._sm70_mixed_expert_method(layer, prefix)
+            if method is not None:
+                return method
+            if not self.is_layer_excluded(prefix):
+                if not sm70_tm.should_use_nvfp4_moe_turbomind():
+                    raise NotImplementedError(
+                        "ModelOpt NVFP4 MoE on SM70 requires the "
+                        "TurboMind backend."
+                    )
+                from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
+                    ModelOptNvFp4SM70MoEMethod,
                 )
-            from vllm.model_executor.layers.quantization.nvfp4_sm70_moe import (
-                ModelOptNvFp4SM70MoEMethod,
-            )
 
-            return ModelOptNvFp4SM70MoEMethod(
-                quant_config=self,
-                moe_config=layer.moe_config,
-            )
+                logger.info_once(
+                    "SM70 MoE format=nvfp4 kernel=ModelOptNvFp4SM70MoEMethod"
+                )
+                return ModelOptNvFp4SM70MoEMethod(
+                    quant_config=self,
+                    moe_config=layer.moe_config,
+                )
         return super().get_quant_method(layer, prefix)
+
+    def _sm70_mixed_expert_method(
+        self, layer: RoutedExperts, prefix: str
+    ) -> "QuantizeMethodBase | None":
+        from vllm.model_executor.layers.quantization.fp8_sm70_moe import (
+            Sm70OnlineBlockFp8MoEMethod,
+            Sm70SerializedBlockFp8MoEMethod,
+        )
+        from vllm.model_executor.layers.quantization.mixed_module_format import (
+            FORMAT_BF16,
+            FORMAT_FP8_BLOCK128,
+            FORMAT_FP8_RUNTIME_AMAX,
+            lookup_mixed_format,
+        )
+
+        fmt = lookup_mixed_format(self.mixed_modules, prefix)
+        is_draft_experts = _is_qwen4_mtp_draft() and "language_model" not in prefix
+        if fmt is None and self.mixed_modules and is_draft_experts:
+            raise ValueError(
+                f"MTP expert {prefix!r} has no mixed_modules format. "
+                "Fail closed: NVFP4 model metadata must not imply NVFP4 MTP."
+            )
+        if fmt is None and is_draft_experts and envs.VLLM_SM70_MTP_ARCH_FALLBACK:
+            logger.warning_once(
+                "SM70 MTP experts: architecture fallback because mixed_modules "
+                "is absent. Set VLLM_SM70_MTP_ARCH_FALLBACK=0 to fail closed."
+            )
+            fmt = (
+                FORMAT_FP8_RUNTIME_AMAX
+                if envs.VLLM_SM70_MTP_BLOCK_FP8
+                else FORMAT_BF16
+            )
+        if fmt in (FORMAT_FP8_BLOCK128, FORMAT_FP8_RUNTIME_AMAX):
+            if fmt == FORMAT_FP8_BLOCK128 and self.fp8_serialized:
+                logger.info_once(
+                    "SM70 MoE format=fp8_block128 kernel="
+                    "Sm70SerializedBlockFp8MoEMethod"
+                )
+                return Sm70SerializedBlockFp8MoEMethod(layer)
+            logger.info_once(
+                "SM70 MoE format=fp8_block128_runtime kernel="
+                "Sm70OnlineBlockFp8MoEMethod"
+            )
+            return Sm70OnlineBlockFp8MoEMethod(layer)
+        if fmt == FORMAT_BF16:
+            return None
+        return None
 
     @classmethod
     def get_min_capability(cls) -> int:
@@ -1224,11 +1292,11 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
         if group_size is None:
             group_size = 16  # Default value
 
-        # For FP4, these fields are required
+        # Flash Next NVFP4 checkpoints omit kv_cache_quant_algo. They do not
+        # quantize KV. Require only group_size and exclude_modules.
         if is_checkpoint_nvfp4_serialized and "quantization" in original_config:
-            # Check if required fields are present in the quantization config
             quant_config = original_config["quantization"]
-            required_fields = ["group_size", "kv_cache_quant_algo", "exclude_modules"]
+            required_fields = ["group_size", "exclude_modules"]
             missing_fields = [
                 field for field in required_fields if field not in quant_config
             ]
@@ -1238,12 +1306,33 @@ class ModelOptNvFp4Config(ModelOptQuantConfigBase):
                     f"hf_quant_config.json: {missing_fields}"
                 )
 
+        mixed_modules = {}
+        fp8_serialized = False
+        fp8_scale_convention = "amax_div_448"
+        if "quantization" in original_config:
+            quant_config = original_config["quantization"]
+            mixed_modules = dict(quant_config.get("mixed_modules") or {})
+            fp8_serialized = bool(quant_config.get("fp8_serialized", False))
+            fp8_scale_convention = str(
+                quant_config.get("fp8_scale_convention", "amax_div_448")
+            )
+            if (
+                fp8_scale_convention
+                and fp8_scale_convention != "amax_div_448"
+            ):
+                raise ValueError(
+                    "unsupported fp8_scale_convention "
+                    f"{fp8_scale_convention!r}; only amax_div_448 is proven"
+                )
         return cls(
             quant_method,
             is_checkpoint_nvfp4_serialized,
             kv_cache_quant_method,
             exclude_modules,
             group_size,
+            mixed_modules=mixed_modules,
+            fp8_serialized=fp8_serialized,
+            fp8_scale_convention=fp8_scale_convention,
         )
 
 

@@ -36,7 +36,10 @@ from vllm.v1.worker.gpu.spec_decode.eagle.cudagraph import (
     DecodeEagleCudaGraphManager,
     PrefillEagleCudaGraphManager,
 )
-from vllm.v1.worker.gpu.spec_decode.eagle.utils import load_eagle_model
+from vllm.v1.worker.gpu.spec_decode.eagle.utils import (
+    load_eagle_model,
+    single_stage_pp_for_draft,
+)
 
 logger = init_logger(__name__)
 
@@ -319,12 +322,16 @@ class EagleSpeculator:
                 )
                 inputs_embeds = self.inputs_embeds[:num_tokens]
 
-            ret_hidden_states = self.model(
-                input_ids=self.input_buffers.input_ids[:num_tokens],
-                positions=self.input_buffers.positions[:num_tokens],
-                hidden_states=self.hidden_states[:num_tokens],
-                inputs_embeds=inputs_embeds,
-            )
+            # The draft head is built unsharded and runs only on the last PP
+            # rank. Present a single-stage view so its first/last-rank
+            # branches take the whole-model path.
+            with single_stage_pp_for_draft(self.vllm_config):
+                ret_hidden_states = self.model(
+                    input_ids=self.input_buffers.input_ids[:num_tokens],
+                    positions=self.input_buffers.positions[:num_tokens],
+                    hidden_states=self.hidden_states[:num_tokens],
+                    inputs_embeds=inputs_embeds,
+                )
         # Some MTP models declare a single-tensor contract but return
         # (logits_hidden, feedback_hidden) for final-norm correctness.
         if isinstance(ret_hidden_states, tuple):
