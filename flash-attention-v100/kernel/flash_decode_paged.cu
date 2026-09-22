@@ -5386,7 +5386,6 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
       partial.data_ptr<float>(), lse.data_ptr<float>(), q.size(0),
       block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
       v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale, nullptr,
-      v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale, nullptr,
       1, nullptr, nullptr, 0, 0, nullptr, row_lengths.data_ptr<int>());
       <<<dim3(q.size(0), 6), kGroupedVerifyThreads, 0, stream>>>(
           partial.data_ptr<float>(), lse.data_ptr<float>(),
