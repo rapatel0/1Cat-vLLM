@@ -6081,8 +6081,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 self.dflash2_grouped_verify_min_model_len,
                 getattr(attn_metadata, "causal", True),
                 self._flash_v100_window_size(causal=True),
-                num_reqs,
-                max_query_len,
                 num_query_tokens,
                 max_query_len,
                 self.dflash2_grouped_verify_max_query_tokens,

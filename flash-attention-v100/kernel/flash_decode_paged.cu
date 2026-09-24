@@ -2267,13 +2267,8 @@ __launch_bounds__(kGroupedVerifyThreads, 2) void flash_attention_grouped_verify_
   }
 
 
-  if constexpr (!SPARSE_PAGE4) {
-    partial_out += static_cast<int64_t>(group_idx) * Traits::kSplits *
-                   MAX_QUERY_TOKENS * kGroupedVerifyHeads *
-                   kGroupedVerifyHeadDim;
-    partial_lse += static_cast<int64_t>(group_idx) * Traits::kSplits *
-                   MAX_QUERY_TOKENS * kGroupedVerifyHeads;
-  }
+  // The store indices below already include group_idx. Do not advance these
+  // pointers again: that skips odd requests and writes beyond the workspace.
   int total_kv = seq_lens[group_idx];
   if constexpr (ROW_SEQLENS) {
     total_kv = 0;
