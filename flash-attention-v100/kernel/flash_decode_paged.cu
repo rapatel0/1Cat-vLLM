@@ -5444,13 +5444,14 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
       partial.data_ptr<float>(), lse.data_ptr<float>(), q.size(0) / batch_size,
       block_table.size(1), k.size(1), k.stride(0), k.stride(1), k.stride(2),
       v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale, nullptr,
-      static_cast<int>(batch_size), row_lengths.data_ptr<int>());
+      static_cast<int>(batch_size), nullptr, nullptr, 0, 0, nullptr,
+      row_lengths.data_ptr<int>());
   flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
       <<<dim3(q.size(0) / batch_size, 6, batch_size), kGroupedVerifyThreads, 0,
          stream>>>(partial.data_ptr<float>(), lse.data_ptr<float>(),
-                   row_lengths.data_ptr<int>(),
+                   row_lengths.data_ptr<int>(), nullptr,
                    reinterpret_cast<__half*>(out.data_ptr()),
-                   q.size(0) / batch_size, row_lengths.data_ptr<int>());
+                   q.size(0) / batch_size, static_cast<int>(batch_size));
   C10_CUDA_KERNEL_LAUNCH_CHECK();
   return out;
 }
