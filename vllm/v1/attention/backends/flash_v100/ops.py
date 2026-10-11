@@ -4,6 +4,7 @@
 
 from __future__ import annotations
 
+import importlib
 import inspect
 from collections.abc import Callable
 from contextlib import suppress
@@ -45,6 +46,11 @@ _sm70_d256_gqa_architecture_q8192_op = None
 _sm70_d256_gqa_architecture_q8192_op_checked = False
 _fp8_e5m2_paged_kv_to_fp16 = None
 _fp8_e5m2_paged_kv_to_fp16_checked = False
+_int8_block32_decode_paged = None
+_int8_block32_prefill_paged = None
+_int8_block32_reshape_and_cache = None
+_int8_block32_paged_kv_to_fp16 = None
+_int8_block32_ops_checked = False
 _flash_attn_turboquant_decode_paged = None
 _flash_attn_turboquant_decode_checked = False
 _paged_kv_utils = None
@@ -355,6 +361,50 @@ def get_fp8_e5m2_paged_kv_bridge_op():
     return _fp8_e5m2_paged_kv_to_fp16
 
 
+def get_int8_block32_ops():
+    """Return (decode, prefill, reshape_and_cache, paged_kv_to_fp16) or Nones."""
+    global _int8_block32_decode_paged, _int8_block32_prefill_paged
+    global _int8_block32_reshape_and_cache, _int8_block32_paged_kv_to_fp16
+    global _int8_block32_ops_checked
+    if not _int8_block32_ops_checked:
+        _int8_block32_ops_checked = True
+        try:
+            try:
+                extension = importlib.import_module(
+                    "flash_attn_v100.flash_attn_v100_cuda"
+                )
+            except ImportError:
+                # Source-tree installs expose the extension as a top-level module.
+                extension = importlib.import_module("flash_attn_v100_cuda")
+            _int8_block32_decode_paged = extension.int8_block32_decode_paged
+            _int8_block32_prefill_paged = extension.int8_block32_prefill_paged
+            _int8_block32_reshape_and_cache = extension.int8_block32_reshape_and_cache
+            _int8_block32_paged_kv_to_fp16 = getattr(
+                extension, "int8_block32_paged_kv_to_fp16", None
+            )
+        except (ImportError, AttributeError):
+            _int8_block32_decode_paged = None
+            _int8_block32_prefill_paged = None
+            _int8_block32_reshape_and_cache = None
+            _int8_block32_paged_kv_to_fp16 = None
+    return (
+        _int8_block32_decode_paged,
+        _int8_block32_prefill_paged,
+        _int8_block32_reshape_and_cache,
+        _int8_block32_paged_kv_to_fp16,
+    )
+
+
+def get_int8_block32_reshape_and_cache():
+    """Return the INT8 block32 cache writer, or None when it is unavailable.
+
+    Other INT8 block32 cache owners, such as a sparse-attention layer, reuse
+    this single writer so every route produces the same signed payload and FP16
+    block-scale layout.
+    """
+    return get_int8_block32_ops()[2]
+
+
 # MLA context-chunk prefill needs the LSE that the dense SM70 kernel already
 # computes, plus independent Q and K sequence metadata for M != N attention.
 _flash_attn_forward_lse: Callable[..., tuple[torch.Tensor, ...]] | None = None
@@ -454,6 +504,7 @@ def get_paged_kv_utils():
 LEGACY_ALIASES = {
     "_get_paged_kv_utils": "get_paged_kv_utils",
     "_get_fp8_e5m2_paged_kv_bridge_op": "get_fp8_e5m2_paged_kv_bridge_op",
+    "_get_int8_block32_ops": "get_int8_block32_ops",
     "_get_sm70_v37_e4m3_bridge_op": "get_sm70_v37_e4m3_bridge_op",
     "_get_flash_dense_forward": "get_flash_dense_forward",
     "_get_sm70_d256_gqa_architecture_op": "get_sm70_d256_gqa_architecture_op",
@@ -471,6 +522,7 @@ if TYPE_CHECKING:
     # Static compatibility only; runtime writes use live owner aliases.
     _get_paged_kv_utils = get_paged_kv_utils
     _get_fp8_e5m2_paged_kv_bridge_op = get_fp8_e5m2_paged_kv_bridge_op
+    _get_int8_block32_ops = get_int8_block32_ops
     _get_sm70_v37_e4m3_bridge_op = get_sm70_v37_e4m3_bridge_op
     _get_flash_dense_forward = get_flash_dense_forward
     _get_sm70_d256_gqa_architecture_op = get_sm70_d256_gqa_architecture_op

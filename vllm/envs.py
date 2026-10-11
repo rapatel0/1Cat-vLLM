@@ -463,6 +463,8 @@ if TYPE_CHECKING:
     VLLM_SM70_FP8_TURBOMIND: bool = True
     VLLM_SM70_FP8_DENSE_GATED_SILU: bool = True
     VLLM_SM70_NVFP4_TURBOMIND: bool = True
+    VLLM_SM70_MTP_BLOCK_FP8: bool = True
+    VLLM_SM70_MTP_ARCH_FALLBACK: bool = True
     VLLM_SM70_NVFP4_MOE_GROUPED_PREFILL: bool = True
     VLLM_SM70_NVFP4_MOE_GROUPED_EXPERT_ROWS: bool = False
     VLLM_SM70_NVFP4_DENSE_GATED_SILU: bool = True
@@ -7325,6 +7327,33 @@ environment_variables: dict[str, Callable[[], Any]] = {
             "Accepted SM70 FP4-family dense routes. Default-on keeps "
             "NVFP4/MXFP4 checkpoints loadable and fast on V100; set either env"
             " to 0 to force the non-TurboMind route for diagnostics."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_MTP_BLOCK_FP8": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_BLOCK_FP8", "1"))),
+        description=(
+            "SM70 MTP experts without a mixed_modules format run as runtime-amax "
+            "block FP8. Default on; set 0 to run them as BF16."
+        ),
+        category="configuration",
+        declared_default="True",
+        effective_default="True",
+        automatic_conditions=(),
+        acceleration_paths=("TurboMind NVFP4",),
+        user_visible=False,
+    ),
+    "VLLM_SM70_MTP_ARCH_FALLBACK": env_var(
+        lambda: bool(int(os.getenv("VLLM_SM70_MTP_ARCH_FALLBACK", "1"))),
+        description=(
+            "SM70 MTP experts fall back to the architecture default format when "
+            "the checkpoint has no mixed_modules metadata. Default on; set 0 to "
+            "fail closed."
         ),
         category="configuration",
         declared_default="True",

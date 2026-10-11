@@ -67,7 +67,12 @@ FP8_E5M2 = KVCodec(
     "fp8_e5m2", ("fp8_e5m2",), torch.uint8, torch.float8_e5m2, quantized=True
 )
 
-KV_CODECS: tuple[KVCodec, ...] = (FP16, BF16, FP8_E4M3, FP8_E5M2)
+# Signed INT8 payloads with separate FP16 page, head and 32-channel scales. The
+# cache is a [pages, page_bytes] int8 tensor, so it has no element reinterpretation
+# and is never dequantized with a per-tensor scale.
+INT8_BLOCK32 = KVCodec("int8_block32", ("int8_block32",), torch.int8)
+
+KV_CODECS: tuple[KVCodec, ...] = (FP16, BF16, FP8_E4M3, FP8_E5M2, INT8_BLOCK32)
 _BY_ALIAS = {alias: codec for codec in KV_CODECS for alias in codec.aliases}
 
 

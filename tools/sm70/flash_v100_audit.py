@@ -45,6 +45,7 @@ def forbidden(source, target):
             "decode": "exec",
             "prefill": "exec",
             "prefill_candidates": "exec",
+            "int8_block32": "exec",
             "verify": "exec",
             "routing": "plan",
             "debug_compare": "debug",

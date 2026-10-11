@@ -1538,7 +1538,14 @@ class GDNAttentionMetadataBuilder(AttentionMetadataBuilder[GDNAttentionMetadata]
                 spec_state_slot_selectors = state_contract.spec_state_slot_selectors
             assert spec_query_start_loc is not None
             if common_gdn_metadata is None:
-                assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
+                # ``spec_query_start_loc`` lives on the device, so ``.item()``
+                # forces a cudaStreamSynchronize on every build. The value is
+                # a construction invariant, not input validation, so keep the
+                # check behind the same opt-in gate used by the other GDN sync
+                # asserts in this file. The common_gdn_metadata branch below
+                # already compares host scalars and needs no gate.
+                if envs.VLLM_SM70_DFLASH2_GDN_SYNC_ASSERT:
+                    assert spec_query_start_loc[-1].item() == num_spec_decode_tokens
             else:
                 assert (
                     common_gdn_metadata.num_spec_decode_tokens == num_spec_decode_tokens

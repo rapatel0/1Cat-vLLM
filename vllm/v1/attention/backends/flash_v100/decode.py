@@ -78,6 +78,7 @@ class DecodeOps:
     draft_debug_log: Callable[..., None]
     format_debug: Callable[..., str]
     scalar_override: Callable[..., None] | None = None
+    int8_block32: Any = None
 
 
 @dataclass(frozen=True)
@@ -988,6 +989,25 @@ class DecodeUnavailable(DecodeCandidate):
         )
 
 
+class DecodeInt8Block32(DecodeCandidate):
+    def admit(self, request: DecodeRequest) -> bool:
+        return self.executor.config.kv_cache_dtype == "int8_block32"
+
+    def run(self, request: DecodeRequest, record: _plan.RecordRoute) -> torch.Tensor:
+        if self.executor.ops.int8_block32 is None:
+            raise RuntimeError("FLASH_ATTN_V100 INT8 block decoder is unavailable")
+        self.executor.ops.profile_trace(
+            "forward branch=decode_int8_block32 layer=%s", request.layer_name
+        )
+        record(_routing.ROUTE_SPECS["decode_int8_block32_register"].name)
+        return self.executor.ops.int8_block32.decode(
+            request.query,
+            request.kv_cache,
+            request.attn_metadata,
+            request.output,
+        )
+
+
 class DecodePagedPrefill(DecodeCandidate):
     def admit(self, request: DecodeRequest) -> bool:
         return (
@@ -1207,6 +1227,7 @@ class DecodePaged(DecodeCandidate):
 
 DECODE_CANDIDATES = (
     DecodeUnavailable,
+    DecodeInt8Block32,
     DecodePagedPrefill,
     DecodeDenseCache,
     DecodeDenseReference,

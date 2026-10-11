@@ -18,6 +18,7 @@ from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import debug_compare as _debug_compare
 from vllm.v1.attention.backends.flash_v100 import decode as _decode
 from vllm.v1.attention.backends.flash_v100 import dense_prefill as _dense_prefill
+from vllm.v1.attention.backends.flash_v100 import int8_block32 as _int8
 from vllm.v1.attention.backends.flash_v100 import masks as _masks
 from vllm.v1.attention.backends.flash_v100 import ops as _ops
 from vllm.v1.attention.backends.flash_v100 import prefill as _prefill
@@ -457,11 +458,51 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             return None
         return codec
 
+    def _int8_block32_attention(self) -> _int8.Int8Block32Attention | None:
+        if getattr(self, "kv_cache_dtype", "auto") != "int8_block32":
+            return None
+        decode, prefill, writer, bridge = _ops.get_int8_block32_ops()
+        return _int8.Int8Block32Attention(
+            _int8.Int8Block32Ops(
+                scale=self.scale,
+                num_kv_heads=self.num_kv_heads,
+                head_size=self.head_size,
+                decode_paged=decode,
+                prefill_paged=prefill,
+                reshape_and_cache=writer,
+                paged_kv_to_fp16=bridge,
+                xqa=getattr(self, "flash_attn_decode_paged_xqa", None),
+                fp16_prefill_paged=getattr(self, "flash_attn_prefill_paged", None),
+                use_prefill_paged=bool(
+                    getattr(self, "use_flash_v100_prefill_paged", False)
+                ),
+                window_size=self._flash_v100_window_size,
+            )
+        )
+
+    def do_kv_cache_update(
+        self,
+        layer: torch.nn.Module,
+        key: torch.Tensor,
+        value: torch.Tensor,
+        kv_cache: torch.Tensor,
+        slot_mapping: torch.Tensor,
+    ) -> None:
+        int8 = self._int8_block32_attention()
+        if int8 is None:
+            super().do_kv_cache_update(layer, key, value, kv_cache, slot_mapping)
+            return
+        int8.update_cache(key, value, kv_cache, slot_mapping)
+
     def _supports_flash_v100_path(self) -> bool:
         """Check whether current layer/config can run Flash V100 safely."""
-        supported_kv_dtype = not _routing.uses_fp8_kv_cache(
-            self.kv_cache_dtype
-        ) or self.kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
+        supported_kv_dtype = (
+            not _routing.uses_fp8_kv_cache(self.kv_cache_dtype)
+            or self.kv_cache_dtype in ("fp8", "fp8_e4m3", "fp8_e5m2")
+        ) and (
+            self.kv_cache_dtype != "int8_block32"
+            or all(op is not None for op in _ops.get_int8_block32_ops()[:3])
+        )
         return (
             self.use_flash_v100
             and self.attn_type == AttentionType.DECODER
@@ -516,6 +557,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             draft_debug_log=_debug.draft_graph_debug_log,
             format_debug=_debug.format_tensor_debug,
             scalar_override=vars(self).get("_call_flash_attn_decode_paged"),
+            int8_block32=self._int8_block32_attention(),
         )
         workspace = getattr(self, "workspace", None)
         if workspace is None:
@@ -617,6 +659,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             capture_prefix_kind=_feature.capture_prefix_kind,
             record_capture_prefix=_feature.record_capture_prefix,
             record_capture_layout=_feature.record_capture_layout,
+            int8_block32=self._int8_block32_attention(),
         )
         overrides = {
             name: vars(self)[name]

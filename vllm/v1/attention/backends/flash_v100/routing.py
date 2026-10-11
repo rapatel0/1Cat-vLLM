@@ -26,6 +26,7 @@ from vllm.v1.attention.kv_codecs import (
     FP8_E4M3,
     FP8_E5M2,
     FP16,
+    INT8_BLOCK32,
     KVCodec,
     canonical_kv_cache_dtype,
     resolve_kv_codec,
@@ -334,6 +335,22 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
             ),
             "prefill",
             {},
+        ),
+        (
+            "decode_int8_block32_register decode_int8_block32_xqa "
+            "decode_int8_block32_register_fallback",
+            "decode",
+            {"codecs": frozenset((INT8_BLOCK32,))},
+        ),
+        (
+            (
+                "prefill_smallq_int8_block32_register "
+                "prefill_prefix_int8_block32_register "
+                "prefill_prefix_int8_block32_bridge_fp16 "
+                "prefill_prefix_int8_block32_bridge_fp16_multi_request"
+            ),
+            "prefill",
+            {"codecs": frozenset((INT8_BLOCK32,))},
         ),
         (
             "flashinfer_sm70_fixed_entry flashinfer_sm70_splitkv3_fast_visible",

@@ -4,6 +4,10 @@
 
 from __future__ import annotations
 
+from typing import ClassVar
+
+import torch
+
 from vllm.logger import init_logger
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import impl as _impl
@@ -17,6 +21,12 @@ logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 class FlashAttnV100Backend(TritonAttentionBackend):
     """Flash Attention V100 Backend."""
+
+    supported_dtypes: ClassVar[list[torch.dtype]] = [torch.float16]
+    supported_kv_cache_dtypes = [
+        *TritonAttentionBackend.supported_kv_cache_dtypes,
+        "int8_block32",
+    ]
 
     # Keep vLLM unified KV cache update path.
     forward_includes_kv_cache_update: bool = False

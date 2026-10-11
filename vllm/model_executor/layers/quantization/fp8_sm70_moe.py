@@ -97,6 +97,14 @@ def _single_token_indexed_w2_enabled(policy: Sm70MoEFormatConfig | None = None) 
     )
 
 
+def _single_token_shortcuts_support_expert_topology(layer: RoutedExperts) -> bool:
+    """Return whether global router IDs are valid local expert row indices."""
+    return (
+        layer.expert_map is None
+        and layer.local_num_experts == layer.global_num_experts
+    )
+
+
 class Fp8SM70MoEMethod(Sm70MoEMethodBase):
     """SM70 FP8 MoE path backed by TurboMind kernels.
 
@@ -232,6 +240,7 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
                 w13, w13_scale, shard_size, layer.local_num_experts
             )
 
+        # pi-lens-ignore: unchecked-throwing-call-python
         num_experts = int(w13.shape[0])
         (
             (w13_tm_weights, w13_tm_scales, w13_meta),
@@ -249,7 +258,9 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
         layer.w2_tm_scales = Parameter(torch.stack(w2_tm_scales), requires_grad=False)
         layer.w2_tm_meta = Parameter(torch.stack(w2_meta), requires_grad=False)
 
+        # pi-lens-ignore: unchecked-throwing-call-python
         w13_k_ld, w13_q_ld = int(w13_meta[0][0].item()), int(w13_meta[0][1].item())
+        # pi-lens-ignore: unchecked-throwing-call-python
         w2_k_ld, w2_q_ld = int(w2_meta[0][0].item()), int(w2_meta[0][1].item())
         w13_ptrs = self.native_ops.awq_moe_build_strided_ptrs(
             layer.w13_tm_weight,
@@ -269,6 +280,7 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
         layer.w13_strided_ptrs_s = Parameter(w13_ptrs[1], requires_grad=False)
         layer.w2_strided_ptrs_w = Parameter(w2_ptrs[0], requires_grad=False)
         layer.w2_strided_ptrs_s = Parameter(w2_ptrs[1], requires_grad=False)
+        # pi-lens-ignore: unchecked-throwing-call-python
         ptr_row_bytes = int(layer.w13_strided_ptrs_w.numel() // num_experts)
         layer.sm70_ptr_row_bytes = ptr_row_bytes
         layer.w13_strided_ptrs_w_rows = layer.w13_strided_ptrs_w.view(
@@ -285,10 +297,15 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
         )
 
         layer.sm70_num_experts = num_experts
+        # pi-lens-ignore: unchecked-throwing-call-python
         layer.sm70_hidden_logical_size = int(w2.shape[1])
+        # pi-lens-ignore: unchecked-throwing-call-python
         layer.sm70_w13_k_dim = int(layer.w13_tm_weight.shape[1])
+        # pi-lens-ignore: unchecked-throwing-call-python
         layer.sm70_w13_n_dim = int(layer.w13_tm_weight.shape[2])
+        # pi-lens-ignore: unchecked-throwing-call-python
         layer.sm70_w2_k_dim = int(layer.w2_tm_weight.shape[1])
+        # pi-lens-ignore: unchecked-throwing-call-python
         layer.sm70_w2_n_dim = int(layer.w2_tm_weight.shape[2])
         layer.sm70_intermediate_size = layer.sm70_w2_k_dim
         layer.sm70_fp8_moe_batched_gemm = self.use_batched_gemm
@@ -406,6 +423,11 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
         top_k: int,
         output: torch.Tensor,
     ) -> torch.Tensor:
+        if not _single_token_shortcuts_support_expert_topology(layer):
+            raise RuntimeError(
+                "SM70 FP8 MoE single-token shortcuts require fully replicated "
+                "experts because their router IDs index local expert rows."
+            )
         exact_layout = self.compact_exact_layout
         _log_runtime_route_once(
             "SM70 FP8 MoE legacy single-token %s compact path enabled "
@@ -544,8 +566,12 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
 
         topk_ids_i32 = buffers["topk_ids"]
         topk_ids_i32.copy_(topk_ids, non_blocking=True)
+        single_token_shortcuts_supported = (
+            _single_token_shortcuts_support_expert_topology(layer)
+        )
         if (
             num_tokens == 1
+            and single_token_shortcuts_supported
             and layer.sm70_fp8_moe_batched_gemm
             and self.legacy_single_token
         ):
@@ -621,6 +647,7 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
         )
         if (
             num_tokens == 1
+            and single_token_shortcuts_supported
             and layer.sm70_fp8_moe_batched_gemm
             and self.compact_compare_reference
             and hasattr(torch.ops._C, "awq_moe_single_token_exact_layout_prepare")
@@ -655,3 +682,135 @@ class Fp8SM70MoEMethod(Sm70MoEMethodBase):
     ) -> torch.Tensor:
         del layer, x, router_logits, input_ids
         raise NotImplementedError("SM70 FP8 MoE base path is not monolithic.")
+
+
+_E4M3_MAX = float(torch.finfo(torch.float8_e4m3fn).max)
+
+
+def block_fp8_quantize(
+    weight: torch.Tensor,
+    block_n: int = 128,
+    block_k: int = 128,
+    *,
+    scale_dtype: torch.dtype = torch.bfloat16,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Quantize `[E, N, K]` weights to E4M3 with official Flash Next scales.
+
+    Proven convention from Qwen3.8-Flash-Next-FP8 MTP experts:
+    dequant = fp8.float() * weight_scale_inv
+    weight_scale_inv = amax / 448, layout [E, ceil(N/128), ceil(K/128)],
+    scale dtype bfloat16. This is runtime-amax, not a ModelOpt MSE clone.
+    """
+    if weight.ndim != 3:
+        raise ValueError(f"expected [E, N, K] weights, got {tuple(weight.shape)}")
+    if block_n != 128 or block_k != 128:
+        raise ValueError("official MTP FP8 uses 128x128 blocks only")
+    num_experts, n, k = weight.shape
+    ns = (n + block_n - 1) // block_n
+    ks = (k + block_k - 1) // block_k
+    pad_n = ns * block_n - n
+    pad_k = ks * block_k - k
+    weight_f = weight.to(torch.float32)
+    if pad_n or pad_k:
+        weight_f = torch.nn.functional.pad(weight_f, (0, pad_k, 0, pad_n))
+    blocks = weight_f.view(num_experts, ns, block_n, ks, block_k)
+    amax = blocks.abs().amax(dim=(2, 4)).clamp(min=1e-12)
+    scale_f = amax / _E4M3_MAX
+    quant = blocks / scale_f.unsqueeze(2).unsqueeze(4)
+    quant = quant.clamp(-_E4M3_MAX, _E4M3_MAX).to(torch.float8_e4m3fn)
+    quant = quant.reshape(num_experts, ns * block_n, ks * block_k)[:, :n, :k]
+    return quant.contiguous(), scale_f.to(scale_dtype).contiguous()
+
+
+class _BlockFp8QuantConfig:
+    weight_block_size = [128, 128]
+    activation_scheme = "dynamic"
+    is_checkpoint_fp8_serialized = True
+
+
+class Sm70SerializedBlockFp8MoEMethod(Fp8SM70MoEMethod):
+    """Load already-serialized 128x128 E4M3 MTP experts. No runtime requant."""
+
+    def __init__(self, layer: RoutedExperts) -> None:
+        super().__init__(_BlockFp8QuantConfig(), layer)
+        logger.info_once(
+            "SM70 MTP experts: serialized block FP8 E4M3 [128, 128] "
+            "(TurboMind unpack to FP16 HMMA)."
+        )
+
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        from vllm.model_executor.layers.quantization.mixed_module_format import (
+            validate_serialized_fp8_experts,
+        )
+
+        validate_serialized_fp8_experts(layer.w13_weight, layer.w2_weight)
+        if not hasattr(layer, "w13_weight_scale_inv"):
+            raise ValueError("serialized MTP FP8 missing w13_weight_scale_inv")
+        super().process_weights_after_loading(layer)
+
+
+class Sm70OnlineBlockFp8MoEMethod(Fp8SM70MoEMethod):
+    """Load BF16 MoE experts, then pack official 128x128 FP8 for SM70."""
+
+    def __init__(self, layer: RoutedExperts) -> None:
+        super().__init__(_BlockFp8QuantConfig(), layer)
+        logger.info_once(
+            "SM70 MTP experts: runtime-amax block FP8 E4M3 [128, 128] "
+            "(not ModelOpt MSE; TurboMind unpack to FP16 HMMA)."
+        )
+
+    def create_weights(
+        self,
+        layer: RoutedExperts,
+        num_experts: int,
+        hidden_size: int,
+        intermediate_size_per_partition: int,
+        params_dtype: torch.dtype,
+        **extra_weight_attrs,
+    ):
+        layer.num_experts = num_experts
+        layer.orig_dtype = params_dtype
+        layer.weight_block_size = self.weight_block_size
+        w13_up_dim = 2 * intermediate_size_per_partition
+        w13_weight = Parameter(
+            torch.empty(
+                num_experts,
+                w13_up_dim,
+                hidden_size,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w13_weight", w13_weight)
+        set_weight_attrs(w13_weight, extra_weight_attrs)
+        w2_weight = Parameter(
+            torch.empty(
+                num_experts,
+                hidden_size,
+                intermediate_size_per_partition,
+                dtype=params_dtype,
+            ),
+            requires_grad=False,
+        )
+        layer.register_parameter("w2_weight", w2_weight)
+        set_weight_attrs(w2_weight, extra_weight_attrs)
+        layer.w13_input_scale = None
+        layer.w2_input_scale = None
+
+    def process_weights_after_loading(self, layer: RoutedExperts) -> None:
+        from vllm.model_executor.layers.quantization.mixed_module_format import (
+            validate_runtime_amax_experts,
+        )
+
+        validate_runtime_amax_experts(layer.w13_weight, layer.w2_weight)
+        w13_fp8, w13_scale = block_fp8_quantize(layer.w13_weight)
+        w2_fp8, w2_scale = block_fp8_quantize(layer.w2_weight)
+        layer.w13_weight = Parameter(w13_fp8, requires_grad=False)
+        layer.w2_weight = Parameter(w2_fp8, requires_grad=False)
+        layer.w13_weight_scale_inv = Parameter(w13_scale, requires_grad=False)
+        layer.w2_weight_scale_inv = Parameter(w2_scale, requires_grad=False)
+        logger.info_once(
+            "SM70 MTP experts requantized to block FP8 E4M3 [128, 128] "
+            "(same recipe as Qwen3.8-Flash-Next-FP8)."
+        )
+        super().process_weights_after_loading(layer)

@@ -1219,6 +1219,26 @@ def observe_prefill_reference(
     )
 
 
+def _forward_int8_block32(
+    self: PrefillExecutor,
+    int8,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: TritonAttentionMetadata,
+    output: torch.Tensor,
+    validate: bool = False,
+) -> torch.Tensor:
+    """Prefix prefill over a signed INT8 block cache (never a Triton fallback)."""
+    if validate:
+        causal = bool(getattr(attn_metadata, "causal", True))
+        if not causal or self._flash_v100_window_size(causal) != (-1, -1):
+            raise RuntimeError(
+                "FLASH_ATTN_V100 INT8 block cache prefix prefill "
+                "requires causal full attention"
+            )
+    return int8.small_query_prefill_as_decode(query, kv_cache, attn_metadata, output)
+
+
 def forward(
     self: PrefillExecutor,
     layer: torch.nn.Module,
@@ -1245,7 +1265,15 @@ def forward(
             available_query_tokens,
         )
     )
+    int8 = self.ops.int8_block32 if self.kv_cache_dtype == "int8_block32" else None
+    if int8 is not None and is_capturing:
+        return _forward_int8_block32(self, int8, query, kv_cache, attn_metadata, output)
     if self.use_triton_prefill:
+        if int8 is not None:
+            raise RuntimeError(
+                "FLASH_ATTN_V100 INT8 block cache cannot use the "
+                "Triton prefill fallback"
+            )
         if not log_once_seen("flash_v100._logged_prefill_triton_safe"):
             logger.info_once(
                 "FLASH_ATTN_V100 prefill uses explicit Triton diagnostic "
@@ -1312,6 +1340,10 @@ def forward(
         attn_metadata
     )
     smallq_decode = has_prefix_context and self.ops.small_query_enabled(attn_metadata)
+    if has_prefix_context and int8 is not None:
+        return _forward_int8_block32(
+            self, int8, query, kv_cache, attn_metadata, output, validate=True
+        )
     if has_prefix_context:
         return _forward_with_prefix(
             self,
@@ -1337,7 +1369,11 @@ def forward(
         )
         set_log_once_state("flash_v100._logged_prefill_flash", True)
     self.workspace.decode_cache.invalidate()
-    if self.use_prefill_paged_cache and self.use_flash_v100_prefill_paged:
+    if (
+        int8 is None
+        and self.use_prefill_paged_cache
+        and self.use_flash_v100_prefill_paged
+    ):
         _debug.sm70_profile_trace(
             "forward branch=prefill_no_prefix_paged_cache layer=%s",
             layer_name,
@@ -1433,6 +1469,7 @@ class PrefillDriverOps:
     is_draft_layer: Any = None
     noncausal_batch: Any = None
     reject_tree_anchor: Any = None
+    int8_block32: Any = None
 
 
 # Calculation bodies keep their old local spelling. Each binding below resolves

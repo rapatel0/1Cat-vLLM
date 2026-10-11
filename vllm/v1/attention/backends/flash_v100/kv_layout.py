@@ -20,6 +20,7 @@ from vllm.v1.attention.backends.triton_attn import (
 from vllm.v1.attention.kv_codecs import (
     resolve_kv_codec,
 )
+from vllm.v1.kv_cache_interface import make_int8_block32_kv_cache_views
 from vllm.v1.attention.ops.sm70_workspaces import retain_for_capture, workspace_cache
 
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
@@ -69,6 +70,51 @@ def has_prefix_context(attn_metadata: TritonAttentionMetadata) -> bool:
 
     query_lens = attn_metadata.query_start_loc[1:] - attn_metadata.query_start_loc[:-1]
     return not torch.equal(query_lens, attn_metadata.seq_lens)
+
+
+def split_int8_block32_kv_cache(
+    kv_cache: torch.Tensor,
+    *,
+    num_kv_heads: int,
+    head_size: int,
+) -> tuple[
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+    torch.Tensor,
+]:
+    """Split a [pages, page_bytes] INT8 page into payload, scale and owner views."""
+    if kv_cache.dtype != torch.int8 or kv_cache.ndim != 2:
+        raise ValueError("INT8 block cache requires [pages,page_bytes] int8 storage")
+    channel_blocks = (head_size + 31) // 32
+    scale_bytes = 2 * num_kv_heads * channel_blocks * 2
+    owner_bytes = 4
+    payload_bytes = kv_cache.shape[1] - scale_bytes - owner_bytes
+    elements_per_token = 2 * num_kv_heads * head_size
+    block_size, remainder = divmod(payload_bytes, elements_per_token)
+    if block_size <= 0 or remainder:
+        raise ValueError(
+            "INT8 block cache page size does not match its head shape: "
+            f"shape={tuple(kv_cache.shape)}, stride={kv_cache.stride()}, "
+            f"num_kv_heads={num_kv_heads}, head_size={head_size}, "
+            f"payload_bytes={payload_bytes}, remainder={remainder}"
+        )
+    page_stride_bytes = kv_cache.stride(0)
+    raw_cache = torch.empty(0, dtype=torch.int8, device=kv_cache.device).set_(
+        kv_cache.untyped_storage(),
+        kv_cache.storage_offset(),
+        (kv_cache.shape[0] * page_stride_bytes,),
+        (1,),
+    )
+    return make_int8_block32_kv_cache_views(
+        raw_cache,
+        num_blocks=kv_cache.shape[0],
+        block_size=block_size,
+        num_kv_heads=num_kv_heads,
+        head_size=head_size,
+        page_stride_bytes=page_stride_bytes,
+    )
 
 
 def metadata_expects_more_query_tokens_than_available(

@@ -1238,6 +1238,23 @@ def flash_attn_decode_paged_xqa_staged_available() -> bool:
     return hasattr(flash_attn_v100_cuda, "decode_paged_xqa_staged_fwd")
 
 
+def flash_attn_grouped_verify_max_requests() -> int:
+    """Return the native grouped-verifier request-count capability.
+
+    Extensions built before multi-request support do not expose the capability
+    entry. Those binaries verify one request per launch, so fall back to that
+    limit instead of routing a batch into the old op.
+    """
+    get_max_requests = getattr(
+        flash_attn_v100_cuda,
+        "grouped_verify_max_requests",
+        None,
+    )
+    if get_max_requests is None:
+        return 1
+    return int(get_max_requests())
+
+
 def flash_attn_grouped_verify_max_query_tokens() -> int:
     """Return the native grouped-verifier query-length capability.
 
@@ -1343,6 +1360,7 @@ def flash_attn_grouped_verify_paged(
     k_scale: float = 1.0,
     v_scale: float = 1.0,
     one_pass: bool = False,
+    query_start_loc: torch.Tensor | None = None,
     *,
     _runtime=None,
 ) -> torch.Tensor:
@@ -1379,6 +1397,7 @@ def flash_attn_grouped_verify_paged(
         float(k_scale),
         float(v_scale),
         bool(one_pass),
+        maybe_contiguous(query_start_loc),
     )
 
 
@@ -1405,6 +1424,8 @@ def flash_attn_decode_paged_xqa(
     active_num_partitions: torch.Tensor | None = None,
     partition_size_hint: int | None = None,
     batch_context_routing: bool = False,
+    key_scales: torch.Tensor | None = None,
+    value_scales: torch.Tensor | None = None,
     *,
     _runtime=None,
 ):
@@ -1577,6 +1598,8 @@ def flash_attn_decode_paged_xqa(
         int(window_size_left),
         int(window_size_right),
         int(batch_context_max_seq_len),
+        key_scales,
+        value_scales,
     )
 
 
@@ -2175,6 +2198,8 @@ __all__ = [
     "flash_attn_decode_paged_xqa",
     "flash_attn_decode_paged_xqa_available",
     "flash_attn_grouped_verify_paged",
+    "flash_attn_grouped_verify_max_query_tokens",
+    "flash_attn_grouped_verify_max_requests",
     "flash_attn_grouped_e4m3_fp32_paged",
     "flash_attn_grouped_e4m3_fp32_available",
     "flash_attn_decode_paged_wmma",

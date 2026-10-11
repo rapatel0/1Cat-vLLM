@@ -1,7 +1,7 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any, cast
 
 import torch
@@ -135,12 +135,19 @@ def init_attn_backend(
                 num_metadata_builders=1,
             )
             builder = group.get_metadata_builder(0)
+            builder_any = cast(Any, builder)
             if attn_backend_workspace is None:
-                if hasattr(builder, "_get_workspace_buffer"):
-                    attn_backend_workspace = builder._get_workspace_buffer()
+                get_workspace_buffer = getattr(
+                    builder_any, "_get_workspace_buffer", None
+                )
+                if callable(get_workspace_buffer):
+                    attn_backend_workspace = get_workspace_buffer()
             else:
-                if hasattr(builder, "set_workspace_buffer"):
-                    builder.set_workspace_buffer(attn_backend_workspace)
+                set_workspace_buffer = getattr(
+                    builder_any, "set_workspace_buffer", None
+                )
+                if callable(set_workspace_buffer):
+                    set_workspace_buffer(attn_backend_workspace)
             # Check cudagraph support for the attention backend
             cg_support = builder.get_cudagraph_support(
                 vllm_config,
@@ -270,6 +277,25 @@ def _reshape_kv_cache(
                     for i in range(len(kv_cache_stride_order))
                 ]
 
+                if kv_cache_spec.kv_quant_mode.is_int8_block32:
+                    if (
+                        kernel_num_blocks != num_blocks
+                        or kernel_block_size != kv_cache_spec.block_size
+                    ):
+                        raise ValueError(
+                            "INT8 block cache requires the scheduler and kernel "
+                            "page sizes to match"
+                        )
+                    real_page_size = replace(
+                        kv_cache_spec, page_size_padded=None
+                    ).page_size_bytes
+                    kv_caches[layer_name] = torch.as_strided(
+                        kv_raw_tensor.view(torch.int8),
+                        size=(kernel_num_blocks, real_page_size),
+                        stride=(kv_cache_spec.page_size_bytes, 1),
+                    )
+                    continue
+
                 dtype = kv_cache_spec.dtype
                 kv_tensor = kv_raw_tensor.view(dtype)
                 if packed is not None:
@@ -326,7 +352,9 @@ def _reshape_kv_cache(
                 has_mamba = True
                 state_tensors = []
                 storage_offset_bytes = 0
-                for shape, dtype in zip(kv_cache_spec.shapes, kv_cache_spec.dtypes):
+                for shape, dtype in zip(
+                    kv_cache_spec.shapes, kv_cache_spec.dtypes, strict=False
+                ):
                     dtype_size = get_dtype_size(dtype)
                     num_element_per_page = kv_cache_spec.page_size_bytes // dtype_size
                     target_shape = (num_blocks, *shape)
@@ -431,7 +459,7 @@ def init_kv_cache(
     kv_cache_raw_tensors = _allocate_kv_cache(
         kv_cache_config, shared_kv_cache_layers, device
     )
-    flattened_attn_groups = list(group for groups in attn_groups for group in groups)
+    flattened_attn_groups = [group for groups in attn_groups for group in groups]
     kv_caches = _reshape_kv_cache(
         attn_groups=flattened_attn_groups,
         kv_cache_raw_tensors=kv_cache_raw_tensors,
@@ -449,7 +477,9 @@ def build_slot_mappings_by_layer(
 ) -> dict[str, torch.Tensor]:
     slot_mappings_by_layer: dict[str, torch.Tensor] = {}
     kv_cache_groups = kv_cache_config.kv_cache_groups
-    for slot_mapping, kv_cache_group in zip(slot_mappings, kv_cache_groups):
+    for slot_mapping, kv_cache_group in zip(
+        slot_mappings, kv_cache_groups, strict=False
+    ):
         for layer_name in kv_cache_group.layer_names:
             slot_mappings_by_layer[layer_name] = slot_mapping
     return slot_mappings_by_layer
@@ -490,9 +520,11 @@ def build_attn_metadata(
         # Hybrid drafters can assign different causality to each KV group.
         # A Mapping must be resolved here; passing the dict itself into the
         # backend metadata makes it truthy and silently selects causal kernels.
-        group_causal = (
-            causal if isinstance(causal, (bool, torch.Tensor)) else causal.get(i, True)
-        )
+        group_causal: bool | torch.Tensor
+        if isinstance(causal, Mapping):
+            group_causal = cast(Mapping[int, bool], causal).get(i, True)
+        else:
+            group_causal = cast(bool | torch.Tensor, causal)
 
         common_attn_metadata_extra_kwargs = (
             model_specific_attn_metadata.get_extra_common_attn_kwargs(i, num_reqs)

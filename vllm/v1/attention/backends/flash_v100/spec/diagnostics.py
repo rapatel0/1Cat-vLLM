@@ -26,6 +26,7 @@ def _layer_debug_info(layer: torch.nn.Module) -> dict[str, object]:
     return {
         "layer_name": getattr(layer, "layer_name", None),
         "is_dflash_draft_attn": getattr(layer, "is_dflash_draft_attn", False),
+        "kv_cache_dtype": getattr(layer, "kv_cache_dtype", None),
         "kv_sharing_target_layer_name": getattr(
             layer, "kv_sharing_target_layer_name", None
         ),

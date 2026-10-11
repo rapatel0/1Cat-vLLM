@@ -46,7 +46,10 @@ def unsupported(
     message: str,
     is_dflash_draft_attn: bool,
 ) -> None:
-    if not (policy.allow_triton_fallback or is_dflash_draft_attn):
+    # Triton cannot read the INT8 block layout, so it is never a fallback.
+    if layer_info.get("kv_cache_dtype") == "int8_block32" or not (
+        policy.allow_triton_fallback or is_dflash_draft_attn
+    ):
         raise RuntimeError(message)
     if policy.use_flash_v100 and not log_once_seen(
         "flash_v100._warned_feature_fallback"

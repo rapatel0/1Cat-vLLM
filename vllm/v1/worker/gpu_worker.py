@@ -252,15 +252,18 @@ class Worker(WorkerBase):
             raise RuntimeError("PLE offload IPC address was not initialized")
         dp_size = self.parallel_config.data_parallel_size
         tp_size = self.parallel_config.tensor_parallel_size
+        # Only the pipeline stage that owns the PLE layers registers, so the
+        # expected registration count stays DP x TP under PP > 1.
         num_workers = dp_size * tp_size
         logger.info(
             "PleOffload: spawning worker "
-            "(rank=%d, local_rank=%d, dp_size=%d, tp_size=%d, "
+            "(rank=%d, local_rank=%d, dp_size=%d, tp_size=%d, pp_size=%d, "
             "num_workers=%d, ipc_addr=%s).",
             self.rank,
             self.local_rank,
             dp_size,
             tp_size,
+            self.parallel_config.pipeline_parallel_size,
             num_workers,
             ipc_addr,
         )
@@ -270,6 +273,21 @@ class Worker(WorkerBase):
             spawn_config,
             num_workers,
             ipc_addr,
+        )
+
+    def _stage_owns_ple_layers(self) -> bool:
+        """Return whether this pipeline stage holds a PLE layer.
+
+        Under PP > 1 only one stage owns the PLE tables. Other stages must not
+        build a connector, because they have no PleOffloadLayer to bind.
+        """
+        if self.parallel_config.pipeline_parallel_size == 1:
+            return True
+        from vllm.model_executor.layers.ple_offload_layer import PleOffloadLayer
+
+        model = self.model_runner.get_model()
+        return any(
+            isinstance(module, PleOffloadLayer) for module in model.modules()
         )
 
     def prepare_ple_offload_spawn(self) -> None:
@@ -493,7 +511,7 @@ class Worker(WorkerBase):
         ):
             self.model_runner.load_model(load_dummy_weights=load_dummy_weights)
 
-        if self._ple_offload_enabled:
+        if self._ple_offload_enabled and self._stage_owns_ple_layers():
             self.model_runner._setup_ple_offload(
                 self.parallel_config._ple_offload_ipc_path
             )

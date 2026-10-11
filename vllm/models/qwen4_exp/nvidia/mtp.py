@@ -543,6 +543,7 @@ class Qwen4ExpMTP(nn.Module, SupportsPP, Qwen4ExpMixtureOfExperts):
     # Hugging Face checkpoint layouts.
     allow_patterns_overrides = [
         "model-bf16-*.safetensors",
+        "model-mtp-fp8*.safetensors",
         "*.safetensors",
         "*.bin",
         "*.pt",

@@ -7,6 +7,11 @@ import math
 
 import pytest
 import torch
+from vllm.v1.kv_cache_interface import (
+    AttentionSpec,
+    KVQuantMode,
+    make_int8_block32_kv_cache_views,
+)
 
 _EXPANDED_BASELINE_MEAN_ERROR = {
     (16, 8, 120): 5.159488409844926e-6,
@@ -179,6 +184,9 @@ def test_batched_grouped_verify_is_bitwise_per_request(
         interleaved=interleaved,
     )
 
+    starts = torch.arange(
+        0, (batch_size + 1) * 8, 8, dtype=torch.int32, device="cuda"
+    )
     batched = flash_attn_v100.flash_attn_grouped_verify_paged(
         query,
         key_cache,
@@ -186,6 +194,7 @@ def test_batched_grouped_verify_is_bitwise_per_request(
         block_table,
         seq_lens,
         one_pass=True,
+        query_start_loc=starts,
     ).clone()
     per_request = torch.cat(
         [
@@ -203,6 +212,79 @@ def test_batched_grouped_verify_is_bitwise_per_request(
     torch.accelerator.synchronize()
 
     assert torch.equal(batched, per_request)
+
+
+@pytest.mark.parametrize("batch_size", [2, 4, 8])
+@torch.inference_mode()
+def test_int8_batched_grouped_verify_keeps_request_workspaces(
+    batch_size: int,
+) -> None:
+    flash_attn_v100 = _require_grouped_verify()
+    torch.manual_seed(20260924 + batch_size)
+    page_size = 1648
+    seq_len = 4096
+    pages_per_request = math.ceil(seq_len / page_size)
+    num_blocks = batch_size * pages_per_request
+    spec = AttentionSpec(
+        block_size=page_size,
+        num_kv_heads=1,
+        head_size=256,
+        dtype=torch.int8,
+        kv_quant_mode=KVQuantMode.INT8_BLOCK32,
+    )
+    raw = torch.empty(
+        num_blocks * spec.page_size_bytes, dtype=torch.int8, device="cuda"
+    )
+    key, value, key_scales, value_scales, _ = make_int8_block32_kv_cache_views(
+        raw,
+        num_blocks=num_blocks,
+        block_size=page_size,
+        num_kv_heads=1,
+        head_size=256,
+    )
+    key.random_(-127, 128)
+    value.random_(-127, 128)
+    key_scales.uniform_(2.0e-3, 1.5e-2)
+    value_scales.uniform_(2.0e-3, 1.5e-2)
+    blocks = torch.arange(
+        num_blocks, dtype=torch.int32, device="cuda"
+    ).view(batch_size, pages_per_request)
+    lengths = torch.full(
+        (batch_size,), seq_len, dtype=torch.int32, device="cuda"
+    )
+    query = torch.randn(
+        batch_size * 8, 6, 256, dtype=torch.float16, device="cuda"
+    )
+    starts = torch.arange(
+        0, (batch_size + 1) * 8, 8, dtype=torch.int32, device="cuda"
+    )
+    batched = flash_attn_v100.flash_attn_grouped_verify_paged(
+        query,
+        key,
+        value,
+        blocks,
+        lengths,
+        kv_cache_dtype="int8_block32",
+        one_pass=True,
+        query_start_loc=starts,
+    ).clone()
+    separate = torch.cat(
+        [
+            flash_attn_v100.flash_attn_grouped_verify_paged(
+                query[i * 8 : (i + 1) * 8],
+                key,
+                value,
+                blocks[i : i + 1],
+                lengths[i : i + 1],
+                kv_cache_dtype="int8_block32",
+                one_pass=True,
+            ).clone()
+            for i in range(batch_size)
+        ]
+    )
+    torch.accelerator.synchronize()
+    assert torch.isfinite(batched).all()
+    assert torch.allclose(batched, separate, atol=5.0e-5, rtol=0)
 
 
 @pytest.mark.parametrize(
