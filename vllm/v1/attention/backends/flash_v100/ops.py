@@ -32,6 +32,7 @@ _flash_attn_decode_paged_xqa = None
 _flash_attn_decode_paged_wmma = None
 _flash_attn_grouped_verify_paged = None
 _flash_attn_grouped_verify_max_query_tokens = 8
+_flash_attn_grouped_verify_max_requests = 1
 _flash_attn_grouped_verify_request_major_abi_version = 0
 _flash_attn_grouped_verify_checked = False
 _flash_attn_prefill_paged = None
@@ -167,6 +168,7 @@ def get_flash_grouped_verify_op():
     """Load the optional exact SM70 grouped verifier."""
     global _flash_attn_grouped_verify_paged
     global _flash_attn_grouped_verify_max_query_tokens
+    global _flash_attn_grouped_verify_max_requests
     global _flash_attn_grouped_verify_request_major_abi_version
     global _flash_attn_grouped_verify_checked
     if _flash_attn_grouped_verify_checked:
@@ -188,6 +190,14 @@ def get_flash_grouped_verify_op():
         except (ImportError, RuntimeError, TypeError, ValueError):
             _flash_attn_grouped_verify_max_query_tokens = 8
         try:
+            from flash_attn_v100 import flash_attn_grouped_verify_max_requests
+
+            _flash_attn_grouped_verify_max_requests = int(
+                flash_attn_grouped_verify_max_requests()
+            )
+        except (ImportError, RuntimeError, TypeError, ValueError):
+            _flash_attn_grouped_verify_max_requests = 1
+        try:
             from flash_attn_v100 import (
                 flash_attn_grouped_verify_request_major_abi_version,
             )
@@ -200,6 +210,12 @@ def get_flash_grouped_verify_op():
     except ImportError:
         _flash_attn_grouped_verify_paged = None
     return bind_attention_operation(_flash_attn_grouped_verify_paged)
+
+
+def grouped_verify_max_requests() -> int:
+    """Packed requests the native grouped verifier accepts (1 on older builds)."""
+    get_flash_grouped_verify_op()
+    return _flash_attn_grouped_verify_max_requests
 
 
 def get_sm70_splitd_d256_ops():

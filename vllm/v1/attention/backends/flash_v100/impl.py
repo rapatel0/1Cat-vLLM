@@ -25,6 +25,7 @@ from vllm.v1.attention.backends.flash_v100 import prefill as _prefill
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
 from vllm.v1.attention.backends.flash_v100.plan import diagnostics as _debug
 from vllm.v1.attention.backends.flash_v100.spec import attention as _feature
+from vllm.v1.attention.backends.flash_v100.spec import int8_verify as _int8_verify
 from vllm.v1.attention.backends.flash_v100.spec import verifier as _verify
 from vllm.v1.attention.backends.triton_attn import (
     TritonAttentionImpl,
@@ -475,6 +476,11 @@ class FlashAttnV100Impl(TritonAttentionImpl):
                 fp16_prefill_paged=getattr(self, "flash_attn_prefill_paged", None),
                 use_prefill_paged=bool(
                     getattr(self, "use_flash_v100_prefill_paged", False)
+                ),
+                grouped=_int8_verify.from_attention(
+                    self,
+                    grouped_op_count=_ops.grouped_verify_max_requests(),
+                    bridge_available=bridge is not None,
                 ),
                 window_size=self._flash_v100_window_size,
             )

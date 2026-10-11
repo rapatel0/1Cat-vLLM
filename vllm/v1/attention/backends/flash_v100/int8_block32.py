@@ -47,6 +47,7 @@ class Int8Block32Ops:
     xqa: Any = None
     fp16_prefill_paged: Any = None
     use_prefill_paged: bool = False
+    grouped: Any = None
     window_size: Callable[[bool], tuple[int, int]] = lambda causal: (-1, -1)
 
     @property
@@ -288,8 +289,9 @@ class Int8Block32Attention:
     ) -> bool:
         """Split mixed bulk-prefill batches into bounded exact request routes.
 
-        Only batches whose every request is a bulk chunk qualify; any short
-        request returns False so the caller uses the small-query INT8 kernels.
+        Each request is either a bulk chunk (FP16 bridge) or a q8/q16
+        verifier chunk (packed INT8 verifier); anything else returns False so
+        the caller uses the small-query INT8 kernels.
         """
         query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
         seq_lens_cpu = getattr(attn_metadata, "seq_lens_cpu", None)
@@ -317,50 +319,68 @@ class Int8Block32Attention:
 
         input_block_size = int(key_cache.shape[1])
         max_num_blocks = int(block_table.shape[1])
+        routes: list[str] = []
         max_required_blocks = 0
         for request_idx in range(num_requests):
             query_len = query_starts[request_idx + 1] - query_starts[request_idx]
             seq_len = sequence_lengths[request_idx]
-            if (
-                query_starts[request_idx] < 0
-                or query_len < BRIDGE_MIN_QUERY_TOKENS
-                or seq_len < query_len
+            if query_starts[request_idx] < 0 or query_len <= 0 or seq_len < query_len:
+                return False
+            if query_len >= BRIDGE_MIN_QUERY_TOKENS:
+                active_input_blocks = min(
+                    max_num_blocks, _masks.cdiv_int(seq_len, input_block_size)
+                )
+                required_blocks = _masks.cdiv_int(
+                    active_input_blocks * input_block_size,
+                    _dense_prefill.FP8_PREFILL_BRIDGE_PAGE_SIZE,
+                )
+                if required_blocks <= 0:
+                    return False
+                max_required_blocks = max(max_required_blocks, required_blocks)
+                routes.append("bridge")
+            elif self.ops.grouped is not None and self.ops.grouped.request_allowed(
+                attn_metadata, query_len
             ):
+                routes.append("grouped_verify")
+            else:
                 return False
-            active_input_blocks = min(
-                max_num_blocks, _masks.cdiv_int(seq_len, input_block_size)
-            )
-            required_blocks = _masks.cdiv_int(
-                active_input_blocks * input_block_size,
-                _dense_prefill.FP8_PREFILL_BRIDGE_PAGE_SIZE,
-            )
-            if required_blocks <= 0:
-                return False
-            max_required_blocks = max(max_required_blocks, required_blocks)
 
         if (
-            _dense_prefill.get_fp8_prefill_bridge_workspace(
+            max_required_blocks <= 0
+            or _dense_prefill.get_fp8_prefill_bridge_workspace(
                 key_cache, max_required_blocks
             )
             is None
         ):
             return False
 
-        for request_idx in range(num_requests):
+        for request_idx, route in enumerate(routes):
             query_start = query_starts[request_idx]
             query_end = query_starts[request_idx + 1]
-            if not self._run_prefill_bridge(
+            request_block_table = block_table[request_idx : request_idx + 1]
+            request_seq_lens = attn_metadata.seq_lens[request_idx : request_idx + 1]
+            if route == "bridge":
+                if not self._run_prefill_bridge(
+                    query[query_start:query_end],
+                    key_cache,
+                    value_cache,
+                    key_scales,
+                    value_scales,
+                    request_block_table,
+                    request_seq_lens,
+                    seq_len=sequence_lengths[request_idx],
+                    out=out[query_start:query_end],
+                ):
+                    return False
+                continue
+            self.ops.grouped.call_request(
                 query[query_start:query_end],
                 key_cache,
                 value_cache,
-                key_scales,
-                value_scales,
-                block_table[request_idx : request_idx + 1],
-                attn_metadata.seq_lens[request_idx : request_idx + 1],
-                seq_len=sequence_lengths[request_idx],
+                request_block_table,
+                request_seq_lens,
                 out=out[query_start:query_end],
-            ):
-                return False
+            )
 
         _routing.record_route(
             _routing.ROUTE_SPECS[
@@ -395,6 +415,17 @@ class Int8Block32Attention:
         )
         query = query[:num_query_tokens]
         out_view = output[:num_query_tokens]
+
+        grouped = self.ops.grouped
+        if grouped is not None and grouped.allowed(
+            query,
+            key_cache,
+            value_cache,
+            attn_metadata,
+            num_query_tokens=num_query_tokens,
+        ):
+            grouped.call(query, key_cache, value_cache, attn_metadata, out=out_view)
+            return output
 
         if (
             num_query_tokens >= BRIDGE_MIN_QUERY_TOKENS

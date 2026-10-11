@@ -28,6 +28,7 @@ COMPOSITION_EDGES = {
         (".impl", ".plan.diagnostics"),
         (".impl", ".routing"),
         (".impl", ".spec.attention"),
+        (".impl", ".spec.int8_verify"),
         (".impl", ".spec.verifier"),
         (".verify", ".spec.verifier"),
     )

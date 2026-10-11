@@ -1361,6 +1361,7 @@ def flash_attn_grouped_verify_paged(
     v_scale: float = 1.0,
     one_pass: bool = False,
     query_start_loc: torch.Tensor | None = None,
+    _query_partition_validated: bool = False,
     *,
     _runtime=None,
 ) -> torch.Tensor:

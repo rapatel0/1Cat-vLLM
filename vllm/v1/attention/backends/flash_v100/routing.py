@@ -347,7 +347,8 @@ ROUTE_SPECS: dict[str, RouteSpec] = _build_specs(
                 "prefill_smallq_int8_block32_register "
                 "prefill_prefix_int8_block32_register "
                 "prefill_prefix_int8_block32_bridge_fp16 "
-                "prefill_prefix_int8_block32_bridge_fp16_multi_request"
+                "prefill_prefix_int8_block32_bridge_fp16_multi_request "
+                "prefill_smallq_dflash2_int8_block32_grouped_verify"
             ),
             "prefill",
             {"codecs": frozenset((INT8_BLOCK32,))},
