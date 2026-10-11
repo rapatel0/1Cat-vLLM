@@ -5446,7 +5446,7 @@ at::Tensor flash_attention_grouped_e4m3_fp32_paged(
       v.stride(0), v.stride(1), v.stride(2), scale * k_scale, v_scale, nullptr,
       static_cast<int>(batch_size), nullptr, nullptr, 0, 0, nullptr,
       row_lengths.data_ptr<int>());
-  flash_attention_grouped_verify_e5m2_combine_kernel<8, false, float, true>
+  flash_attention_grouped_verify_e5m2_combine_kernel<8, false>
       <<<dim3(q.size(0) / batch_size, 6, batch_size), kGroupedVerifyThreads, 0,
          stream>>>(partial.data_ptr<float>(), lse.data_ptr<float>(),
                    row_lengths.data_ptr<int>(), nullptr,
