@@ -344,6 +344,7 @@ WORKDIR /workspace
 
 COPY pyproject.toml setup.py CMakeLists.txt ./
 COPY scripts/serve_qwen38_27b_nvfp4_v100.sh scripts/
+COPY scripts/serve_flash_next_nvfp4_v100.sh scripts/
 COPY cmake cmake/
 COPY csrc csrc/
 COPY flash_qla flash_qla/
