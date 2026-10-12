@@ -219,11 +219,19 @@ def _prepare_with_cache(
 
     _, layer, kv_cache, slots = get_attention_context(_resolve_layer_name(layer_name))
     cache_args = {}
-    if slots is not None and kv_cache.numel() > 0:
+    # Packed INT8 pages have payload/scale/owner offsets, not a K/V axis.
+    # Check the fused writer's format and storage before splitting; all other
+    # caches must retain the backend's format-aware publication path.
+    if (
+        slots is not None
+        and kv_cache.numel() > 0
+        and layer.kv_cache_dtype in ("fp8", "fp8_e4m3")
+        and kv_cache.dtype == torch.uint8
+        and kv_cache.ndim == 5
+    ):
         key_cache, value_cache = _split_paged_kv_cache(kv_cache)
         eligible = (
-            layer.kv_cache_dtype in ("fp8", "fp8_e4m3")
-            and key_cache.dtype == value_cache.dtype == torch.uint8
+            key_cache.dtype == value_cache.dtype == torch.uint8
             and key_cache.ndim == value_cache.ndim == 4
             and key_cache.shape == value_cache.shape
             and key_cache.shape[2:] == (1, 256)

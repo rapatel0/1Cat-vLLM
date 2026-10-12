@@ -155,7 +155,15 @@ def sm70_dflash2_qk_norm_rope_cache(
 
     _, layer, kv_cache, slots = get_attention_context(_resolve_layer_name(layer_name))
     cache_args = {}
-    if slots is not None and kv_cache.numel() > 0:
+    # Only conventional FP16 storage has the K/V axis consumed by this fused
+    # writer. Packed INT8 caches must be published by the backend instead.
+    if (
+        slots is not None
+        and kv_cache.numel() > 0
+        and layer.kv_cache_dtype in ("auto", "float16")
+        and kv_cache.dtype == torch.float16
+        and kv_cache.ndim == 5
+    ):
         kc, vc = _split_paged_kv_cache(kv_cache)
         if (
             kc.dtype == vc.dtype == torch.float16
