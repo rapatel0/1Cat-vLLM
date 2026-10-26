@@ -10,12 +10,25 @@ fi
 
 export NVIDIA_VISIBLE_DEVICES="${NVIDIA_VISIBLE_DEVICES// /}"
 expected='GPU-c1aa8bd9-f642-328d-96f8-79d7c38ce61e,GPU-c275f176-56b9-eb8d-14d7-a3fd15a0ec03,GPU-d5302639-be81-61f0-5e1a-b8f421bb100b,GPU-dd6f7287-63a3-17c4-64c2-1eb597391f4b'
-mapfile -t gpu_uuids < <(nvidia-smi --query-gpu=uuid --format=csv,noheader | tr -d ' ' | sort)
-actual=$(IFS=,; echo "${gpu_uuids[*]}")
-if [[ "$actual" != "$expected" ]]; then
-  echo "Flint requires exactly Island B." >&2
+# A layout may claim part of the island, so every visible device must belong to
+# Island B and the count must match the requested tensor-parallel width.
+tp_size="${FLINT_TP_SIZE:-4}"
+# The NVIDIA runtime rewrites NVIDIA_VISIBLE_DEVICES to "void" once it has
+# claimed the devices, so the live device list is the only reliable count.
+mapfile -t gpu_uuids < <(nvidia-smi --query-gpu=uuid --format=csv,noheader | tr -d ' \r' | sort)
+if [[ ${#gpu_uuids[@]} -ne "$tp_size" ]]; then
+  echo "Flint expects $tp_size GPUs, saw ${#gpu_uuids[@]}." >&2
   exit 64
 fi
+for uuid in "${gpu_uuids[@]}"; do
+  case ",$expected," in
+    *",$uuid,"*) ;;
+    *)
+      printf 'GPU %q is outside Island B.\n' "$uuid" >&2
+      exit 64
+      ;;
+  esac
+done
 
 MODEL=${FLINT_MODEL_DIR:-/models/flint-nvfp4-gguf}
 # FP8 KV halves the cache and doubles full-context concurrency on V100.
@@ -39,12 +52,18 @@ args=(
   --enable-auto-tool-choice
   --tool-call-parser glm47
   --host 0.0.0.0
-  --port 8002
+  --port "${FLINT_PORT:-8002}"
 )
 
 # Graph capture sizes must cover the batch ceiling, or larger batches decode eagerly.
 if [[ -n "${FLINT_COMPILATION_CONFIG:-}" ]]; then
   args+=(--compilation-config "$FLINT_COMPILATION_CONFIG")
+fi
+
+# Flint keeps 256 experts with top-6 routing, so sharding experts across ranks
+# instead of splitting each expert's hidden width can move MoE-heavy decode.
+if [[ "${FLINT_EXPERT_PARALLEL:-0}" == 1 ]]; then
+  args+=(--enable-expert-parallel)
 fi
 
 exec taskset -c "${FLINT_CPUSET:-20-39,60-79}" \

@@ -133,6 +133,33 @@ def apply_paged_decode_sinks(
         raise ValueError("paged decode sink correction needs a positive partition plan")
     if sinks.dtype != torch.float32 or not sinks.is_contiguous():
         raise RuntimeError("learned sinks must already be contiguous fp32")
+    if (
+        os.environ.get("FLINT_SINK_DEBUG") == "1"
+        and not torch.cuda.is_current_stream_capturing()
+    ):
+        longest = int(seq_lens.max().item())
+        parts = min(
+            launch_num_partitions, (longest + partition_size - 1) // partition_size
+        )
+        part_max = max_logits[:, :, :parts]
+        part_sum = exp_sums[:, :, :parts]
+        merged_max = part_max.amax(dim=2)
+        merged_sum = (
+            part_sum * torch.exp(part_max - merged_max.unsqueeze(2))
+        ).sum(dim=2)
+        lse = merged_max + torch.log(merged_sum.clamp_min(1.0e-20))
+        scale = torch.sigmoid(lse - sinks.view(1, -1))
+        print(
+            f"[sink-debug] seq={longest} parts={parts} "
+            f"lse_mean={lse.mean().item():.3f} sink_mean={sinks.mean().item():.3f} "
+            f"scale_min={scale.min().item():.3f} "
+            f"scale_mean={scale.mean().item():.3f} "
+            f"stats={tuple(max_logits.shape)} "
+            f"max0={float(part_max[0, 0, 0]):.3f} "
+            f"sum0={float(part_sum[0, 0, 0]):.3f} "
+            f"seqvals={seq_lens[:4].to(torch.float32).tolist()}",
+            flush=True,
+        )
     _paged_decode_sink_kernel[(batch, heads)](  # type: ignore[index]
         output,
         max_logits,
