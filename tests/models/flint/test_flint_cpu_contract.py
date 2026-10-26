@@ -56,13 +56,16 @@ def test_nvfp4_repack_round_trip_one_block():
     values = gguf.dequantize_nvfp4(weight, scale)
     assert values.shape[-1] == 64
     assert torch.isfinite(values).all()
-    # The packed layout is chosen for the QPN fragment order, so compare the
-    # decoded values against the ggml reference instead of raw packed bytes.
+    # The packed layout follows ggml's fragment order: inside each group of
+    # eight bytes all low nibbles come first, then the high nibbles. So the low
+    # nibble of qs byte 0 is column 0 and its high nibble is column 8. Each
+    # nibble is an E2M1 code, not a magnitude: 1 -> 0.5 and 2 -> 1.0.
     import numpy as np
 
+    scale_value = _e4m3(0x38)
     ref = np.zeros(64, dtype=np.float32)
-    ref[0] = 1.0 * _e4m3(0x38)
-    ref[1] = 2.0 * _e4m3(0x38)
+    ref[0] = 0.5 * scale_value
+    ref[8] = 1.0 * scale_value
     torch.testing.assert_close(values, torch.from_numpy(ref), atol=1e-6, rtol=1e-4)
 
 
@@ -73,9 +76,14 @@ def _e4m3(byte: int) -> float:
     if exponent == 0:
         return mantissa / 8.0 * 2.0**-6
     return (1.0 + mantissa / 8.0) * 2.0 ** (exponent - 7)
+
+
+def test_gguf_name_mapping_stacks_experts():
+    gguf = _load(_GGUF, "flint_gguf_names_under_test")
     name, stacked = gguf._map_name("blk.2.ffn_gate_exps")
     assert stacked
     assert name == "model.layers.2.mlp.experts.{}.gate_proj"
     name, stacked = gguf._map_name("blk.0.attn_sinks.weight")
     assert not stacked
     assert name.endswith("softmax_offset")
+

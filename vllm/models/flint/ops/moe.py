@@ -24,6 +24,8 @@ Triton combine. Both paths read the same weights in FlashInfer's layout (see
 
 from collections.abc import Iterable
 from dataclasses import dataclass
+from importlib import import_module
+from typing import Any
 
 import regex as re
 import torch
@@ -32,9 +34,9 @@ from torch import nn
 from vllm.model_executor.layers.fused_moe.activation import MoEActivation
 from vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe import (
     interleave_linear_and_gate,
-    nvfp4_swizzled_scale_to_cutedsl_mma_view,
-    reorder_w13_to_w31_for_flashinfer_cutedsl,
 )
+
+
 from vllm.model_executor.layers.quantization.utils.nvfp4_utils import (
     swizzle_blockscale,
 )
@@ -44,6 +46,21 @@ from vllm.utils.torch_utils import aux_stream, current_stream
 
 from . import moe_cute, moe_gemv
 from .norm import _rsqrt
+
+
+def _cutedsl_scale_helpers() -> tuple[Any, Any]:
+    """Resolve the CuTe DSL scale helpers, which only exist on SM100 builds.
+
+    Resolved lazily so an SM70 base can still import this module for its
+    Triton kernels.
+    """
+    module = import_module(
+        "vllm.model_executor.layers.quantization.utils.flashinfer_fp4_moe"
+    )
+    return (
+        getattr(module, "nvfp4_swizzled_scale_to_cutedsl_mma_view"),
+        getattr(module, "reorder_w13_to_w31_for_flashinfer_cutedsl"),
+    )
 
 # Largest token count served by the GEMV decode kernels.
 DECODE_MAX_TOKENS = 6
@@ -58,7 +75,7 @@ def _ptxas_has_bf16x2_e2m1() -> bool:
     # Triton with an older system ptxas.
     if not current_platform.is_cuda():
         return False
-    from triton.backends.nvidia.compiler import get_ptxas
+    from triton.backends.nvidia.compiler import get_ptxas  # type: ignore[import-not-found]
 
     major, minor = map(int, get_ptxas(100).version.split(".")[:2])
     return (major, minor) >= (13, 2)
@@ -524,7 +541,7 @@ def trtllm_bf16_row_maps(
     produced by ``convert_moe_weights_to_flashinfer_trtllm_block_layout``
     (gated gate/up interleave + epilogue-tile shuffle). Returns (w13 map over
     [gate rows; up rows], w2 map over output rows), int32."""
-    from flashinfer.fused_moe.core import (
+    from flashinfer.fused_moe.core import (  # type: ignore[import-not-found]
         _maybe_get_cached_w3_w1_permute_indices,
         get_w2_permute_indices_with_cache,
     )
@@ -566,7 +583,7 @@ def flint_moe_bf16_decode(
     assert x.dtype == torch.bfloat16 and x.is_contiguous()
     ids, tw = route(x, router_weight, top_k, counter)
     act = torch.empty(num_tokens * top_k, inter, dtype=x.dtype, device=x.device)
-    _gate_up_gemv_bf16_kernel[(num_tokens * top_k, inter)](
+    _gate_up_gemv_bf16_kernel[(num_tokens * top_k, inter)](  # type: ignore[index]
         x,
         ids,
         w13,
@@ -584,7 +601,7 @@ def flint_moe_bf16_decode(
     if shared_ready is not None:
         shared_ready.wait(current_stream())
     bn = 1 if num_tokens <= 2 else 2
-    _down_gemv_bf16_kernel[(num_tokens, hidden // bn)](
+    _down_gemv_bf16_kernel[(num_tokens, hidden // bn)](  # type: ignore[index]
         act,
         ids,
         tw,
@@ -625,23 +642,26 @@ class FlintMoEWeights:
     ) -> "FlintMoEWeights":
         """From ModelOpt tensors: w13 [E, 2I, H/2] ([gate; up]), w13_scale
         [E, 2I, H/16], w2 [E, H, I/2], w2_scale [E, H, I/16], fp32 [E]."""
-        w1, w1_sf = reorder_w13_to_w31_for_flashinfer_cutedsl(
-            MoEActivation.SILU, w13, w13_scale
-        )
+        mma_view, reorder_w13 = _cutedsl_scale_helpers()
+        w1, w1_sf = reorder_w13(MoEActivation.SILU, w13, w13_scale)
         w1 = interleave_linear_and_gate(w1, group_size=64, dim=1)
         w1_sf = interleave_linear_and_gate(w1_sf, group_size=64, dim=1)
         return cls(
             w1,
-            nvfp4_swizzled_scale_to_cutedsl_mma_view(swizzle_blockscale(w1_sf)),
+            mma_view(swizzle_blockscale(w1_sf)),
             w13_scale_2.float().contiguous(),
             w2.contiguous(),
-            nvfp4_swizzled_scale_to_cutedsl_mma_view(swizzle_blockscale(w2_scale)),
+            mma_view(swizzle_blockscale(w2_scale)),
             w2_scale_2.float().contiguous(),
         )
 
     @property
     def intermediate_size(self) -> int:
         return self.w2.shape[2] * 2
+
+
+def _empty_param(*shape: int, dtype: torch.dtype) -> nn.Parameter:
+    return nn.Parameter(torch.empty(*shape, dtype=dtype), requires_grad=False)
 
 
 def make_route_counter(device: torch.device | str | None = None) -> torch.Tensor:
@@ -666,7 +686,7 @@ def route(
             num_tokens, num_experts, dtype=torch.bfloat16, device=x.device
         )
         eb = 2
-        _router_kernel[(num_tokens, num_experts // eb)](
+        _router_kernel[(num_tokens, num_experts // eb)](  # type: ignore[index]
             x,
             x,
             x,
@@ -688,7 +708,7 @@ def route(
         )
     else:
         logits = torch.mm(x, router_weight.t())
-        _topk_kernel[(num_tokens,)](
+        _topk_kernel[(num_tokens,)](  # type: ignore[index]
             logits, ids, tw, E=num_experts, TOPK=top_k, num_warps=4
         )
     return ids, tw
@@ -716,7 +736,7 @@ def flint_moe(
     out = torch.empty_like(x)
     if num_tokens <= DECODE_MAX_TOKENS:
         act = torch.empty(num_tokens * top_k, inter, dtype=x.dtype, device=x.device)
-        _gate_up_gemv_kernel[(num_tokens * top_k, inter)](
+        _gate_up_gemv_kernel[(num_tokens * top_k, inter)](  # type: ignore[index]
             x,
             ids,
             weights.w1.view(torch.int32),
@@ -734,7 +754,7 @@ def flint_moe(
         bn = 1 if num_tokens <= 2 else 2
         if shared_ready is not None:
             shared_ready.wait(current_stream())
-        _down_gemv_kernel[(num_tokens, hidden // bn)](
+        _down_gemv_kernel[(num_tokens, hidden // bn)](  # type: ignore[index]
             act,
             ids,
             tw,
@@ -765,7 +785,7 @@ def flint_moe(
     if shared_ready is not None:
         shared_ready.wait(current_stream())
     bh = 1024
-    _combine_kernel[(num_tokens, hidden // bh)](
+    _combine_kernel[(num_tokens, hidden // bh)](  # type: ignore[index]
         y,
         perm,
         tw,
@@ -812,6 +832,10 @@ class FlintBf16DecodeMoE(nn.Module):
     is needed; larger batches keep using that layer.
     """
 
+    route_counter: torch.Tensor
+    row_map13: torch.Tensor
+    row_map2: torch.Tensor
+
     def __init__(
         self, num_experts: int, hidden_size: int, intermediate_size: int, top_k: int
     ) -> None:
@@ -829,7 +853,9 @@ class FlintBf16DecodeMoE(nn.Module):
         self._join = torch.cuda.Event()
         self._checked = False
 
-    def _check(self, routed_experts: nn.Module) -> None:
+    # The BF16 expert holder differs per unquantized backend, so its weight
+    # attributes are checked structurally rather than through nn.Module.
+    def _check(self, routed_experts: Any) -> None:
         from vllm.model_executor.layers.fused_moe.oracle.unquantized import (
             UnquantizedMoeBackend,
         )
@@ -851,7 +877,7 @@ class FlintBf16DecodeMoE(nn.Module):
         self,
         hidden_states: torch.Tensor,
         router_weight: torch.Tensor,
-        routed_experts: nn.Module,
+        routed_experts: Any,
         shared: torch.Tensor | nn.Module,
     ) -> torch.Tensor:
         if not self._checked:
@@ -878,6 +904,14 @@ class FlintNvfp4Experts(nn.Module):
     repacks them into ``FlintMoEWeights`` and frees the checkpoint layout.
     """
 
+    route_counter: torch.Tensor
+    w13_weight: nn.Parameter
+    w13_weight_scale: nn.Parameter
+    w13_weight_scale_2: nn.Parameter
+    w2_weight: nn.Parameter
+    w2_weight_scale: nn.Parameter
+    w2_weight_scale_2: nn.Parameter
+
     def __init__(
         self,
         num_experts: int,
@@ -894,15 +928,12 @@ class FlintNvfp4Experts(nn.Module):
         self.num_experts = e
         self.top_k = top_k
 
-        def param(*shape: int, dtype: torch.dtype) -> nn.Parameter:
-            return nn.Parameter(torch.empty(*shape, dtype=dtype), requires_grad=False)
-
-        self.w13_weight = param(e, 2 * i, h // 2, dtype=torch.uint8)
-        self.w13_weight_scale = param(e, 2 * i, h // 16, dtype=torch.float8_e4m3fn)
-        self.w13_weight_scale_2 = param(e, 2, dtype=torch.float32)
-        self.w2_weight = param(e, h, i // 2, dtype=torch.uint8)
-        self.w2_weight_scale = param(e, h, i // 16, dtype=torch.float8_e4m3fn)
-        self.w2_weight_scale_2 = param(e, dtype=torch.float32)
+        self.w13_weight = _empty_param(e, 2 * i, h // 2, dtype=torch.uint8)
+        self.w13_weight_scale = _empty_param(e, 2 * i, h // 16, dtype=torch.float8_e4m3fn)
+        self.w13_weight_scale_2 = _empty_param(e, 2, dtype=torch.float32)
+        self.w2_weight = _empty_param(e, h, i // 2, dtype=torch.uint8)
+        self.w2_weight_scale = _empty_param(e, h, i // 16, dtype=torch.float8_e4m3fn)
+        self.w2_weight_scale_2 = _empty_param(e, dtype=torch.float32)
         self.register_buffer("route_counter", make_route_counter(), persistent=False)
         self._loaded_names: set[str] = set()
         self._fork = torch.cuda.Event()
@@ -1032,7 +1063,7 @@ def flint_moe_ll(
     act = torch.empty(m * top_k, ew.intermediate_size, dtype=bf16, device=dev)
     out = torch.empty_like(attn_out)
     eb = 2
-    _router_kernel[(m * (num_experts // eb),)](
+    _router_kernel[(m * (num_experts // eb),)](  # type: ignore[index]
         attn_out,
         residual,
         ln_weight,
@@ -1091,7 +1122,7 @@ def ll_weights_from_layers(
     tensors (ModelOpt-packed weight, 128x4-swizzled scales, fp32 global
     scale)."""
 
-    def nvfp4(layer: nn.Module) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    def nvfp4(layer: Any) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
         weight = layer.weight
         n, k2 = weight.shape
         k = k2 * 2

@@ -6,8 +6,10 @@ the log-sum-exp of the key scores, the corrected output is
 
     out * exp(lse - logaddexp(lse, sink))
 
-``lse`` uses the FlashAttention layout ``[query_heads, tokens]``. ``sinks`` is
-``[query_heads]``.
+which is exactly ``out * sigmoid(lse - sink)``. The sigmoid form needs one
+exponential instead of three, and it lets the multiply stay in the output
+dtype. ``lse`` uses the FlashAttention layout ``[query_heads, tokens]``.
+``sinks`` is ``[query_heads]``.
 """
 
 from __future__ import annotations
@@ -35,8 +37,8 @@ def apply_learned_attention_sinks(
         raise ValueError(f"sinks shape {tuple(sinks.shape)} does not match heads={heads}")
     sink = sinks.to(device=output.device, dtype=torch.float32).view(1, heads, 1)
     lse_f = lse.to(dtype=torch.float32).transpose(0, 1).unsqueeze(-1)
-    corrected = output.float() * torch.exp(lse_f - torch.logaddexp(lse_f, sink))
-    output.copy_(corrected.to(dtype=output.dtype))
+    scale = torch.sigmoid(lse_f - sink)
+    output.mul_(scale.to(dtype=output.dtype))
     return output
 
 
@@ -56,14 +58,14 @@ def _paged_decode_sink_kernel(
     partition_size,
     launch_num_partitions,
     D: tl.constexpr,
-    P: tl.constexpr,
 ):
     """Scale a paged-decode row by the learned-sink softmax factor.
 
     ``max_ptr`` / ``sum_ptr`` are the Flash-V100 partition stats
-    ``[batch, heads, partitions]``. The merged LSE matches the reduce kernel:
+    ``[batch, heads, partitions]``. Partitions merge in one online pass, the
+    same recurrence the reduce kernel uses, so the merged LSE matches:
     ``global_max + log(sum(exp_sums * exp(part_max - global_max)))`` over
-    ``min(P, ceil(seq_len / partition_size))`` partitions.
+    ``min(launch_num_partitions, ceil(seq_len / partition_size))`` partitions.
     """
     batch = tl.program_id(0)
     head = tl.program_id(1)
@@ -76,25 +78,27 @@ def _paged_decode_sink_kernel(
     if num_parts <= 0:
         return
 
-    neg_inf = -1.0e20
-    global_max = neg_inf
-    for i in range(P):
-        if i < num_parts:
-            part_max = tl.load(max_ptr + batch * max_stride_b + head * max_stride_h + i)
-            global_max = tl.maximum(global_max, part_max)
+    max_base = max_ptr + batch * max_stride_b + head * max_stride_h
+    sum_base = sum_ptr + batch * sum_stride_b + head * sum_stride_h
+    merged_max = -1.0e20
+    merged_sum = 0.0
+    part = 0
+    while part < num_parts:
+        part_max = tl.load(max_base + part)
+        part_sum = tl.load(sum_base + part)
+        new_max = tl.maximum(merged_max, part_max)
+        merged_sum = merged_sum * tl.exp(merged_max - new_max) + part_sum * tl.exp(
+            part_max - new_max
+        )
+        merged_max = new_max
+        part += 1
 
-    global_sum = 0.0
-    for i in range(P):
-        if i < num_parts:
-            part_max = tl.load(max_ptr + batch * max_stride_b + head * max_stride_h + i)
-            part_sum = tl.load(sum_ptr + batch * sum_stride_b + head * sum_stride_h + i)
-            if part_sum > 0:
-                global_sum += part_sum * tl.exp(part_max - global_max)
-    lse = global_max + tl.log(global_sum)
+    if merged_sum <= 0:
+        return
+
+    lse = merged_max + tl.log(merged_sum)
     sink = tl.load(sink_ptr + head)
-    larger = tl.maximum(lse, sink)
-    logaddexp = larger + tl.log(tl.exp(lse - larger) + tl.exp(sink - larger))
-    scale = tl.exp(lse - logaddexp)
+    scale = tl.sigmoid(lse - sink)
 
     offs = tl.arange(0, D)
     out_ptrs = out_ptr + batch * out_stride_b + head * out_stride_h + offs
@@ -144,6 +148,5 @@ def apply_paged_decode_sinks(
         int(partition_size),
         int(launch_num_partitions),
         D=output.shape[-1],
-        P=int(launch_num_partitions),
     )
     return output
