@@ -4,10 +4,11 @@
 
 from __future__ import annotations
 
+import os
 from collections.abc import Callable
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -44,6 +45,7 @@ class DecodeConfig:
     kv_cache_dtype: str
     attn_type: str
     sliding_window: tuple[int, int] | None
+    sinks: torch.Tensor | None = None
 
     @property
     def kv_codec(self) -> KVCodec | None:
@@ -185,6 +187,11 @@ class DecodeExecutor:
             anchor_lens=anchor_lens,
             anchored_window=anchored_window,
         ):
+            if self.config.sinks is not None:
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 scalar-tail decode does not apply "
+                    "learned attention sinks."
+                )
             record(_routing.ROUTE_SPECS["decode_e4m3_compact_scalar_tail"].name)
             return
         kwargs: dict[str, object] = {
@@ -201,6 +208,8 @@ class DecodeExecutor:
                 "FLASH_ATTN_V100 decode op does not support sliding-window "
                 "attention with this extension build."
             )
+        if self.config.sinks is not None:
+            kwargs["sinks"] = self.config.sinks
         if anchor_lens is not None and anchored_window > 0:
             if "anchor_lens" not in self.ops.paged_keywords:
                 raise RuntimeError(
@@ -287,8 +296,8 @@ class DecodeExecutor:
                 attn_metadata.seq_lens[:num_seqs],
                 softmax_scale=self.config.scale,
                 kv_cache_dtype=self.config.kv_cache_dtype,
-                k_scale=float(layer._k_scale_float),
-                v_scale=float(layer._v_scale_float),
+                k_scale=float(cast(float, layer._k_scale_float)),
+                v_scale=float(cast(float, layer._v_scale_float)),
                 causal=True,
             )
         raw_q_bhmd = q_bhmd
@@ -317,8 +326,8 @@ class DecodeExecutor:
             softmax_scale=self.config.scale,
             out=out_bhmd,
             kv_cache_dtype=self.config.kv_cache_dtype,
-            k_scale=float(layer._k_scale_float),
-            v_scale=float(layer._v_scale_float),
+            k_scale=float(cast(float, layer._k_scale_float)),
+            v_scale=float(cast(float, layer._v_scale_float)),
             causal=True,
         )
         if safe_bmhd is not None:
@@ -431,8 +440,8 @@ class DecodeExecutor:
                         softmax_scale=self.config.scale,
                         out=out_wmma,
                         kv_cache_dtype=self.config.kv_cache_dtype,
-                        k_scale=float(layer._k_scale_float),
-                        v_scale=float(layer._v_scale_float),
+                        k_scale=float(cast(float, layer._k_scale_float)),
+                        v_scale=float(cast(float, layer._v_scale_float)),
                     )
                     return output
                 if (
@@ -463,8 +472,8 @@ class DecodeExecutor:
                     attn_metadata.seq_lens[:num_seqs],
                     softmax_scale=self.config.scale,
                     kv_cache_dtype=self.config.kv_cache_dtype,
-                    k_scale=float(layer._k_scale_float),
-                    v_scale=float(layer._v_scale_float),
+                    k_scale=float(cast(float, layer._k_scale_float)),
+                    v_scale=float(cast(float, layer._v_scale_float)),
                     causal=True,
                 )
                 if first_query_len == 1 and q_bhmd.is_contiguous():
@@ -499,8 +508,8 @@ class DecodeExecutor:
                 attn_metadata.seq_lens[i : i + 1],
                 softmax_scale=self.config.scale,
                 kv_cache_dtype=self.config.kv_cache_dtype,
-                k_scale=float(layer._k_scale_float),
-                v_scale=float(layer._v_scale_float),
+                k_scale=float(cast(float, layer._k_scale_float)),
+                v_scale=float(cast(float, layer._v_scale_float)),
                 causal=True,
             )
             out_view[start:end].copy_(out_seq.squeeze(0))
@@ -658,30 +667,79 @@ class DecodeExecutor:
             if end <= start:
                 continue
             seq_len = int(seq_lens_host[i].item())
-            k_cont, v_cont = _kv_layout.extract_contiguous_kv_from_paged_cache(
-                kv_cache=kv_cache,
-                block_table=attn_metadata.block_table[i : i + 1],
-                seq_lens=attn_metadata.seq_lens[i : i + 1],
-                num_kv_heads=num_kv_heads,
-                head_dim=head_dim,
-                block_size=block_size,
-                total_tokens=seq_len,
-            )
+            # Read NHD blocks directly. The CUDA gather used by the
+            # generic extractor does not match this cache layout.
+            nblocks = (seq_len + block_size - 1) // block_size
+            physical = attn_metadata.block_table[i, :nblocks].to(dtype=torch.long)
+            k_cont = key_cache[physical].reshape(-1, num_kv_heads, head_dim)[:seq_len]
+            v_cont = value_cache[physical].reshape(-1, num_kv_heads, head_dim)[:seq_len]
             k_cont, v_cont = _kv_layout.dequantize_fp8_contiguous_kv(
                 k_cont,
                 v_cont,
                 self.config.kv_cache_dtype,
-                float(layer._k_scale_float),
-                float(layer._v_scale_float),
+                float(cast(float, layer._k_scale_float)),
+                float(cast(float, layer._v_scale_float)),
             )
-            out_seq = self.ops.dense(
-                query[start:end].unsqueeze(0),
-                k_cont.unsqueeze(0),
-                v_cont.unsqueeze(0),
-                causal=True,
+            q_len = end - start
+            # Gathered keys already end at this query. causal=True would
+            # treat a 1-token decode query as position 0 and hide the prefix.
+            if q_len != 1:
+                raise RuntimeError(
+                    "FLASH_ATTN_V100 dense decode reference only applies the "
+                    "learned-sink correction for single-token decode; "
+                    f"got q_len={q_len}"
+                )
+            from vllm.v1.attention.backends.flash_v100 import (
+                dense_prefill as _dense_prefill,
+            )
+            from vllm.v1.attention.backends.flash_v100.sinks import (
+                apply_learned_attention_sinks,
+            )
+
+            # The proven Flash path is equal-length causal attention.
+            # Put this decode token at the end of that sequence so it sees
+            # the prefix. Slice sliding layers to the last window first.
+            sliding = self.config.sliding_window
+            if sliding is not None and tuple(sliding) != (-1, -1):
+                keep = int(sliding[0]) + 1
+                if 0 < keep < k_cont.shape[0]:
+                    k_cont = k_cont[-keep:]
+                    v_cont = v_cont[-keep:]
+            # One decode query attends to every gathered key. Sliding
+            # layers have already kept only the last window. This is the
+            # same Flash kernel as prefill, without padding the query to
+            # the full sequence.
+            q_tok = query[start:end]
+            out_tok = out_view[start:end]
+            lse = torch.empty(
+                (q_tok.shape[1], q_tok.shape[0]),
+                dtype=torch.float32,
+                device=q_tok.device,
+            )
+            cu_q = torch.tensor(
+                [0, q_tok.shape[0]], device=q_tok.device, dtype=torch.int32
+            )
+            cu_k = torch.tensor(
+                [0, k_cont.shape[0]], device=q_tok.device, dtype=torch.int32
+            )
+            _dense_prefill.flash_v100_dense_prefill_lse(
+                query=q_tok,
+                key=k_cont,
+                value=v_cont,
+                output=out_tok,
+                softmax_lse=lse,
+                cu_seqlens_q=cu_q,
+                cu_seqlens_k=cu_k,
+                num_actual_tokens=q_tok.shape[0],
                 softmax_scale=self.config.scale,
+                causal=False,
+                window_size=(-1, -1),
             )
-            out_view[start:end].copy_(out_seq.squeeze(0))
+            if (
+                self.config.sinks is not None
+                and os.environ.get("FLINT_SKIP_DECODE_SINKS") != "1"
+            ):
+                apply_learned_attention_sinks(out_tok, lse, self.config.sinks)
         return output
 
     def _flash_v100_decode(
@@ -800,8 +858,8 @@ class DecodeExecutor:
             softmax_scale=self.config.scale,
             out=out_view,
             kv_cache_dtype=self.config.kv_cache_dtype,
-            k_scale=float(layer._k_scale_float),
-            v_scale=float(layer._v_scale_float),
+            k_scale=float(cast(float, layer._k_scale_float)),
+            v_scale=float(cast(float, layer._v_scale_float)),
             window_size=window_size,
             max_seq_len_hint=getattr(
                 attn_metadata,
@@ -868,8 +926,8 @@ class DecodeExecutor:
             softmax_scale=self.config.scale,
             out=out_view,
             kv_cache_dtype=self.config.kv_cache_dtype,
-            k_scale=float(layer._k_scale_float),
-            v_scale=float(layer._v_scale_float),
+            k_scale=float(cast(float, layer._k_scale_float)),
+            v_scale=float(cast(float, layer._v_scale_float)),
             window_size=window_size,
             max_seq_len_hint=getattr(
                 attn_metadata,
@@ -898,6 +956,10 @@ class XqaDecode:
         self.executor = executor
 
     def admit(self, request: NativeDecodeRequest) -> bool:
+        # XQA does not expose the partition LSE, so a sink layer must use
+        # the scalar paged kernel that applies the correction.
+        if self.executor.config.sinks is not None:
+            return False
         return request.selection is _routing.ROUTE_SPECS["decode_xqa_paged"]
 
     def run(

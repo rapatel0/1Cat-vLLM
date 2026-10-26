@@ -103,6 +103,9 @@ def test_iterator_maps_names_and_scales(tmp_path):
 def test_find_gguf_file_resolves_hub_repo_ids(tmp_path, monkeypatch):
     """`vllm serve <org>/<repo>` must detect a GGUF-only repo, not just local paths."""
     (tmp_path / "flint.gguf").touch()
+    # Offline mode skips the repo listing and trusts the cached snapshot, so the
+    # repo-id distinction below only applies online.
+    monkeypatch.setattr(gguf_nvfp4.huggingface_hub.constants, "HF_HUB_OFFLINE", False)
     monkeypatch.setattr(
         gguf_nvfp4,
         "any_pattern_in_repo_files",

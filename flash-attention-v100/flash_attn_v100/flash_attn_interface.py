@@ -1,15 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 import logging
+from typing import Any, cast
 
 import torch
 
 from . import legacy_policy as _legacy
 
 try:
-    from . import flash_attn_v100_cuda
+    from . import flash_attn_v100_cuda  # type: ignore[import-not-found]
 except ImportError:
-    import flash_attn_v100_cuda
+    import flash_attn_v100_cuda  # type: ignore[import-not-found]
 from dataclasses import dataclass
 
 try:
@@ -71,8 +72,12 @@ class _GroupedVerifyWorkspace:
     partial_lse: torch.Tensor
 
 
-def maybe_contiguous(x):
+def maybe_contiguous(x: Any) -> Any:
     return x.contiguous() if x is not None and not x.is_contiguous() else x
+
+
+def _contiguous_set(*tensors: Any) -> tuple[Any, ...]:
+    return tuple(maybe_contiguous(t) for t in tensors)
 
 
 def _copy_bhmd_to_bmhd_out(
@@ -738,17 +743,17 @@ def _flash_attn_forward(
     v: torch.Tensor,
     out: torch.Tensor | None,
     dropout_p: float,
-    softmax_scale: float,
+    softmax_scale: float | None,
     causal: bool,
     window_size_left: int,
     window_size_right: int,
     softcap: float,
-    alibi_slopes: torch.Tensor,
+    alibi_slopes: torch.Tensor | None,
     return_softmax: bool,
     *,
     _runtime=None,
 ) -> tuple:
-    q, k, v = map(maybe_contiguous, (q, k, v))
+    q, k, v = _contiguous_set(q, k, v)
     out = maybe_contiguous(out)
     if out is None:
         out = torch.zeros_like(q)
@@ -788,11 +793,11 @@ def _flash_attn_backward(
     softcap: float,
     alibi_slopes: torch.Tensor,
     deterministic: bool,
-    rng_state: torch.Tensor = None,
+    rng_state: torch.Tensor | None = None,
     *,
     _runtime=None,
-) -> torch.Tensor:
-    dout, q, k, v, out = map(maybe_contiguous, (dout, q, k, v, out))
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    dout, q, k, v, out = _contiguous_set(dout, q, k, v, out)
     grads = (_runtime.native if _runtime is not None else flash_attn_v100_cuda).bwd(
         dout,
         q,
@@ -901,7 +906,7 @@ class FlashAttnFunc(torch.autograd.Function):
         return out if not return_softmax else (out, lse_, None)
 
     @staticmethod
-    def backward(ctx, dout, *args):
+    def backward(ctx, dout, *args):  # type: ignore[misc]
         _runtime = ctx.attention_runtime
         q_, k_, v_, out_, lse_, rng_state = ctx.saved_tensors
 
@@ -960,11 +965,11 @@ def flash_attn_func(
     k: torch.Tensor,
     v: torch.Tensor,
     dropout_p: float = 0.0,
-    softmax_scale: float = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
     window_size: tuple = (-1, -1),
     softcap: float = 0.0,
-    alibi_slopes: torch.Tensor = None,
+    alibi_slopes: torch.Tensor | None = None,
     deterministic: bool = False,
     return_attn_probs: bool = False,
     out: torch.Tensor | None = None,
@@ -1018,11 +1023,11 @@ def flash_attn_bhmd_func(
     k: torch.Tensor,
     v: torch.Tensor,
     dropout_p: float = 0.0,
-    softmax_scale: float = None,
+    softmax_scale: float | None = None,
     causal: bool = False,
     window_size: tuple = (-1, -1),
     softcap: float = 0.0,
-    alibi_slopes: torch.Tensor = None,
+    alibi_slopes: torch.Tensor | None = None,
     return_attn_probs: bool = False,
     out: torch.Tensor | None = None,
     *,
@@ -1091,7 +1096,7 @@ def flash_attn_lse(
     if softmax_scale is None:
         softmax_scale = q.shape[-1] ** -0.5
 
-    q, k, v = map(maybe_contiguous, (q, k, v))
+    q, k, v = _contiguous_set(q, k, v)
     q_ = q.permute(0, 2, 1, 3).contiguous()
     k_ = k.permute(0, 2, 1, 3).contiguous()
     v_ = v.permute(0, 2, 1, 3).contiguous()
@@ -1131,6 +1136,7 @@ def flash_attn_decode_paged(
     partition_size_hint: int | None = None,
     anchor_lens: torch.Tensor | None = None,
     anchored_window: int = 0,
+    sinks: torch.Tensor | None = None,
     *,
     _runtime=None,
 ):
@@ -1189,7 +1195,7 @@ def flash_attn_decode_paged(
         and anchor_lens is None
     ):
         version = getattr(flash_attn_v100_cuda, "tp2_e4m3_scalar_fast_version", None)
-        if not callable(version) or int(version()) < 3:
+        if not callable(version) or int(cast(int, version())) < 3:
             raise RuntimeError("Rebuild Flash-V100 for E4M3 scalar fast revision 3")
     tmp_out, max_logits, exp_sums, active_num_partitions = (
         _get_decode_workspace_for_plan(
@@ -1203,8 +1209,12 @@ def flash_attn_decode_paged(
             _runtime=_runtime,
         )
     )
+    if sinks is not None:
+        # Inactive partitions must not keep a previous step's max logit.
+        max_logits.fill_(-1.0e20)
+        exp_sums.zero_()
 
-    return (
+    result = (
         _runtime.native if _runtime is not None else flash_attn_v100_cuda
     ).decode_paged_fwd(
         q,
@@ -1228,6 +1238,24 @@ def flash_attn_decode_paged(
         anchor_lens,
         int(anchored_window),
     )
+    if sinks is not None:
+        # The reduce kernel does not return LSE. Recompute it from the
+        # partition stats that kernel just wrote and apply the sink scale
+        # in place. This must not allocate: decode runs under CUDA graphs.
+        from vllm.v1.attention.backends.flash_v100.sinks import (
+            apply_paged_decode_sinks,
+        )
+
+        apply_paged_decode_sinks(
+            result,
+            max_logits,
+            exp_sums,
+            seq_lens,
+            sinks,
+            partition_size=int(plan.partition_size),
+            launch_num_partitions=int(plan.launch_num_partitions),
+        )
+    return result
 
 
 def flash_attn_decode_paged_xqa_available() -> bool:
@@ -1287,7 +1315,7 @@ def flash_attn_grouped_e4m3_fp32_available(min_version: int = 4) -> bool:
     return (
         hasattr(flash_attn_v100_cuda, "grouped_e4m3_fp32_paged_fwd")
         and callable(version)
-        and int(version()) >= min_version
+        and int(cast(int, version())) >= min_version
     )
 
 
@@ -1393,7 +1421,7 @@ def flash_attn_grouped_verify_paged(
         seq_lens,
         workspace.partial_out,
         workspace.partial_lse,
-        float(softmax_scale),
+        float(cast(float, softmax_scale)),
         kv_cache_dtype,
         float(k_scale),
         float(v_scale),
@@ -1888,10 +1916,11 @@ def flash_attn_prefill_paged(
 
 # Advertise the packaged direct-output ABI to the attention backend. Older
 # extension builds keep their existing single-request publication path.
-flash_attn_prefill_paged._sm70_dflash2_direct_bmhd = hasattr(
+_prefill_paged_attrs: dict[str, object] = cast(dict, flash_attn_prefill_paged.__dict__)
+_prefill_paged_attrs["_sm70_dflash2_direct_bmhd"] = hasattr(
     flash_attn_v100_cuda, "dflash2_paged_bmhd_fwd"
 )
-flash_attn_prefill_paged._sm70_dflash2_split_pages = (832, 1024, 1648, 2048)
+_prefill_paged_attrs["_sm70_dflash2_split_pages"] = (832, 1024, 1648, 2048)
 
 
 def fp8_e4m3_paged_kv_to_fp16(
@@ -2142,7 +2171,7 @@ def flash_attn_prefill_paged_d256_bm32_allp_pair_scratch(
         softmax_lse,
         block_table,
         seq_lens,
-        float(softmax_scale),
+        float(cast(float, softmax_scale)),
     )
     return out_result, lse_result
 
@@ -2186,7 +2215,7 @@ def flash_attn_prefill_paged_d256_bm32_allp_pair_scratch_splitkv3(
         workspace.row_sum,
         block_table,
         int(actual_n),
-        float(softmax_scale),
+        float(cast(float, softmax_scale)),
     )
     return out_result, lse_result
 

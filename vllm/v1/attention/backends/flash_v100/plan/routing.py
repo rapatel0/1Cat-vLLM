@@ -15,11 +15,11 @@ R_co = TypeVar("R_co", covariant=True)
 
 
 class Candidate(Protocol[C_contra, R_co]):
-    def admit(self, context: C_contra) -> bool:
+    def admit(self, request: C_contra) -> bool:
         """Pure predicate; admission alone performs no preparation."""
         ...
 
-    def run(self, context: C_contra, record: RecordRoute) -> R_co | None:
+    def run(self, request: C_contra, record: RecordRoute) -> R_co | None:
         """May prepare/execute and decline; retain all prior side effects."""
         ...
 
@@ -45,11 +45,11 @@ def execute(context: C, candidates: Iterable[Candidate[C, R]]) -> R:
 
 
 class _LegacyObservation:
-    def admit(self, name: str) -> bool:
+    def admit(self, request: str) -> bool:
         return True
 
-    def run(self, name: str, record: RecordRoute) -> bool:
-        record(name)
+    def run(self, request: str, record: RecordRoute) -> bool:
+        record(request)
         return True
 
 

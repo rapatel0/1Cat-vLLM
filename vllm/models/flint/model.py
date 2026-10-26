@@ -9,6 +9,7 @@ ungated shared expert.
 """
 
 from collections.abc import Iterable
+from typing import TYPE_CHECKING, Any, cast
 
 import torch
 from torch import nn
@@ -27,6 +28,9 @@ from vllm.model_executor.layers.attention.attention import (
 )
 from vllm.model_executor.layers.activation import SiluAndMul
 from vllm.model_executor.layers.fused_moe import FusedMoE, GateLinear
+from vllm.model_executor.layers.fused_moe.layer import (
+    fused_moe_make_expert_params_mapping,
+)
 from vllm.model_executor.layers.layernorm import RMSNorm as VllmRMSNorm
 from vllm.model_executor.layers.linear import (
     MergedColumnParallelLinear,
@@ -87,6 +91,22 @@ except ImportError:
     LL_MOE_MAX_TOKENS = 0
     LL_MAX_TOKENS = 0
     _SM100_OPS = False
+
+if TYPE_CHECKING:
+    # The stock SM70 path leaves these as None at runtime; the fused kernels are
+    # only reached on SM100. Keep the checker on the callable shape instead of
+    # widening every call site with an None test.
+    flint_linear: Any
+    qk_norm_rope_cache: Any
+    flint_qkv_fused: Any
+    FlintBf16DecodeMoE: Any
+    FlintNvfp4Experts: Any
+    LLMoEWeights: Any
+    flint_moe_ll: Any
+    ll_weights_from_layers: Any
+    BF16_DECODE_MAX_TOKENS: int
+    LL_MOE_MAX_TOKENS: int
+    LL_MAX_TOKENS: int
 
 from .ops.norm import RMSNorm, silu_and_mul
 
@@ -196,8 +216,8 @@ class FlintSparseMoeBlock(nn.Module):
             assert config.router_score_function == "sigmoid"
             assert config.norm_topk_prob
         self.use_flint_kernel = use_flint and is_nvfp4
-        self.bf16_decode: FlintBf16DecodeMoE | None = None
-        self._ll_weights: LLMoEWeights | None = None
+        self.bf16_decode: Any = None
+        self._ll_weights: Any = None
         if self.use_flint_kernel:
             self.experts = FlintNvfp4Experts(
                 config.num_experts,
@@ -218,6 +238,13 @@ class FlintSparseMoeBlock(nn.Module):
             scoring_func=config.router_score_function,
             quant_config=quant_config,
             prefix=f"{prefix}.experts",
+            expert_mapping=fused_moe_make_expert_params_mapping(
+                self,
+                ckpt_gate_proj_name="gate_proj",
+                ckpt_down_proj_name="down_proj",
+                ckpt_up_proj_name="up_proj",
+                num_experts=config.num_experts,
+            ),
         )
         if use_flint:
             self.bf16_decode = FlintBf16DecodeMoE(
@@ -344,7 +371,7 @@ class FlintAttention(nn.Module):
             from vllm.v1.attention.backends.flashinfer import (
                 FlashInferImpl,
                 FlashInferMetadata,
-                FlashInferTrtllmAPIDecode,
+                TRTLLMDecode,
             )
 
             impl = self.attn.impl
@@ -352,7 +379,7 @@ class FlintAttention(nn.Module):
                 "Flint SM100 kernels require FlashInfer attention"
             )
             self._metadata_cls = FlashInferMetadata
-            self._decode_cls = FlashInferTrtllmAPIDecode
+            self._decode_cls = TRTLLMDecode
             assert get_current_vllm_config().model_config.dtype == torch.bfloat16
             assert self.attn.kv_cache_dtype in ("auto", "bfloat16")
             assert impl.kv_sharing_target_layer_name is None
@@ -451,22 +478,24 @@ class FlintAttention(nn.Module):
         single-token decode of at most ``max_decode_batch`` requests (the Flint
         decode attention kernel), else None. K/V are already in the cache."""
         forward_metadata = get_forward_context().attn_metadata
-        attn_metadata = (
+        attn_metadata: Any = (
             forward_metadata.get(self.attn.layer_name)
             if isinstance(forward_metadata, dict)
             else forward_metadata
         )
+        metadata_cls: Any = self._metadata_cls
+        decode_cls: Any = self._decode_cls
+        impl: Any = self.impl
         if (
-            not isinstance(attn_metadata, self._metadata_cls)  # profiling run
+            not isinstance(attn_metadata, metadata_cls)  # profiling run
             or attn_metadata.num_prefills != 0
             or not 0 < attn_metadata.num_decodes <= self.max_decode_batch
             or attn_metadata.num_decode_tokens != attn_metadata.num_decodes
         ):
             return None
         decode = attn_metadata.decode
-        assert isinstance(decode, self._decode_cls)
-        assert decode.q_len_per_req == 1 and decode.dcp_query_start_loc is None
-        left = self.impl.window_left
+        assert isinstance(decode, decode_cls)
+        left = impl.window_left
         window = left + 1 if left >= 0 else None
         return decode, attn_metadata.num_decodes, window
 
@@ -474,14 +503,15 @@ class FlintAttention(nn.Module):
         self, q: torch.Tensor, out: torch.Tensor, decode, n: int, window: int | None
     ) -> None:
         shape = (-1, self.num_heads, self.head_dim)
+        impl: Any = self.impl
         self._decode_attention(
             q.view(shape)[:n],
             self.attn.kv_cache,
             decode.block_tables,
             decode.seq_lens,
-            self.impl.sinks,
+            impl.sinks,
             window,
-            self.impl.scale,
+            impl.scale,
             out.view(shape)[:n],
         )
 
@@ -491,7 +521,7 @@ class FlintAttention(nn.Module):
         hidden_states: torch.Tensor,
         residual: torch.Tensor | None,
         input_layernorm: RMSNorm,
-    ) -> tuple[torch.Tensor, torch.Tensor] | None:
+    ) -> tuple[Any, Any] | None:
         """Small pure-decode batches: two fused kernels for the residual-add
         RMSNorm, qkv GEMV, q/k norm, RoPE and KV-cache write, then the Flint
         decode attention. Returns None to fall back to the regular path."""
@@ -556,7 +586,7 @@ class FlintDecoderLayer(nn.Module):
         else:
             self.mlp = FlintSparseMoeBlock(config, quant_config, prefix=f"{prefix}.mlp")
         # Flint's Triton norm writes BF16. V100 stock execution is FP16.
-        norm_cls = RMSNorm if _SM100_OPS else VllmRMSNorm
+        norm_cls: Any = RMSNorm if _SM100_OPS else VllmRMSNorm
         self.input_layernorm = norm_cls(config.hidden_size, eps=config.rms_norm_eps)
         self.post_attention_layernorm = norm_cls(
             config.hidden_size, eps=config.rms_norm_eps
@@ -580,7 +610,10 @@ class FlintDecoderLayer(nn.Module):
         else:
             hidden_states, residual = self.input_layernorm(hidden_states, residual)
         hidden_states = self.self_attn(positions, hidden_states)
-        return self._post_attention(hidden_states, residual)
+        cached_residual: torch.Tensor = (
+            hidden_states if residual is None else residual
+        )
+        return self._post_attention(hidden_states, cached_residual)
 
     def _post_attention(
         self, hidden_states: torch.Tensor, residual: torch.Tensor
@@ -604,7 +637,7 @@ class FlintModel(nn.Module):
         prefix: str = "",
     ) -> None:
         super().__init__()
-        config: FlintConfig = vllm_config.model_config.hf_config
+        config = cast(FlintConfig, vllm_config.model_config.hf_config)
         cache_config = vllm_config.cache_config
         self.config = config
         self.embed_tokens = VocabParallelEmbedding(
@@ -619,12 +652,15 @@ class FlintModel(nn.Module):
             ),
             prefix=f"{prefix}.layers",
         )
-        self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
+        # Same rule as the decoder norms: Flint's Triton norm is BF16-only.
+        norm_cls = RMSNorm if _SM100_OPS else VllmRMSNorm
+        self.norm = norm_cls(config.hidden_size, eps=config.rms_norm_eps)
         self.make_empty_intermediate_tensors = make_empty_intermediate_tensors_factory(
             ["hidden_states", "residual"], config.hidden_size
         )
 
-    def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
+    def embed_input_ids(self, input_ids: torch.Tensor | None) -> torch.Tensor:
+        assert input_ids is not None
         return self.embed_tokens(input_ids)
 
     def forward(
@@ -634,9 +670,11 @@ class FlintModel(nn.Module):
         intermediate_tensors: IntermediateTensors | None = None,
         inputs_embeds: torch.Tensor | None = None,
     ) -> torch.Tensor | IntermediateTensors:
+        hidden_states: torch.Tensor
+        residual: torch.Tensor | None
         if intermediate_tensors is not None:
-            hidden_states = intermediate_tensors["hidden_states"]
-            residual = intermediate_tensors["residual"]
+            hidden_states = cast(torch.Tensor, intermediate_tensors["hidden_states"])
+            residual = cast(torch.Tensor | None, intermediate_tensors["residual"])
         else:
             hidden_states = (
                 inputs_embeds
@@ -648,7 +686,10 @@ class FlintModel(nn.Module):
             hidden_states, residual = layer(positions, hidden_states, residual)
         if self.end_layer != len(self.layers):
             return IntermediateTensors(
-                {"hidden_states": hidden_states, "residual": residual}
+                cast(
+                    dict[str, torch.Tensor],
+                    {"hidden_states": hidden_states, "residual": residual},
+                )
             )
         hidden_states, _ = self.norm(hidden_states, residual)
         return hidden_states
@@ -673,7 +714,7 @@ class FlintForCausalLM(nn.Module, SupportsPP):
 
     def __init__(self, *, vllm_config: VllmConfig, prefix: str = "") -> None:
         super().__init__()
-        config: FlintConfig = vllm_config.model_config.hf_config
+        config = cast(FlintConfig, vllm_config.model_config.hf_config)
         self.config = config
 
         model_config = vllm_config.model_config
@@ -704,10 +745,12 @@ class FlintForCausalLM(nn.Module, SupportsPP):
         self.flint_dense = _flint_kernels(quant_config)
         if self.flint_dense:
             flint_linear.install_flint_dense_kernels(self.model)
+        # The GGUF loader dequantizes the LM head and applies its scale to
+        # FP32 logits. Do not attach an NVFP4 linear method to that parameter.
         self.lm_head = ParallelLMHead(
             config.vocab_size,
             config.hidden_size,
-            quant_config=quant_config,
+            quant_config=None if self.gguf_path is not None else quant_config,
             prefix=maybe_prefix(prefix, "lm_head"),
         )
         self.logits_processor = LogitsProcessor(config.vocab_size)
@@ -718,7 +761,7 @@ class FlintForCausalLM(nn.Module, SupportsPP):
     def embed_input_ids(self, input_ids: torch.Tensor) -> torch.Tensor:
         return self.model.embed_input_ids(input_ids)
 
-    def forward(
+    def forward(  # type: ignore[misc]
         self,
         input_ids: torch.Tensor | None,
         positions: torch.Tensor,
@@ -738,7 +781,9 @@ class FlintForCausalLM(nn.Module, SupportsPP):
             )
             if self.flint_dense:
                 weights = flint_linear.check_merged_global_scales(weights)
-        loader = AutoWeightsLoader(self)
+        # AutoWeightsLoader.load_weights is wrapped by the torchao reload
+        # decorator, so keep the loader handle loose-typed like other models.
+        loader: Any = AutoWeightsLoader(self)
         return loader.load_weights(weights, mapper=self.hf_to_vllm_mapper)
 
     def _apply_dequantized_scales(

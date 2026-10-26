@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from collections.abc import Callable
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -38,6 +38,75 @@ PrefillConfig = _sequence.PrefillConfig
 logger = init_logger("vllm.v1.attention.backends.flash_attn_v100")
 
 
+def _sink_window(sliding_window, causal: bool) -> tuple[int, int]:
+    if sliding_window is None or tuple(sliding_window) == (-1, -1):
+        return (-1, -1)
+    left, right = int(sliding_window[0]), int(sliding_window[1])
+    if not causal and left >= 0 and right == 0:
+        right = left
+    return (left, right)
+
+
+def _flash_v100_prefill_with_sinks(
+    self: PrefillExecutor,
+    query: torch.Tensor,
+    key: torch.Tensor,
+    value: torch.Tensor,
+    attn_metadata: TritonAttentionMetadata,
+    output: torch.Tensor,
+    causal: bool,
+    sinks: torch.Tensor,
+) -> torch.Tensor:
+    """Dense no-prefix prefill plus the learned-sink correction.
+
+    The correction uses the same Flash-V100 kernel's LSE. Prefix and paged
+    prefill are refused by the caller until they return that LSE too.
+    """
+    if not _dense_prefill.flash_v100_dense_prefill_lse_available():
+        raise RuntimeError(
+            "FLASH_ATTN_V100 dense LSE prefill is required to apply learned sinks"
+        )
+    num_actual_tokens = int(attn_metadata.num_actual_tokens)
+    cu = attn_metadata.query_start_loc
+    if cu.device != query.device:
+        cu = cu.to(device=query.device)
+    need = (query.shape[1], query.shape[0])
+    lse = getattr(self.workspace, "sink_lse", None)
+    if (
+        not isinstance(lse, torch.Tensor)
+        or tuple(lse.shape) != need
+        or lse.device != query.device
+        or lse.dtype != torch.float32
+    ):
+        if torch.cuda.is_current_stream_capturing():
+            raise RuntimeError(
+                "learned-sink LSE buffer must be allocated before CUDA graph capture"
+            )
+        lse = torch.empty(need, dtype=torch.float32, device=query.device)
+        self.workspace.sink_lse = lse
+    _dense_prefill.flash_v100_dense_prefill_lse(
+        query=query,
+        key=key[:num_actual_tokens],
+        value=value[:num_actual_tokens],
+        output=output,
+        softmax_lse=lse,
+        cu_seqlens_q=cu,
+        cu_seqlens_k=cu,
+        num_actual_tokens=num_actual_tokens,
+        softmax_scale=self.scale,
+        causal=causal,
+        window_size=_sink_window(getattr(self.settings, "sliding_window", None), causal),
+    )
+    from vllm.v1.attention.backends.flash_v100.sinks import (
+        apply_learned_attention_sinks,
+    )
+
+    apply_learned_attention_sinks(
+        output[:num_actual_tokens], lse[:, :num_actual_tokens], sinks
+    )
+    return output
+
+
 def _flash_v100_prefill(
     self: PrefillExecutor,
     query: torch.Tensor,
@@ -48,6 +117,11 @@ def _flash_v100_prefill(
 ) -> torch.Tensor:
     """Prefill path for no-prefix case (query_len == seq_len per sequence)."""
     causal = getattr(attn_metadata, "causal", True)
+    sinks = getattr(self.settings, "sinks", None)
+    if sinks is not None:
+        return _flash_v100_prefill_with_sinks(
+            self, query, key, value, attn_metadata, output, causal, sinks
+        )
     window_size = self._flash_v100_window_size(causal)
     num_actual_tokens = attn_metadata.num_actual_tokens
     query_start_loc_cpu = getattr(attn_metadata, "query_start_loc_cpu", None)
@@ -460,8 +534,8 @@ def _run_mixed_rows_grouped_e4m3(
         ):
             return False
     q_pad.index_copy_(0, plan.dst_idx, query.index_select(0, plan.src_idx))
-    k_scale = float(layer._k_scale_float)
-    v_scale = float(layer._v_scale_float)
+    k_scale = float(cast(Any, layer._k_scale_float))
+    v_scale = float(cast(Any, layer._v_scale_float))
     for g0, g1 in chunks:
         r0, r1 = g0 * _workspace.MIXED_ROWS_GROUP, g1 * _workspace.MIXED_ROWS_GROUP
         # Row lengths are authoritative: padding rows have length zero and
@@ -596,8 +670,8 @@ def _run_prefill_prefix_decode_rows(
         if use_xqa
         else None
     )
-    k_scale = float(layer._k_scale_float)
-    v_scale = float(layer._v_scale_float)
+    k_scale = float(cast(Any, layer._k_scale_float))
+    v_scale = float(cast(Any, layer._v_scale_float))
     if use_xqa:
         route = "prefill_prefix_decode_rows_xqa"
 
@@ -815,8 +889,8 @@ def _flash_v100_prefill_with_prefix(
                         attn_metadata.seq_lens[i : i + 1],
                         softmax_scale=self.scale,
                         kv_cache_dtype=self.kv_cache_dtype,
-                        k_scale=float(layer._k_scale_float),
-                        v_scale=float(layer._v_scale_float),
+                        k_scale=float(cast(Any, layer._k_scale_float)),
+                        v_scale=float(cast(Any, layer._v_scale_float)),
                         causal=causal,
                         window_size=window_size,
                         anchor_lens=anchor_lens[i : i + 1],
@@ -893,8 +967,8 @@ def _flash_v100_prefill_with_prefix(
                 k_cont,
                 v_cont,
                 self.kv_cache_dtype,
-                float(layer._k_scale_float),
-                float(layer._v_scale_float),
+                float(cast(Any, layer._k_scale_float)),
+                float(cast(Any, layer._v_scale_float)),
             )
 
             out_seq = self.flash_attn_func(
@@ -1239,6 +1313,87 @@ def _forward_int8_block32(
     return int8.small_query_prefill_as_decode(query, kv_cache, attn_metadata, output)
 
 
+def _prefill_prefix_with_sinks(
+    self: PrefillExecutor,
+    layer: torch.nn.Module,
+    query: torch.Tensor,
+    kv_cache: torch.Tensor,
+    attn_metadata: TritonAttentionMetadata,
+    output: torch.Tensor,
+) -> torch.Tensor:
+    """Prefix or mixed prefill using gathered NHD cache and Flash LSE.
+
+    Causal attention at a position depends only on that query and the keys
+    up to it, so missing prefix queries can be zeros. Sliding layers whose
+    sequence is longer than the window keep the last window of keys.
+    """
+    from vllm.v1.attention.backends.flash_v100.sinks import (
+        apply_learned_attention_sinks,
+    )
+
+    key_cache, value_cache = _kv_layout.split_paged_kv_cache(kv_cache)
+    block_size = int(key_cache.shape[1])
+    num_kv_heads = int(key_cache.shape[2])
+    head_dim = int(key_cache.shape[3])
+    query_start = attn_metadata.query_start_loc.detach().cpu().tolist()
+    seq_lens = attn_metadata.seq_lens.detach().cpu().tolist()
+    sinks = self.settings.sinks
+    sliding = getattr(self.settings, "sliding_window", None)
+    for seq_idx in range(len(query_start) - 1):
+        start = int(query_start[seq_idx])
+        end = int(query_start[seq_idx + 1])
+        q_len = end - start
+        if q_len <= 0:
+            continue
+        seq_len = int(seq_lens[seq_idx])
+        nblocks = (seq_len + block_size - 1) // block_size
+        physical = attn_metadata.block_table[seq_idx, :nblocks].to(dtype=torch.long)
+        keys = key_cache[physical].reshape(-1, num_kv_heads, head_dim)[:seq_len]
+        values = value_cache[physical].reshape(-1, num_kv_heads, head_dim)[:seq_len]
+        keys, values = _kv_layout.dequantize_fp8_contiguous_kv(
+            keys,
+            values,
+            self.kv_cache_dtype,
+            float(cast(Any, layer._k_scale_float)),
+            float(cast(Any, layer._v_scale_float)),
+        )
+        if sliding is not None and tuple(sliding) != (-1, -1):
+            # Every query in the chunk needs its own left window, so the union
+            # of keys is the left window plus the chunk itself. Queries are
+            # right-aligned against these keys, which keeps the causal mask and
+            # each row's window boundary in the right place.
+            keep = min(seq_len, int(sliding[0]) + q_len)
+            keys = keys[-keep:]
+            values = values[-keep:]
+            seq_len = keys.shape[0]
+        q_tok = query[start:end]
+        q_pad = q_tok.new_zeros((seq_len, q_tok.shape[1], q_tok.shape[2]))
+        q_pad[-q_len:].copy_(q_tok)
+        out_pad = q_pad.new_empty(q_pad.shape)
+        lse = torch.empty(
+            (q_pad.shape[1], seq_len), dtype=torch.float32, device=q_tok.device
+        )
+        cu = torch.tensor([0, seq_len], device=q_tok.device, dtype=torch.int32)
+        _dense_prefill.flash_v100_dense_prefill_lse(
+            query=q_pad,
+            key=keys,
+            value=values,
+            output=out_pad,
+            softmax_lse=lse,
+            cu_seqlens_q=cu,
+            cu_seqlens_k=cu,
+            num_actual_tokens=seq_len,
+            softmax_scale=self.scale,
+            causal=True,
+            window_size=(-1, -1),
+        )
+        out_tok = output[start:end]
+        out_tok.copy_(out_pad[-q_len:])
+        if sinks is not None:
+            apply_learned_attention_sinks(out_tok, lse[:, -q_len:], sinks)
+    return output
+
+
 def forward(
     self: PrefillExecutor,
     layer: torch.nn.Module,
@@ -1339,6 +1494,17 @@ def forward(
     has_prefix_context = metadata_live_token_mismatch or _kv_layout.has_prefix_context(
         attn_metadata
     )
+    if getattr(self.settings, "sinks", None) is not None and (
+        self.use_triton_prefill or self.use_prefill_paged_cache or int8 is not None
+    ):
+        raise RuntimeError(
+            "FLASH_ATTN_V100 learned-sink correction is not applied on this "
+            "prefill route."
+        )
+    if getattr(self.settings, "sinks", None) is not None and has_prefix_context:
+        return _prefill_prefix_with_sinks(
+            self, layer, query, kv_cache, attn_metadata, output
+        )
     smallq_decode = has_prefix_context and self.ops.small_query_enabled(attn_metadata)
     if has_prefix_context and int8 is not None:
         return _forward_int8_block32(

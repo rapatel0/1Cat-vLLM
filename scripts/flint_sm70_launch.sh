@@ -18,16 +18,18 @@ if [[ "$actual" != "$expected" ]]; then
 fi
 
 MODEL=${FLINT_MODEL_DIR:-/models/flint-nvfp4-gguf}
-exec taskset -c 20-39,60-79 \
+# FP8 KV halves the cache and doubles full-context concurrency on V100.
+KV_CACHE_DTYPE=${FLINT_KV_CACHE_DTYPE:-fp8_e5m2}
+exec taskset -c "${FLINT_CPUSET:-20-39,60-79}" \
   python3 -m vllm.entrypoints.openai.api_server \
   --model "$MODEL" \
   --tokenizer "$MODEL" \
   --served-model-name flint \
   --trust-remote-code \
   --dtype float16 \
-  --kv-cache-dtype auto \
+  --kv-cache-dtype "$KV_CACHE_DTYPE" \
   --tensor-parallel-size "${FLINT_TP_SIZE:-4}" \
-  --max-model-len 262144 \
+  --max-model-len "${FLINT_MAX_MODEL_LEN:-262144}" \
   --max-num-seqs "${FLINT_MAX_NUM_SEQS:-8}" \
   --max-num-batched-tokens "${FLINT_MAX_BATCHED_TOKENS:-8192}" \
   --gpu-memory-utilization "${FLINT_GPU_MEMORY_UTILIZATION:-0.90}" \
@@ -35,6 +37,5 @@ exec taskset -c 20-39,60-79 \
   --enable-prefix-caching \
   --enable-auto-tool-choice \
   --tool-call-parser glm47 \
-  --reasoning-parser glm47 \
   --host 0.0.0.0 \
   --port 8002

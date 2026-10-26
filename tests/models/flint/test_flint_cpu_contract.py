@@ -52,10 +52,27 @@ def test_nvfp4_repack_round_trip_one_block():
     blocks[4] = 0x21
     weight, scale = gguf._repack_nvfp4(blocks, 64)
     assert tuple(weight.shape) == (32,)
-    assert int(weight[0]) == 0x12
+    assert tuple(scale.shape) == (4,)
     values = gguf.dequantize_nvfp4(weight, scale)
     assert values.shape[-1] == 64
     assert torch.isfinite(values).all()
+    # The packed layout is chosen for the QPN fragment order, so compare the
+    # decoded values against the ggml reference instead of raw packed bytes.
+    import numpy as np
+
+    ref = np.zeros(64, dtype=np.float32)
+    ref[0] = 1.0 * _e4m3(0x38)
+    ref[1] = 2.0 * _e4m3(0x38)
+    torch.testing.assert_close(values, torch.from_numpy(ref), atol=1e-6, rtol=1e-4)
+
+
+def _e4m3(byte: int) -> float:
+    # Unsigned E4M3 decode used by ggml for NVFP4 block scales.
+    exponent = (byte >> 3) & 0xF
+    mantissa = byte & 0x7
+    if exponent == 0:
+        return mantissa / 8.0 * 2.0**-6
+    return (1.0 + mantissa / 8.0) * 2.0 ** (exponent - 7)
     name, stacked = gguf._map_name("blk.2.ffn_gate_exps")
     assert stacked
     assert name == "model.layers.2.mlp.experts.{}.gate_proj"

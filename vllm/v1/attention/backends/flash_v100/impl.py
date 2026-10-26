@@ -514,7 +514,6 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             and self.attn_type == AttentionType.DECODER
             and self.alibi_slopes is None
             and self.logits_soft_cap == 0
-            and self.sinks is None
             and supported_kv_dtype
         )
 
@@ -542,6 +541,7 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             self.kv_cache_dtype,
             getattr(self, "attn_type", AttentionType.DECODER),
             getattr(self, "sliding_window", None),
+            sinks=getattr(self, "sinks", None),
         )
         ops = _decode.DecodeOps(
             dense=getattr(self, "flash_attn_func", None),
@@ -642,6 +642,8 @@ class FlashAttnV100Impl(TritonAttentionImpl):
             cast(_config.V100AttnConfig, policy),
             getattr(self, "scale", 1.0),
             getattr(self, "kv_cache_dtype", "auto"),
+            sinks=getattr(self, "sinks", None),
+            sliding_window=getattr(self, "sliding_window", None),
         )
         native: dict[str, Any] = {
             field: getattr(self, legacy_name, None)

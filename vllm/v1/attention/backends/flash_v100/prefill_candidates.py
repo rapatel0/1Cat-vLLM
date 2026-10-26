@@ -6,7 +6,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from functools import partial
-from typing import Any
+from typing import Any, cast
 
 import torch
 
@@ -25,6 +25,8 @@ class PrefillConfig:
     policy: _config.V100AttnConfig
     scale: float
     kv_cache_dtype: str
+    sinks: torch.Tensor | None = None
+    sliding_window: tuple[int, int] | None = None
 
     @property
     def kv_codec(self) -> KVCodec | None:
@@ -199,8 +201,8 @@ class BflaPrefill(SequenceCandidate):
                 self.executor.config.policy.prefill_bfla_mask_block_n,
                 softmax_scale=self.executor.config.scale,
                 kv_cache_dtype=self.executor.config.kv_cache_dtype,
-                k_scale=float(request.layer._k_scale_float),
-                v_scale=float(request.layer._v_scale_float),
+                k_scale=float(cast(Any, request.layer._k_scale_float)),
+                v_scale=float(cast(Any, request.layer._v_scale_float)),
                 causal=request.causal,
                 window_size=request.window_size,
             ),
@@ -504,8 +506,8 @@ class Fp8BridgePrefill(SequenceCandidate):
             block_table=request.attn_metadata.block_table[request.i : request.i + 1],
             seq_lens=request.attn_metadata.seq_lens[request.i : request.i + 1],
             seq_len=request.seq_len,
-            k_scale=float(request.layer._k_scale_float),
-            v_scale=float(request.layer._v_scale_float),
+            k_scale=float(cast(Any, request.layer._k_scale_float)),
+            v_scale=float(cast(Any, request.layer._v_scale_float)),
             causal=request.causal,
             window_size=request.window_size,
             out=request.out_view[request.start : request.end].unsqueeze(0),
@@ -527,8 +529,8 @@ class Fp8BridgePrefill(SequenceCandidate):
                 request.attn_metadata.seq_lens[request.i : request.i + 1],
                 softmax_scale=self.executor.config.scale,
                 kv_cache_dtype=self.executor.config.kv_cache_dtype,
-                k_scale=float(request.layer._k_scale_float),
-                v_scale=float(request.layer._v_scale_float),
+                k_scale=float(cast(Any, request.layer._k_scale_float)),
+                v_scale=float(cast(Any, request.layer._v_scale_float)),
                 causal=request.causal,
                 window_size=request.window_size,
             )
@@ -563,8 +565,8 @@ class SplitKvPrefill(SequenceCandidate):
                 request.attn_metadata.seq_lens[request.i : request.i + 1],
                 softmax_scale=self.executor.config.scale,
                 kv_cache_dtype=self.executor.config.kv_cache_dtype,
-                k_scale=float(request.layer._k_scale_float),
-                v_scale=float(request.layer._v_scale_float),
+                k_scale=float(cast(Any, request.layer._k_scale_float)),
+                v_scale=float(cast(Any, request.layer._v_scale_float)),
                 causal=request.causal,
                 window_size=request.window_size,
                 split_kv_tokens=self.executor.config.policy.prefill_split_kv_tokens,
@@ -598,8 +600,8 @@ class PagedPrefill(SequenceCandidate):
                 request.attn_metadata.seq_lens[request.i : request.i + 1],
                 softmax_scale=self.executor.config.scale,
                 kv_cache_dtype=self.executor.config.kv_cache_dtype,
-                k_scale=float(request.layer._k_scale_float),
-                v_scale=float(request.layer._v_scale_float),
+                k_scale=float(cast(Any, request.layer._k_scale_float)),
+                v_scale=float(cast(Any, request.layer._v_scale_float)),
                 causal=request.causal,
                 window_size=request.window_size,
             ),
