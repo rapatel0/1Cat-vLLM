@@ -14,6 +14,7 @@ from vllm.logger import init_logger, log_once_seen, set_log_once_state
 from vllm.v1.attention.backends.flash_v100 import config as _config
 from vllm.v1.attention.backends.flash_v100 import dense_prefill as _dense_prefill
 from vllm.v1.attention.backends.flash_v100 import kv_layout as _kv_layout
+from vllm.v1.attention.backends.flash_v100 import ops as _ops
 from vllm.v1.attention.backends.flash_v100 import masks as _masks
 from vllm.v1.attention.backends.flash_v100 import prefill_candidates as _sequence
 from vllm.v1.attention.backends.flash_v100 import routing as _routing
@@ -1339,6 +1340,8 @@ def _prefill_prefix_with_sinks(
     seq_lens = attn_metadata.seq_lens.detach().cpu().tolist()
     sinks = self.settings.sinks
     sliding = getattr(self.settings, "sliding_window", None)
+    window_left, window_right = _sink_window(sliding, True)
+    bhmd_forward = _ops.get_flash_dense_forward()
     for seq_idx in range(len(query_start) - 1):
         start = int(query_start[seq_idx])
         end = int(query_start[seq_idx + 1])
@@ -1366,14 +1369,37 @@ def _prefill_prefix_with_sinks(
             keys = keys[-keep:]
             values = values[-keep:]
             seq_len = keys.shape[0]
-        q_tok = query[start:end]
-        q_pad = q_tok.new_zeros((seq_len, q_tok.shape[1], q_tok.shape[2]))
-        q_pad[-q_len:].copy_(q_tok)
+        out_tok = output[start:end]
+        q_bhmd = query[start:end].transpose(0, 1).unsqueeze(0).contiguous()
+        if bhmd_forward is not None:
+            # The dense kernel aligns causal and windowed rows against the key
+            # length, so the real query rows can attend the gathered keys
+            # without padding the query up to the key length first.
+            out_bhmd, lse_bhmd, _, _ = bhmd_forward(
+                q_bhmd,
+                keys.transpose(0, 1).unsqueeze(0).contiguous(),
+                values.transpose(0, 1).unsqueeze(0).contiguous(),
+                None,
+                0.0,
+                self.scale,
+                True,
+                window_left,
+                window_right,
+                0.0,
+                None,
+                False,
+            )
+            out_tok.copy_(out_bhmd[0].transpose(0, 1))
+            if sinks is not None:
+                apply_learned_attention_sinks(out_tok, lse_bhmd[0], sinks)
+            continue
+        q_pad = q_bhmd.new_zeros((seq_len, q_bhmd.shape[1], q_bhmd.shape[3]))
+        q_pad[-q_len:].copy_(q_bhmd[0].transpose(0, 1))
         out_pad = q_pad.new_empty(q_pad.shape)
         lse = torch.empty(
-            (q_pad.shape[1], seq_len), dtype=torch.float32, device=q_tok.device
+            (q_pad.shape[1], seq_len), dtype=torch.float32, device=q_bhmd.device
         )
-        cu = torch.tensor([0, seq_len], device=q_tok.device, dtype=torch.int32)
+        cu = torch.tensor([0, seq_len], device=q_bhmd.device, dtype=torch.int32)
         _dense_prefill.flash_v100_dense_prefill_lse(
             query=q_pad,
             key=keys,
@@ -1387,7 +1413,6 @@ def _prefill_prefix_with_sinks(
             causal=True,
             window_size=(-1, -1),
         )
-        out_tok = output[start:end]
         out_tok.copy_(out_pad[-q_len:])
         if sinks is not None:
             apply_learned_attention_sinks(out_tok, lse[:, -q_len:], sinks)

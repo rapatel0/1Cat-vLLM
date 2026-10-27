@@ -55,6 +55,12 @@ args=(
   --port "${FLINT_PORT:-8002}"
 )
 
+# Long-context decode walks one page descriptor per block, so wider pages turn
+# the paged KV walk into longer contiguous reads.
+if [[ -n "${FLINT_BLOCK_SIZE:-}" ]]; then
+  args+=(--block-size "$FLINT_BLOCK_SIZE")
+fi
+
 # Graph capture sizes must cover the batch ceiling, or larger batches decode eagerly.
 if [[ -n "${FLINT_COMPILATION_CONFIG:-}" ]]; then
   args+=(--compilation-config "$FLINT_COMPILATION_CONFIG")
